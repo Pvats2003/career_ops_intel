@@ -5,7 +5,7 @@ a truthful candidate knowledge base, and (in later phases) prepares and
 submits applications — with humans in the loop by default and every
 generated fact traceable to a source.
 
-**This repository is at the end of Phase 2 (Job Engine).** Matching, resume
+**This repository is at the end of Phase 3 (Matching Engine).** Resume
 tailoring, answer generation, and browser automation do not exist yet.
 Nothing in this codebase can submit a job application.
 
@@ -49,7 +49,19 @@ src/job_agent/
     freshness.py             JUST_POSTED/NEW/RECENT/OLD/UNKNOWN_POST_DATE classification
     repository.py             Dedup-aware DB upsert
     service.py                Orchestrates one discovery scan
+  llm/                     LLM provider abstraction (Phase 3)
+    provider.py               LLMProvider ABC, NullLLMProvider, AnthropicLLMProvider
+  matching/                Matching engine (Phase 3)
+    schema.py                 JobMatchResult, Decision enum
+    deterministic.py           Keyword/regex-based sub-scores + hard-stop detection
+    semantic.py                 LLM-refined sub-scores (role/experience/project)
+    scoring.py                   Blends deterministic + semantic per configured weights
+    decision.py                   Thresholds + hard-stop/excluded overrides
+    repository.py                 Insert-only job_matches persistence
+    service.py                     Orchestrates matching for jobs in the DB
   cli/                     Typer CLI (main.py)
+
+prompts/                 Versioned prompt text (job_matcher.md)
 
 alembic/                  Database migrations (source of truth for schema evolution)
 tests/unit/               pytest unit tests
@@ -164,6 +176,74 @@ Deduplication is deliberately two-tiered:
   the matching/application layer, which can choose not to apply twice
   without destroying either source's history (section 54).
 
+## Architecture (Phase 3 — Matching Engine)
+
+```
+CandidateProfile  +  Job (from DB)
+        │
+        ▼
+compute_deterministic_match()   (job_agent.matching.deterministic — no LLM call)
+  ├─ skills_match        keyword vocabulary vs. candidate skill evidence (fuzzy substring match)
+  ├─ experience_match     "N+ years" extraction vs. computed months of experience
+  ├─ role_match            title vs. config/profile.yaml target_roles / excluded_roles
+  ├─ project_match          keyword overlap with candidate project stack/highlights
+  ├─ education_match         degree-requirement phrases vs. candidate education
+  ├─ location_match           remote/location match vs. candidate location preferences
+  ├─ seniority_match           senior/junior keyword detection
+  └─ eligibility_match          sponsorship-requirement phrases vs. visa_information
+        │
+        ▼  (skipped entirely if excluded/hard-stopped/very low score — cost optimization)
+run_semantic_match()   (job_agent.matching.semantic — one Anthropic tool-use call)
+  refines: role_match, experience_match, project_match
+  untrusted job text is clearly delimited; system prompt forbids following
+  any instruction found inside it (prompt injection defense, section 30)
+        │
+        ▼
+combine_match()   →   weighted blend (config/automation.yaml scoring_weights + semantic_blend_weight)
+        │
+        ▼
+decide()   →   APPLY / REVIEW / SAVE / SKIP / HUMAN_REQUIRED
+  hard-stop conditions (unknown_work_authorization, seniority_mismatch,
+  required_degree_missing) always force HUMAN_REQUIRED regardless of score;
+  candidate-configured exclusions always force SKIP; no semantic signal
+  caps the decision below APPLY even at a high deterministic score
+        │
+        ▼
+save_job_match()  →  job_matches (insert-only — each run is a new historical row)
+```
+
+**Deterministic vs. semantic is not an implementation detail, it's the
+contract from BUILD PROMPT section 10**: skills, education, location,
+seniority, and eligibility are pattern-matchable and stay 100%
+deterministic (no LLM, no cost, always available, always explainable).
+Only role alignment, experience similarity, and project relevance — the
+dimensions that genuinely need judgment about transferability and career
+trajectory — go through the semantic stage, and only when it's plausibly
+worth the API call.
+
+**Cost optimization (section 40):** the semantic stage is skipped entirely
+when a job is already decided by cheap signals alone — excluded by
+config, hard-stopped, or so poorly matched on deterministic signals that an
+LLM call is very unlikely to change the outcome. In this repo's own test
+run against 4 sample jobs, 2 of the 4 never triggered an LLM call.
+
+**No API key configured is a normal, safe state, not an error** — the
+`NullLLMProvider` is a real fallback path (not a workaround): `jobs match`
+still runs deterministic-only scoring, and `decide()` caps the outcome at
+REVIEW even for a would-be-APPLY score, because auto-applying without the
+semantic "second opinion" is a risk this system doesn't take. This sandbox
+has no `ANTHROPIC_API_KEY` configured, so all matching shown in this repo's
+own testing is deterministic-only; semantic blending is verified with a
+fake `LLMProvider` in `tests/unit/test_matching_scoring.py` and
+`test_matching_semantic.py`, and the real `AnthropicLLMProvider` is tested
+against a mocked Anthropic client (`tests/unit/test_llm_provider.py`) —
+same reasoning as Phase 2's mocked job-source tests.
+
+**Auditability:** `job_matches` is insert-only. Re-running `jobs match`
+never overwrites a prior score — it adds a new row, so match history
+survives config/threshold changes and eventually supports the outcome
+analytics in section 24 ("which match score predicts interviews?").
+
 ## Database schema
 
 SQLite via SQLAlchemy 2.0, migrated with Alembic. 15 tables (BUILD PROMPT
@@ -174,10 +254,11 @@ section 21's minimum set): `candidate`, `candidate_facts`, `skills`,
 
 Phase 1 populates `candidate`, `candidate_facts`, `skills`, `experiences`,
 `projects` (via `job-agent profile parse`). Phase 2 adds `job_sources`,
-`companies`, and `jobs` (via `job-agent jobs scan`). The remaining tables
-(`job_matches`, `resumes`, `applications`, `application_answers`,
+`companies`, and `jobs` (via `job-agent jobs scan`). Phase 3 adds
+`job_matches` (via `job-agent jobs match`; insert-only, see above). The
+remaining tables (`resumes`, `applications`, `application_answers`,
 `application_events`, `notifications`) are defined now so schema and code
-evolve together, and get populated starting in Phase 3.
+evolve together, and get populated starting in Phase 4.
 
 Indexes exist on `job_fingerprint`, `company_name`, `title`, `posted_at`
 (jobs), `overall_score`/`decision` (job_matches), `status`/`match_score`
@@ -212,6 +293,7 @@ job-agent health            # config loads + candidate profile parses + DB reach
 job-agent profile parse     # parse candidate/*.md + config/*.yaml, persist to DB
 job-agent dry-run           # confirm submission is currently impossible
 job-agent jobs scan         # poll enabled job sources, persist new/updated jobs
+job-agent jobs match        # score every job in the DB against the candidate profile
 ```
 
 To actually discover jobs: edit `config/sources.yaml`, set `enabled: true`
@@ -221,15 +303,17 @@ or Lever company slug (found on the company's own careers page URL). With
 nothing enabled, `jobs scan` reports that clearly and does nothing — it
 never guesses at a board to poll.
 
-Commands for later phases (`jobs match`, `applications prepare/review/run`,
-`dashboard`) are registered in the CLI now so the interface is stable, but
-exit with a clear "not implemented yet" message — see `job_agent/cli/main.py`.
+To enable semantic matching: set `ANTHROPIC_API_KEY` in `.env`. Without it,
+`jobs match` still runs (deterministic-only) and says so explicitly.
+
+Commands for later phases (`applications prepare/review/run`, `dashboard`)
+are registered in the CLI now so the interface is stable, but exit with a
+clear "not implemented yet" message — see `job_agent/cli/main.py`.
 
 ## Testing
 
 ```bash
-pytest -q            # 65 tests: config, candidate schema/parser, db, job engine (fingerprint,
-                      # freshness, http retries, Greenhouse/Lever adapters, repository, service)
+pytest -q            # 121 tests: config, candidate schema/parser, db, job engine, matching engine
 ruff check src tests # lint — currently clean
 mypy -p job_agent     # type check — currently clean
 ```
@@ -238,12 +322,17 @@ Tests run against the **real** `candidate/*.md` and `config/*.yaml` files
 (not synthetic fixtures), so they double as a regression check on the
 shipped candidate data itself — e.g. `test_full_profile_assembly_never_
 fabricates_preferences` asserts that salary/visa stay `UNKNOWN` because the
-resume never states them. Job-source tests never make a real network call —
-every Greenhouse/Lever test injects an `httpx.MockTransport`, both because
-this sandbox can't reach those APIs anyway and because deterministic mocked
-responses are the right way to test this regardless (BUILD PROMPT section 35).
+resume never states them, and the deterministic matcher tests run against
+the real profile to confirm actual skills (SQL, Excel, Agile/Scrum, Figma)
+are correctly fuzzy-matched rather than reported MISSING due to naming
+differences ("Basic SQL" vs. "SQL"). Job-source and LLM-provider tests never
+make a real network call — Greenhouse/Lever tests inject an
+`httpx.MockTransport`, and `AnthropicLLMProvider` tests inject a fake
+Anthropic client, both because this sandbox can't reach those APIs anyway
+and because deterministic mocked responses are the right way to test this
+regardless (BUILD PROMPT section 35).
 
-## What's implemented (Phase 1 + Phase 2)
+## What's implemented (Phase 1 + Phase 2 + Phase 3)
 
 **Phase 1 — Foundation**
 - [x] Project structure, `pyproject.toml`, `.gitignore`, `.env.example`
@@ -266,17 +355,33 @@ responses are the right way to test this regardless (BUILD PROMPT section 35).
 - [x] Discovery service orchestrating the full scan pipeline + `job-agent jobs scan` CLI command
 - [x] 35 new unit tests (fingerprint, freshness, HTTP retry behavior, adapters, repository, service)
 
-65 passing unit tests total; clean `ruff` and `mypy`.
+**Phase 3 — Matching Engine**
+- [x] `LLMProvider` abstraction (`job_agent.llm`) — `NullLLMProvider` (safe default, no API key)
+      and `AnthropicLLMProvider` (forced tool-use JSON, schema-validated)
+- [x] Deterministic matcher: skills (fuzzy vocabulary match), experience-years, role alignment
+      (target/excluded roles), project overlap, education, location, seniority, eligibility/visa
+- [x] Semantic matcher: LLM-refined role/experience/project scores, with an explicit
+      prompt-injection defense for untrusted job-posting text (section 30)
+- [x] Retry-once-then-fallback on invalid LLM output (section 29); never crashes, never lets
+      malformed output touch scoring
+- [x] Scoring engine blending deterministic + semantic per `config/automation.yaml` weights
+- [x] Decision engine: configurable thresholds, hard-stop conditions force HUMAN_REQUIRED,
+      candidate exclusions force SKIP, missing semantic signal caps below APPLY
+- [x] Cost-optimized pipeline: semantic stage skipped for excluded/hard-stopped/very-low-score jobs
+- [x] Insert-only `job_matches` persistence (full audit history) + `job-agent jobs match` CLI command
+- [x] 56 new unit tests (deterministic sub-scores, LLM provider, semantic retry/fallback,
+      scoring blend, decision thresholds, repository, service orchestration)
 
-## What remains (Phases 3–8)
+121 passing unit tests total; clean `ruff` and `mypy`.
 
-Not started: the matching engine (deterministic + semantic scoring, decision
-thresholds), resume selection/tailoring, the answer-generation engine,
+## What remains (Phases 4–8)
+
+Not started: resume selection/tailoring, the answer-generation engine,
 Playwright browser automation, the application state machine, the FastAPI
 dashboard, the scheduler, notifications, and live-mode submission. Also not
 started within "job sources": Workday, company career pages, and the
 ToS-restricted sources (LinkedIn, Indeed, Wellfound) — see
-`config/sources.yaml` notes on each. See the BUILD PROMPT's Phase 3–8
+`config/sources.yaml` notes on each. See the BUILD PROMPT's Phase 4–8
 breakdown for the full plan — each phase stops for review before the next
 begins.
 

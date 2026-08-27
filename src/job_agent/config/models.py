@@ -129,6 +129,7 @@ class MatchingThresholds(StrictModel):
     auto_apply_threshold: int = Field(ge=0, le=100, default=90)
     review_threshold: int = Field(ge=0, le=100, default=80)
     save_threshold: int = Field(ge=0, le=100, default=70)
+    semantic_blend_weight: float = Field(ge=0.0, le=1.0, default=0.4)
 
 
 class FreshnessSettings(StrictModel):
@@ -171,7 +172,7 @@ class SchedulerSettings(StrictModel):
 
 class LLMSettings(StrictModel):
     provider: str = "anthropic"
-    model: str = "configurable"
+    model: str = "claude-haiku-4-5-20251001"
     max_requests_per_minute: int = 20
 
 

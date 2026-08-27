@@ -18,6 +18,11 @@ matching:
   review_threshold: 80
   save_threshold: 70
   # Below save_threshold -> SKIP
+  # How much weight the LLM-based semantic refinement gets vs. the
+  # deterministic keyword/regex score, for the three dimensions it refines
+  # (role_match, experience_match, project_match). 0.0 = ignore semantic
+  # entirely; 1.0 = trust semantic entirely. See job_agent.matching.scoring.
+  semantic_blend_weight: 0.4
 
 freshness:
   preferred_hours: 24
@@ -54,5 +59,7 @@ scheduler:
 
 llm:
   provider: "anthropic"
-  model: "configurable"
+  # Cheap/fast model, appropriate for a high-volume matching task (section
+  # 40's cost-optimization guidance). Override via LLM_MODEL env var or here.
+  model: "claude-haiku-4-5-20251001"
   max_requests_per_minute: 20

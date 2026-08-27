@@ -2,6 +2,7 @@
 
 Phase 1 implements: init, profile parse, status, health.
 Phase 2 adds: jobs scan.
+Phase 3 adds: jobs match.
 Later-phase commands are registered now (so the interface contract is
 stable) but exit with a clear "not implemented yet" message rather than
 pretending to do something they can't — see BUILD PROMPT section 48.
@@ -21,7 +22,9 @@ from job_agent.config.loader import REPO_ROOT, load_config
 from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.jobs.service import run_scan
+from job_agent.llm.provider import NullLLMProvider, build_llm_provider
 from job_agent.logging.setup import configure_logging, get_logger, log_event
+from job_agent.matching.service import run_matching
 
 app = typer.Typer(help="Autonomous global job discovery and application agent.")
 profile_app = typer.Typer(help="Candidate profile commands.")
@@ -260,7 +263,74 @@ def jobs_scan() -> None:
 
 @jobs_app.command("match")
 def jobs_match() -> None:
-    _not_implemented("Phase 3 (Matching)")
+    """Score every job in the database against the candidate profile."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    try:
+        profile = parse_candidate_profile(cfg)
+    except CandidateParseError as exc:
+        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    llm = build_llm_provider(cfg)
+    llm_note = (
+        "[green]enabled[/green]"
+        if not isinstance(llm, NullLLMProvider)
+        else "[yellow]disabled — no ANTHROPIC_API_KEY[/yellow]"
+    )
+    console.print(f"Semantic matching: {llm_note}")
+
+    with session_factory() as session:
+        candidate_id = save_candidate_profile(session, profile)
+        try:
+            outcomes = run_matching(session, cfg, profile, candidate_id, llm=llm)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+
+    if not outcomes:
+        console.print(
+            "[yellow]No jobs in the database yet.[/yellow] Run `job-agent jobs scan` first."
+        )
+        raise typer.Exit(code=0)
+
+    table = Table(title="Match Results")
+    table.add_column("Job ID")
+    table.add_column("Company")
+    table.add_column("Title")
+    table.add_column("Score")
+    table.add_column("Decision")
+    table.add_column("Semantic")
+    decision_colors = {
+        "APPLY": "green",
+        "REVIEW": "cyan",
+        "SAVE": "blue",
+        "SKIP": "dim",
+        "HUMAN_REQUIRED": "red",
+    }
+    for outcome in outcomes:
+        color = decision_colors.get(outcome.result.decision.value, "white")
+        table.add_row(
+            str(outcome.job_id),
+            outcome.company,
+            outcome.title,
+            str(outcome.result.overall_score),
+            f"[{color}]{outcome.result.decision.value}[/{color}]",
+            "yes" if outcome.semantic_call_made else "no",
+        )
+    console.print(table)
+
+    log_event(
+        logger,
+        component="cli.jobs_match",
+        action="match",
+        result="success",
+        jobs_matched=len(outcomes),
+        semantic_calls=sum(1 for o in outcomes if o.semantic_call_made),
+    )
 
 
 @applications_app.command("prepare")
