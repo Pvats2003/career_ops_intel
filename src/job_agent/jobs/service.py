@@ -4,6 +4,19 @@ postings, normalize, classify freshness, and persist with dedup.
 This is the only place that wires `JobSource` implementations together with
 the repository and config — adding a new source means registering it in
 `build_sources()`, nothing else in this module changes (section 46).
+
+Security fix (post-Phase-6A audit, remaining-sites pass): `ScanResult.
+errors` is returned to `job-agent jobs scan`, which prints every entry to
+the terminal verbatim (`cli/main.py`'s `jobs_scan` command) — a source
+adapter's underlying HTTP client exception could in principle embed a
+credential (a query-string API key, a Basic-auth header echoed back in an
+error message) even though today's Greenhouse/Lever adapters use no
+credentials at all. Both places that append to `result.errors` now scrub
+through `job_agent.logging.setup.redact_text()` before the string is ever
+stored — the same centralized boundary already used for `log_event()`,
+`record_event()`, and the Phase 5/6A application-error paths, applied here
+so `ScanResult.errors` protects its content by construction rather than
+relying on the CLI (or a future caller) to remember to redact.
 """
 
 from __future__ import annotations
@@ -18,7 +31,7 @@ from job_agent.jobs.repository import get_or_create_job_source, upsert_job
 from job_agent.jobs.source import JobSource
 from job_agent.jobs.sources.greenhouse import GreenhouseJobSource
 from job_agent.jobs.sources.lever import LeverJobSource
-from job_agent.logging.setup import get_logger, log_event
+from job_agent.logging.setup import get_logger, log_event, redact_text
 from job_agent.net.http_client import ResilientHttpClient
 
 logger = get_logger("job_agent.jobs.service")
@@ -64,7 +77,8 @@ def scan_source(session: Session, config: AppConfig, source: JobSource) -> ScanR
     try:
         raw_postings = source.search()
     except Exception as exc:  # noqa: BLE001
-        result.errors.append(str(exc))
+        safe_error = redact_text(str(exc))
+        result.errors.append(safe_error)
         log_event(
             logger,
             component="jobs.service",
@@ -72,7 +86,7 @@ def scan_source(session: Session, config: AppConfig, source: JobSource) -> ScanR
             result="failure",
             source=source.name,
             identifier=result.identifier,
-            error=str(exc),
+            error=safe_error,
         )
         session.commit()
         return result
@@ -92,7 +106,7 @@ def scan_source(session: Session, config: AppConfig, source: JobSource) -> ScanR
                 result.updated += 1
         except Exception as exc:  # noqa: BLE001
             posting_id = raw.get("id", "?") if isinstance(raw, dict) else "?"
-            result.errors.append(f"posting {posting_id}: {exc}")
+            result.errors.append(redact_text(f"posting {posting_id}: {exc}"))
 
     session.commit()
     log_event(

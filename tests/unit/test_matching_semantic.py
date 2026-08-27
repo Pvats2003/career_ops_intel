@@ -106,6 +106,51 @@ def test_candidate_facts_exclude_pii(real_profile):
     assert real_profile.identity_name.value not in facts_str
 
 
+# --------------------------------------------------------------------------
+# Security fix (post-Phase-6A audit, remaining-sites pass): unavailable_reason
+# flows into JobMatchResult.concerns, which is persisted to job_matches and
+# displayed by `job-agent jobs match` — the same credential-capable path as
+# answer_engine.py's validation_notes (both wrap AnthropicLLMProvider
+# transport/API failures).
+# --------------------------------------------------------------------------
+class _LeakyUnavailable(LLMProvider):
+    def complete_json(self, **kwargs):
+        raise LLMUnavailableError("no credentials configured: api_key=sk-liveSECRET1234567890")
+
+
+class _LeakyAlwaysInvalid(LLMProvider):
+    def __init__(self):
+        self.calls = 0
+
+    def complete_json(self, **kwargs):
+        self.calls += 1
+        raise LLMOutputValidationError("upstream rejected request: password=hunter2secretvalue")
+
+
+def test_run_semantic_match_unavailable_error_redacted(real_profile):
+    outcome = run_semantic_match(_LeakyUnavailable(), real_profile, JOB)
+    assert outcome.available is False
+    assert "sk-liveSECRET1234567890" not in outcome.unavailable_reason
+    assert "***REDACTED***" in outcome.unavailable_reason
+
+
+def test_run_semantic_match_ordinary_unavailable_message_preserved(real_profile):
+    """Confirms the fix does not blindly redact everything — this is the
+    same fixture used by test_run_semantic_match_unavailable above."""
+    outcome = run_semantic_match(_AlwaysUnavailable(), real_profile, JOB)
+    assert outcome.unavailable_reason == "no key configured"
+
+
+def test_run_semantic_match_invalid_output_error_redacted_after_retry(real_profile):
+    provider = _LeakyAlwaysInvalid()
+    outcome = run_semantic_match(provider, real_profile, JOB)
+    assert outcome.available is False
+    assert provider.calls == 2
+    assert "hunter2secretvalue" not in outcome.unavailable_reason
+    assert "***REDACTED***" in outcome.unavailable_reason
+    assert "retry" in outcome.unavailable_reason  # diagnostic context preserved
+
+
 def test_prompt_neutralizes_fake_closing_delimiter(real_profile):
     """A job posting cannot break out of the <job_posting> delimiter by
     including the literal closing tag itself, followed by fabricated

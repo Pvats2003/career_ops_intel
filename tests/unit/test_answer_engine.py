@@ -9,7 +9,7 @@ from job_agent.applications.answer_engine import (
     normalize_delimiter,
 )
 from job_agent.applications.schema import ApplicationQuestion, QuestionCategory
-from job_agent.llm.errors import LLMOutputValidationError
+from job_agent.llm.errors import LLMOutputValidationError, LLMUnavailableError
 from job_agent.llm.provider import LLMCallMetadata, LLMProvider, NullLLMProvider
 from job_agent.resume.extractor import extract_resume_text
 
@@ -173,6 +173,72 @@ def test_llm_invalid_output_retries_once_then_requires_human(real_profile, resum
     assert answer.requires_human is True
     assert llm.calls == 2
     assert answer.source == "llm_invalid_output"
+
+
+# --------------------------------------------------------------------------
+# Security fix (post-Phase-6A audit, remaining-sites pass): validation_notes
+# is persisted to ApplicationAnswer and displayed by `job-agent applications
+# review` — an LLM-provider transport/API failure message must never carry
+# a credential onto either surface.
+# --------------------------------------------------------------------------
+class _LeakyUnavailableLLM(LLMProvider):
+    def complete_json(self, **kwargs):
+        raise LLMUnavailableError("no credentials configured: api_key=sk-liveSECRET1234567890")
+
+
+class _OrdinaryUnavailableLLM(LLMProvider):
+    def complete_json(self, **kwargs):
+        raise LLMUnavailableError("No LLM provider configured")
+
+
+class _LeakyAlwaysInvalidLLM(LLMProvider):
+    def __init__(self):
+        self.calls = 0
+
+    def complete_json(self, **kwargs):
+        self.calls += 1
+        raise LLMOutputValidationError("upstream rejected request: password=hunter2secretvalue")
+
+
+def test_llm_unavailable_error_redacted_in_validation_notes(real_profile, resume_text, bank):
+    question = ApplicationQuestion(
+        text="Describe a challenging technical project.", category=QuestionCategory.TECHNICAL
+    )
+    answer = generate_answer(question, real_profile, resume_text, bank, _LeakyUnavailableLLM())
+
+    assert answer.requires_human is True
+    assert answer.source == "llm_unavailable"
+    assert len(answer.validation_notes) == 1
+    assert "sk-liveSECRET1234567890" not in answer.validation_notes[0]
+    assert "***REDACTED***" in answer.validation_notes[0]
+
+
+def test_llm_unavailable_ordinary_message_preserved_when_nothing_sensitive(
+    real_profile, resume_text, bank
+):
+    question = ApplicationQuestion(
+        text="Describe a challenging technical project.", category=QuestionCategory.TECHNICAL
+    )
+    answer = generate_answer(question, real_profile, resume_text, bank, _OrdinaryUnavailableLLM())
+
+    assert answer.validation_notes == ("No LLM provider configured",)
+
+
+def test_llm_invalid_output_error_redacted_in_validation_notes_after_retry(
+    real_profile, resume_text, bank
+):
+    question = ApplicationQuestion(
+        text="Describe a challenging technical project.", category=QuestionCategory.TECHNICAL
+    )
+    llm = _LeakyAlwaysInvalidLLM()
+    answer = generate_answer(question, real_profile, resume_text, bank, llm)
+
+    assert answer.requires_human is True
+    assert llm.calls == 2
+    assert len(answer.validation_notes) == 1
+    assert "hunter2secretvalue" not in answer.validation_notes[0]
+    assert "***REDACTED***" in answer.validation_notes[0]
+    assert "invalid after retry" in answer.validation_notes[0]  # diagnostic context preserved
 
 
 def test_prompt_injection_neutralizes_fake_closing_delimiter():

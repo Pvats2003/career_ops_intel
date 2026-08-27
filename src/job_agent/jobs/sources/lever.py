@@ -18,6 +18,7 @@ from typing import Any
 from job_agent.jobs.schema import Job, RemoteType
 from job_agent.jobs.source import HealthCheckResult, JobSource, RawPosting
 from job_agent.jobs.sources._html import html_to_text
+from job_agent.logging.setup import redact_text
 from job_agent.net.http_client import ResilientHttpClient
 
 BASE_URL = "https://api.lever.co/v0/postings"
@@ -85,11 +86,16 @@ class LeverJobSource(JobSource):
             return None
 
     def health_check(self) -> HealthCheckResult:
+        """`detail` is scrubbed with `redact_text()` before being returned
+        — see `GreenhouseJobSource.health_check()` for why this boundary
+        is closed here rather than left to a future caller."""
         checked_at = datetime.now(UTC)
         try:
             data: Any = self._http.get_json(self._postings_url(), params={"mode": "json"})
         except Exception as exc:  # noqa: BLE001
-            return HealthCheckResult(healthy=False, detail=str(exc), checked_at=checked_at)
+            return HealthCheckResult(
+                healthy=False, detail=redact_text(str(exc)), checked_at=checked_at
+            )
         if not isinstance(data, list):
             return HealthCheckResult(
                 healthy=False, detail="response was not a JSON list", checked_at=checked_at

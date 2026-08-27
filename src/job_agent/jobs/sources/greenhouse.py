@@ -20,6 +20,7 @@ from typing import Any
 from job_agent.jobs.schema import Job, RemoteType
 from job_agent.jobs.source import HealthCheckResult, JobSource, RawPosting
 from job_agent.jobs.sources._html import html_to_text
+from job_agent.logging.setup import redact_text
 from job_agent.net.http_client import ResilientHttpClient
 
 BASE_URL = "https://boards-api.greenhouse.io/v1/boards"
@@ -80,11 +81,19 @@ class GreenhouseJobSource(JobSource):
         return dt
 
     def health_check(self) -> HealthCheckResult:
+        """`detail` is scrubbed with `redact_text()` before being returned
+        — no caller currently displays/logs a health check's `detail`
+        (this endpoint takes no credential today, so there is nothing to
+        leak in practice), but the boundary is closed here rather than
+        wherever a future caller happens to consume it, matching the
+        centralized-redaction pattern the rest of the codebase uses."""
         checked_at = datetime.now(UTC)
         try:
             data: Any = self._http.get_json(self._jobs_url(), params={"content": "false"})
         except Exception as exc:  # noqa: BLE001
-            return HealthCheckResult(healthy=False, detail=str(exc), checked_at=checked_at)
+            return HealthCheckResult(
+                healthy=False, detail=redact_text(str(exc)), checked_at=checked_at
+            )
         if not isinstance(data, dict) or "jobs" not in data:
             return HealthCheckResult(
                 healthy=False,
