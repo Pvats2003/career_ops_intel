@@ -5,6 +5,9 @@ Phase 2 adds: jobs scan.
 Phase 3 adds: jobs match.
 Phase 4 adds: profile parse now also snapshots a validated, versioned
 profile (candidate_profile_versions); profile history lists past versions.
+Phase 5 adds: applications prepare/review/run (dry-run by default; no real
+ATS integration exists yet, so `run` always reports what a human still
+needs to do rather than actually submitting anything).
 Later-phase commands are registered now (so the interface contract is
 stable) but exit with a clear "not implemented yet" message rather than
 pretending to do something they can't — see BUILD PROMPT section 48.
@@ -18,9 +21,20 @@ import time
 import typer
 from rich.console import Console
 from rich.table import Table
+from sqlalchemy import select
 
+from job_agent.applications.provider import ManualReviewProvider
+from job_agent.applications.repository import get_answers
+from job_agent.applications.schema import ApplicationStatus
+from job_agent.applications.service import (
+    discover_application,
+    prepare_application,
+    submit_application,
+)
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
 from job_agent.config.loader import REPO_ROOT, load_config
+from job_agent.db.models import Application, JobMatch
+from job_agent.db.models import Job as JobRow
 from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.jobs.service import run_scan
@@ -429,17 +443,148 @@ def jobs_match() -> None:
 
 @applications_app.command("prepare")
 def applications_prepare() -> None:
-    _not_implemented("Phase 5 (Application Engine)")
+    """Discover + prepare an Application for every job_matches row that
+    doesn't have one yet (APPLY/REVIEW decisions proceed toward PREPARED;
+    HUMAN_REQUIRED/SAVE/SKIP land in the matching states directly)."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    try:
+        profile = parse_candidate_profile(cfg)
+    except CandidateParseError as exc:
+        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    llm = build_llm_provider(cfg)
+    provider = ManualReviewProvider()
+
+    with session_factory() as session:
+        candidate_id = save_candidate_profile(session, profile)
+        job_matches = list(
+            session.execute(
+                select(JobMatch).where(JobMatch.candidate_id == candidate_id)
+            ).scalars()
+        )
+        # Only the most recent match per job matters for deciding what to prepare.
+        latest_by_job: dict[int, JobMatch] = {}
+        for jm in job_matches:
+            latest_by_job[jm.job_id] = jm
+
+        rows = []
+        for job_id, jm in latest_by_job.items():
+            job = session.get(JobRow, job_id)
+            if job is None:
+                continue
+            application = discover_application(session, cfg, job, jm, candidate_id)
+            if ApplicationStatus(application.status) in (
+                ApplicationStatus.MATCHED,
+                ApplicationStatus.HUMAN_REQUIRED,
+            ):
+                outcome = prepare_application(
+                    session, cfg, application, job, profile, provider, llm=llm
+                )
+                application = outcome.application
+            rows.append((job, application))
+
+    if not rows:
+        console.print(
+            "[yellow]No job matches found.[/yellow] Run `job-agent jobs match` first."
+        )
+        raise typer.Exit(code=0)
+
+    table = Table(title="Application Preparation")
+    table.add_column("Job ID")
+    table.add_column("Company")
+    table.add_column("Title")
+    table.add_column("Status")
+    status_colors = {
+        "PREPARED": "green", "HUMAN_REQUIRED": "yellow", "SKIPPED": "dim",
+        "FAILED": "red", "MATCHED": "cyan",
+    }
+    for job, application in rows:
+        color = status_colors.get(application.status, "white")
+        table.add_row(
+            str(job.id), job.company_name, job.title, f"[{color}]{application.status}[/{color}]"
+        )
+    console.print(table)
 
 
 @applications_app.command("review")
 def applications_review() -> None:
-    _not_implemented("Phase 7 (Dashboard / Review Queue)")
+    """List every application currently awaiting human input."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        pending = list(
+            session.execute(
+                select(Application).where(
+                    Application.status == ApplicationStatus.HUMAN_REQUIRED.value
+                )
+            ).scalars()
+        )
+        if not pending:
+            console.print("[green]Nothing awaiting human review.[/green]")
+            raise typer.Exit(code=0)
+
+        for application in pending:
+            job = session.get(JobRow, application.job_id)
+            console.print(
+                f"\n[bold]{job.company_name if job else '?'} — "
+                f"{job.title if job else '?'}[/bold] (application id {application.id})"
+            )
+            answers = get_answers(session, application.id)
+            for answer in answers:
+                if not answer.requires_human:
+                    continue
+                console.print(f"  [yellow]?[/yellow] {answer.question_text}")
+                for note in answer.validation_notes or []:
+                    console.print(f"      {note}")
 
 
 @applications_app.command("run")
 def applications_run() -> None:
-    _not_implemented("Phase 6 (Real Application Flows)")
+    """Attempt submission for every PREPARED application.
+
+    There is no real ATS integration in this phase — `ManualReviewProvider`
+    always refuses (see job_agent.applications.provider) — so this command
+    exists to exercise the safety gates honestly and report exactly what a
+    human still needs to do, never to actually submit anything."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+    provider = ManualReviewProvider()
+
+    if not cfg.is_submission_allowed():
+        console.print(
+            "[green]Safe:[/green] dry-run mode active — no submission will be attempted; "
+            "this command will only report what would happen."
+        )
+
+    with session_factory() as session:
+        prepared = list(
+            session.execute(
+                select(Application).where(Application.status == ApplicationStatus.PREPARED.value)
+            ).scalars()
+        )
+        if not prepared:
+            console.print("[yellow]No PREPARED applications to submit.[/yellow]")
+            raise typer.Exit(code=0)
+
+        for application in prepared:
+            job = session.get(JobRow, application.job_id)
+            if job is None:
+                continue
+            result = submit_application(session, cfg, application, job, provider)
+            console.print(
+                f"{job.company_name} — {job.title}: [cyan]{result.status}[/cyan]"
+                + (f" ({result.error_message})" if result.error_message else "")
+            )
 
 
 @app.command()
