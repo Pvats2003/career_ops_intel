@@ -1,0 +1,66 @@
+# =============================================================================
+# profile.yaml — Target role taxonomy and career-direction configuration
+# =============================================================================
+# This file does NOT contain candidate facts (those live in candidate/*.md and
+# are parsed with provenance into the database). It contains PREFERENCES about
+# which roles the agent should search for and how to weigh career direction.
+#
+# Edit this file directly — no code changes required. The role engine
+# (Phase 3) reads this to compute role_similarity / career_direction scores.
+# =============================================================================
+
+target_roles:
+  # Roles most aligned with demonstrated resume experience (product
+  # management competencies: Agile/Scrum, PRD drafting, roadmapping,
+  # prioritisation frameworks) and self-initiated PM projects.
+  primary:
+    - "Associate Product Manager"
+    - "Product Analyst"
+    - "APM"
+    - "Junior Product Manager"
+    - "Business Analyst"
+
+  # Adjacent roles supported by demonstrated operations/ops-tooling and
+  # data-collection program experience (Instawork Robotics Labs internship).
+  secondary:
+    - "Product Operations Analyst"
+    - "Operations Analyst"
+    - "AI Operations Associate"
+    - "Program Operations Analyst"
+    - "Technical Business Analyst"
+
+  # Roles the candidate has adjacent/self-taught exposure to (personal
+  # projects using OpenAI/Claude APIs, OCR pipelines) but no professional,
+  # verified experience. Included for exploratory discovery only — matching
+  # engine must weigh these lower and flag missing requirements honestly.
+  exploratory:
+    - "Technical Product Manager"
+    - "AI Product Analyst"
+    - "Solutions Consultant"
+
+target_industries:
+  - "Technology / SaaS"
+  - "AI / Machine Learning"
+  - "Robotics"
+  - "Fintech"
+  - "Consumer Internet"
+
+# Roles explicitly out of scope even if a job source surfaces a high textual
+# match (e.g. pure software engineering roles requiring production coding
+# experience the candidate does not have verified).
+excluded_roles:
+  - "Senior Product Manager"
+  - "Director of Product"
+  - "Software Engineer"
+  - "Site Reliability Engineer"
+  - "Sales / Business Development"
+
+# Populate with specific companies to never apply to (past employers under
+# NDA, competitors of a current employer, etc). Empty by default — edit as
+# needed. HUMAN_REVIEW_REQUIRED, do not let the agent infer this list.
+excluded_companies: []
+
+# Seniority the candidate can truthfully claim given resume evidence
+# (internship + self-initiated project experience only — no full-time
+# professional experience yet).
+seniority_level: "entry_level"

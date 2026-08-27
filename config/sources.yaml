@@ -1,0 +1,69 @@
+# =============================================================================
+# sources.yaml — Job source adapter configuration (Phase 2+)
+# =============================================================================
+# Phase 1 does not implement any job source adapter. This file defines the
+# configuration shape the JobSource plugin architecture (Phase 2) will read,
+# so config and code evolve together instead of being retrofitted.
+#
+# `enabled: false` everywhere until a source's adapter is implemented AND
+# verified to respect that platform's robots.txt / terms of use / official
+# API. Never flip a source to enabled without that verification.
+# =============================================================================
+
+sources:
+  greenhouse:
+    enabled: false
+    kind: "ats_api"
+    poll_interval_minutes: 10
+    rate_limit_per_minute: 20
+    notes: "Public job-board JSON API per-company; no auth needed for reads."
+
+  lever:
+    enabled: false
+    kind: "ats_api"
+    poll_interval_minutes: 10
+    rate_limit_per_minute: 20
+    notes: "Public postings API per-company."
+
+  workday:
+    enabled: false
+    kind: "ats_api"
+    poll_interval_minutes: 15
+    rate_limit_per_minute: 10
+    notes: "Varies per tenant; some expose a CXS JSON endpoint."
+
+  company_career_pages:
+    enabled: false
+    kind: "scrape"
+    poll_interval_minutes: 30
+    rate_limit_per_minute: 5
+    notes: "Must respect robots.txt per-domain; structured data (JSON-LD JobPosting) preferred over HTML scraping."
+
+  linkedin:
+    enabled: false
+    kind: "restricted"
+    notes: "LinkedIn's ToS restricts automated scraping/application. Do not enable without an approved, compliant integration (e.g. official API/partner access)."
+
+  indeed:
+    enabled: false
+    kind: "restricted"
+    notes: "Requires reviewing current API/partner terms before enabling."
+
+  wellfound:
+    enabled: false
+    kind: "restricted"
+    notes: "Requires reviewing current API/terms before enabling."
+
+  yc_jobs:
+    enabled: false
+    kind: "scrape"
+    poll_interval_minutes: 30
+    rate_limit_per_minute: 10
+    notes: "Work Y Combinator jobs board; verify robots.txt before enabling."
+
+global_limits:
+  max_concurrent_sources: 3
+  default_backoff_seconds: 5
+  default_backoff_multiplier: 2.0
+  default_backoff_max_seconds: 300
+  max_retries_per_request: 3

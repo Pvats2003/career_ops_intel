@@ -1,0 +1,58 @@
+# =============================================================================
+# automation.yaml — Automation level, thresholds, safety switches
+# =============================================================================
+
+automation:
+  # 0=discovery only, 1=+score, 2=+prepare, 3=+fill+human approval,
+  # 4=auto-submit safe applications. See BUILD PROMPT section 18.
+  level: 3
+  mode: "human_approval"
+
+# Master safety switches. Both must be true for anything to ever be
+# auto-submitted; LIVE_MODE additionally gates real submission (section 37).
+dry_run: true
+live_mode: false
+
+matching:
+  auto_apply_threshold: 90
+  review_threshold: 80
+  save_threshold: 70
+  # Below save_threshold -> SKIP
+
+freshness:
+  preferred_hours: 24
+  just_posted_hours: 6
+  recent_days: 7
+
+priority_weights:
+  match: 0.50
+  freshness: 0.20
+  career_value: 0.15
+  company_fit: 0.10
+  application_ease: 0.05
+
+scoring_weights:
+  skills: 0.25
+  experience: 0.20
+  role_alignment: 0.20
+  projects: 0.10
+  education: 0.10
+  location: 0.05
+  seniority: 0.05
+  eligibility: 0.05
+
+applications:
+  max_per_day: 15
+  max_per_hour: 5
+  max_per_company: 1
+  max_per_source_per_day: 10
+
+scheduler:
+  job_discovery_minutes: 10
+  analytics_daily_hour_utc: 2
+  cleanup_daily_hour_utc: 3
+
+llm:
+  provider: "anthropic"
+  model: "configurable"
+  max_requests_per_minute: 20

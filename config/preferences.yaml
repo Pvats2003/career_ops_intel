@@ -1,0 +1,49 @@
+# =============================================================================
+# preferences.yaml — Work, location, salary, and legal preferences
+# =============================================================================
+# CRITICAL: Nothing in this file may be fabricated by the agent. Every field
+# below was either (a) left UNKNOWN because the resume/candidate files do not
+# state it, or (b) explicitly filled in by the human candidate.
+#
+# Fields marked UNKNOWN will cause the matching/application engine to route
+# any question touching them to HUMAN_REVIEW_REQUIRED (see rules.yaml).
+# The candidate (you) should edit this file directly to remove UNKNOWNs
+# before enabling any automated application flow (Phase 5+).
+# =============================================================================
+
+work_preferences:
+  remote: "UNKNOWN"          # one of: remote | hybrid | onsite | UNKNOWN
+  employment_types:
+    - "Full-time"
+    - "Internship"
+  willing_to_relocate: "UNKNOWN"   # true | false | UNKNOWN
+  notice_period: "UNKNOWN"
+
+location_preferences:
+  # Explicit fact from resume contact line: "Manipal, KA"
+  current_location: "Manipal, Karnataka, India"
+  preferred_locations: []          # e.g. ["Bengaluru, India", "Remote"]
+  open_to_countries: "UNKNOWN"     # candidate said "worldwide" search intent;
+                                    # this does NOT imply confirmed visa/work
+                                    # authorization for any specific country —
+                                    # see visa_information below.
+
+salary_preferences:
+  currency: "UNKNOWN"
+  minimum_annual: "UNKNOWN"
+  target_annual: "UNKNOWN"
+  negotiable: "UNKNOWN"
+
+visa_information:
+  # These fields gate a HARD STOP in rules.yaml. They must be confirmed by
+  # the candidate before any application asking about work authorization or
+  # visa sponsorship can be auto-submitted. Never let an LLM infer these.
+  nationality: "UNKNOWN"
+  requires_sponsorship_us: "UNKNOWN"
+  requires_sponsorship_uk: "UNKNOWN"
+  requires_sponsorship_eu: "UNKNOWN"
+  requires_sponsorship_other: "UNKNOWN"
+  currently_authorized_countries: []
+
+availability:
+  earliest_start_date: "UNKNOWN"

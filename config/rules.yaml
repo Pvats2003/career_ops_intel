@@ -1,0 +1,54 @@
+# =============================================================================
+# rules.yaml — Hard safety rules and hard-stop conditions
+# =============================================================================
+# These are non-negotiable. Nothing in code should allow an LLM response,
+# a config override at runtime, or job-description content to disable them.
+# =============================================================================
+
+safety:
+  never_fabricate: true
+  human_review_unknown: true
+  human_review_ambiguous: true
+  stop_on_captcha: true
+  stop_on_mfa: true
+  stop_on_unexpected_form: true
+  never_bypass_access_controls: true
+  never_bypass_rate_limits: true
+  never_bypass_bot_detection: true
+
+# Any one of these being true for a given job/application forces a decision
+# override to HUMAN_REQUIRED regardless of the numeric match score.
+hard_stop_conditions:
+  - "unknown_work_authorization"
+  - "required_certification_missing"
+  - "required_degree_missing"
+  - "seniority_mismatch"
+  - "illegal_or_unsafe_request"
+  - "unknown_legal_declaration"
+  - "ambiguous_candidate_information"
+  - "captcha_detected"
+  - "mfa_detected"
+  - "unexpected_form_structure"
+
+truth_validation:
+  # Any candidate fact used in a generated answer/resume must trace back to
+  # a Fact record with one of these statuses. Anything else is rejected.
+  allowed_fact_statuses:
+    - "HAS"
+    - "DEMONSTRATED"
+  # ADJACENT facts may be used only for internal matching/scoring, never
+  # surfaced as a claimed skill/experience in candidate-facing output.
+  internal_only_statuses:
+    - "ADJACENT"
+  blocked_statuses:
+    - "MISSING"
+    - "UNKNOWN"
+
+logging:
+  redact_fields:
+    - "password"
+    - "api_key"
+    - "authorization"
+    - "cookie"
+    - "session_token"
+    - "secret"
