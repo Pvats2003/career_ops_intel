@@ -176,6 +176,31 @@ class LLMSettings(StrictModel):
     max_requests_per_minute: int = 20
 
 
+# --------------------------------------------------------------------------
+# Application-provider selection (Phase 6B CLI wiring). Mirrors sources.
+# yaml's per-source `enabled: false` opt-in pattern exactly:
+# `manual_review` (the only provider in production before this phase) stays
+# the default so no existing behavior changes unless a config explicitly
+# selects otherwise. `structured_ats` additionally requires its own nested
+# `enabled: true` — two switches, not one, matching the same
+# defense-in-depth posture `AppConfig.is_submission_allowed()` already uses
+# for dry_run/live_mode.
+# --------------------------------------------------------------------------
+class StructuredATSProviderConfig(StrictModel):
+    enabled: bool = False
+    # Relative to the repo root; points at a LOCAL fixture file only — see
+    # config/fixtures/structured_ats_forms.example.yaml. Never a URL, never
+    # anything fetched over the network.
+    fixture_path: str = "config/fixtures/structured_ats_forms.example.yaml"
+
+
+class ApplicationProviderConfig(StrictModel):
+    provider: Literal["manual_review", "structured_ats"] = "manual_review"
+    structured_ats: StructuredATSProviderConfig = Field(
+        default_factory=StructuredATSProviderConfig
+    )
+
+
 class AutomationConfig(StrictModel):
     automation: AutomationSettings
     dry_run: bool = True
@@ -187,6 +212,9 @@ class AutomationConfig(StrictModel):
     applications: ApplicationLimits
     scheduler: SchedulerSettings
     llm: LLMSettings
+    application_provider: ApplicationProviderConfig = Field(
+        default_factory=ApplicationProviderConfig
+    )
 
 
 # --------------------------------------------------------------------------

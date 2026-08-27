@@ -1272,6 +1272,70 @@ class TestAdversarialReview:
 
 
 # --------------------------------------------------------------------------
+# load_fixture_forms (Phase 6B CLI wiring — local fixture loading)
+# --------------------------------------------------------------------------
+class TestLoadFixtureForms:
+    def test_loads_a_well_formed_fixture_file(self, tmp_path):
+        from job_agent.applications.providers.structured_ats import load_fixture_forms
+
+        path = tmp_path / "forms.yaml"
+        path.write_text(
+            "forms:\n"
+            "  - application_url: \"https://x.test/1\"\n"
+            "    ats_application_url: \"https://x.test/1/apply\"\n"
+            "    ats_application_id: \"ats-1\"\n"
+            "    fields:\n"
+            "      - field_id: \"f1\"\n"
+            "        label: \"Tell me about yourself.\"\n"
+            "        field_type: \"TEXTAREA\"\n"
+        )
+        forms = load_fixture_forms(path)
+        assert set(forms) == {"https://x.test/1"}
+        assert forms["https://x.test/1"].ats_application_id == "ats-1"
+        assert len(forms["https://x.test/1"].fields) == 1
+
+    def test_missing_file_raises_file_not_found_rather_than_empty_mapping(self, tmp_path):
+        from job_agent.applications.providers.structured_ats import load_fixture_forms
+
+        with pytest.raises(FileNotFoundError):
+            load_fixture_forms(tmp_path / "does_not_exist.yaml")
+
+    def test_duplicate_application_url_raises_rather_than_silently_picking_one(self, tmp_path):
+        """Ambiguous provider behavior (Phase 6B CLI-wiring adversarial
+        review): two fixture entries claiming the same application_url
+        must never be silently resolved by last-wins dict overwrite."""
+        from job_agent.applications.providers.structured_ats import load_fixture_forms
+
+        path = tmp_path / "forms.yaml"
+        path.write_text(
+            "forms:\n"
+            "  - application_url: \"https://x.test/dup\"\n"
+            "    ats_application_url: \"a\"\n"
+            "    ats_application_id: \"1\"\n"
+            "  - application_url: \"https://x.test/dup\"\n"
+            "    ats_application_url: \"b\"\n"
+            "    ats_application_id: \"2\"\n"
+        )
+        with pytest.raises(ValueError, match="duplicate application_url"):
+            load_fixture_forms(path)
+
+    def test_malformed_shape_raises_pydantic_validation_error(self, tmp_path):
+        from job_agent.applications.providers.structured_ats import load_fixture_forms
+
+        path = tmp_path / "forms.yaml"
+        path.write_text("forms:\n  - not_a_valid_field: true\n")
+        with pytest.raises(ValueError):  # pydantic.ValidationError is a ValueError subclass
+            load_fixture_forms(path)
+
+    def test_empty_file_returns_empty_mapping(self, tmp_path):
+        from job_agent.applications.providers.structured_ats import load_fixture_forms
+
+        path = tmp_path / "forms.yaml"
+        path.write_text("forms: []\n")
+        assert load_fixture_forms(path) == {}
+
+
+# --------------------------------------------------------------------------
 # 20. Full Phase 1-6A regression is exercised by the rest of the test suite
 # (run together via `pytest`, not duplicated here).
 # --------------------------------------------------------------------------

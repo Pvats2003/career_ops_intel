@@ -59,7 +59,12 @@ from job_agent.applications.answer_bank import load_answer_bank
 from job_agent.applications.answer_engine import generate_answer
 from job_agent.applications.duplicates import find_cross_source_duplicate_application
 from job_agent.applications.errors import ProviderError
-from job_agent.applications.provider import ApplicationProvider
+from job_agent.applications.provider import ApplicationProvider, ManualReviewProvider
+from job_agent.applications.providers.structured_ats import (
+    ATSApplicationForm,
+    StructuredATSProvider,
+    load_fixture_forms,
+)
 from job_agent.applications.rate_limits import check_rate_limits
 from job_agent.applications.repository import (
     get_answers,
@@ -78,7 +83,7 @@ from job_agent.applications.schema import (
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError, can_transition
 from job_agent.candidate.schema import CandidateProfile
-from job_agent.config.loader import AppConfig
+from job_agent.config.loader import REPO_ROOT, AppConfig
 from job_agent.db.models import Application, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
@@ -93,6 +98,55 @@ logger = get_logger("job_agent.applications.service")
 class PreparationOutcome:
     application: Application
     answers: list[GeneratedAnswer] = field(default_factory=list)
+
+
+def build_application_provider(
+    config: AppConfig, jobs: list[JobRow] | None = None
+) -> ApplicationProvider:
+    """Resolves which `ApplicationProvider` `applications prepare` should
+    use for a batch, driven entirely by `config.automation.
+    application_provider` (Phase 6B CLI wiring) — mirrors `job_agent.jobs.
+    service.build_sources`'s config-driven resolution pattern: read the
+    real, loaded config, construct nothing unless explicitly enabled,
+    never silently substitute one provider for another.
+
+    Default — `provider: "manual_review"`, the value every shipped
+    `config/automation.yaml` carries — always returns
+    `ManualReviewProvider()`, byte-for-byte the same provider
+    `applications prepare` used before this function existed. There is no
+    configuration that changes that default.
+
+    `StructuredATSProvider` is constructed only when BOTH
+    `provider: "structured_ats"` AND `application_provider.structured_ats.
+    enabled: true` are set (two explicit switches, matching `dry_run`/
+    `live_mode`'s own defense-in-depth posture) — and even then, only from
+    a LOCAL fixture file (`load_fixture_forms`, no network I/O). `jobs`
+    supplies the batch actually being prepared so the provider is given
+    exactly the fixture forms relevant to it (matched by each Job's
+    `application_url` against the fixture file's keys, then translated to
+    that Job's real `job_id`) — never every fixture entry regardless of
+    relevance.
+
+    This function decides nothing about application eligibility,
+    submission, or safety — it only chooses which honest adapter answers
+    `get_questions`/`discover_application`/`inspect_application`/`submit`/
+    `verify` for the rest of the pipeline, which remains entirely
+    unchanged by this choice.
+    """
+    provider_cfg = config.automation.application_provider
+    if provider_cfg.provider != "structured_ats" or not provider_cfg.structured_ats.enabled:
+        return ManualReviewProvider()
+
+    fixture_path = REPO_ROOT / provider_cfg.structured_ats.fixture_path
+    forms_by_url = load_fixture_forms(fixture_path)
+    forms: dict[int, ATSApplicationForm] = {}
+    for job in jobs or []:
+        if job.application_url is None:
+            continue
+        form = forms_by_url.get(job.application_url)
+        if form is not None:
+            forms[job.id] = form
+    return StructuredATSProvider(forms)
 
 
 def discover_application(

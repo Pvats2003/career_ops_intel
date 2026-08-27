@@ -30,7 +30,11 @@ from sqlalchemy import select
 from job_agent.applications.provider import ManualReviewProvider
 from job_agent.applications.repository import get_answers, get_latest_event
 from job_agent.applications.schema import ApplicationStatus
-from job_agent.applications.service import prepare_applications_batch, submit_applications_batch
+from job_agent.applications.service import (
+    build_application_provider,
+    prepare_applications_batch,
+    submit_applications_batch,
+)
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
 from job_agent.config.loader import REPO_ROOT, load_config
 from job_agent.db.models import Application, JobMatch
@@ -467,7 +471,6 @@ def applications_prepare() -> None:
         raise typer.Exit(code=1) from exc
 
     llm = build_llm_provider(cfg)
-    provider = ManualReviewProvider()
 
     with session_factory() as session:
         candidate_id = save_candidate_profile(session, profile)
@@ -487,6 +490,29 @@ def applications_prepare() -> None:
             if job is None:
                 continue
             items.append((job, jm))
+
+        # Phase 6B: which ApplicationProvider to use is config-driven
+        # (`config.automation.application_provider`), mirroring
+        # `job_agent.jobs.service.build_sources`'s pattern. Default
+        # ("manual_review") is byte-for-byte the same provider this
+        # command has always hardcoded — StructuredATSProvider only ever
+        # runs when explicitly enabled, and only against a local fixture
+        # file (never a network call, never a real ATS). A misconfigured
+        # fixture_path (e.g. a typo) must fail loudly with a clear,
+        # redacted message here — never as an unhandled traceback, and
+        # never by silently falling back to a different provider.
+        try:
+            provider = build_application_provider(cfg, [job for job, _ in items])
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(
+                f"[red]Failed to resolve application provider:[/red] {redact_text(str(exc))}"
+            )
+            raise typer.Exit(code=1) from exc
+        if provider.name != "manual_review":
+            console.print(
+                f"[cyan]Using application provider:[/cyan] {provider.name} "
+                "(local fixture data only — submission remains disabled)"
+            )
 
         outcomes = prepare_applications_batch(
             session, cfg, items, candidate_id, profile, provider, llm=llm

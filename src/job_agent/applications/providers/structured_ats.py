@@ -58,7 +58,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from job_agent.applications.errors import SubmissionRefusedError
@@ -159,6 +161,70 @@ class ATSApplicationForm(BaseModel):
     mfa_present: bool = False
     consent_required: bool = False
     fields: tuple[ATSFormField, ...] = Field(default_factory=tuple)
+
+
+class _FixtureFormEntry(BaseModel):
+    """One entry of a local fixture file (see `load_fixture_forms`) — keyed
+    by `application_url` rather than `job_id`, since a Job row's database
+    id doesn't exist until the job has actually been scanned/persisted and
+    so can't be known ahead of time in a static config file."""
+
+    model_config = ConfigDict(frozen=True)
+
+    application_url: str
+    ats_application_url: str
+    ats_application_id: str
+    captcha_present: bool = False
+    mfa_present: bool = False
+    consent_required: bool = False
+    fields: tuple[ATSFormField, ...] = Field(default_factory=tuple)
+
+
+class _FixtureFile(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    forms: tuple[_FixtureFormEntry, ...] = Field(default_factory=tuple)
+
+
+def load_fixture_forms(path: Path) -> dict[str, ATSApplicationForm]:
+    """Reads a LOCAL fixture YAML file (see config/fixtures/
+    structured_ats_forms.example.yaml) and returns a mapping of
+    `application_url -> ATSApplicationForm`.
+
+    Performs a single local file read — `yaml.safe_load` — and nothing
+    else; there is no network call anywhere in this function, matching
+    this module's local-fixture-only design. A missing file raises
+    `FileNotFoundError` rather than silently returning an empty mapping,
+    so a misconfigured `fixture_path` fails loudly at startup instead of
+    quietly routing every job to HUMAN_REQUIRED for a confusing,
+    hard-to-diagnose reason. Two entries sharing the same
+    `application_url` raise `ValueError` for the same reason — silently
+    picking one (last-wins, in whatever order the file happens to list
+    them) would be exactly the kind of ambiguous, unauditable provider
+    behavior this system otherwise refuses to guess through.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"structured_ats fixture file not found: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh) or {}
+    parsed = _FixtureFile.model_validate(raw)
+
+    forms: dict[str, ATSApplicationForm] = {}
+    for entry in parsed.forms:
+        if entry.application_url in forms:
+            raise ValueError(
+                "structured_ats fixture file has duplicate application_url entries: "
+                f"{entry.application_url!r}"
+            )
+        forms[entry.application_url] = ATSApplicationForm(
+            ats_application_url=entry.ats_application_url,
+            ats_application_id=entry.ats_application_id,
+            captcha_present=entry.captcha_present,
+            mfa_present=entry.mfa_present,
+            consent_required=entry.consent_required,
+            fields=entry.fields,
+        )
+    return forms
 
 
 def _structure_recognized(form: ATSApplicationForm) -> bool:

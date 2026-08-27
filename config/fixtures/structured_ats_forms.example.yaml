@@ -1,0 +1,47 @@
+# =============================================================================
+# structured_ats_forms.example.yaml — LOCAL/FAKE fixture data for
+# StructuredATSProvider (Phase 6B)
+# =============================================================================
+# This file is NEVER fetched from a network and NEVER represents a real ATS
+# platform, a real employer, or a real job posting. It exists only so
+# `job-agent applications prepare` can be exercised end-to-end against a
+# StructuredATSProvider without contacting anything real, per the Phase 6B
+# spec's "local/fixture data only" requirement.
+#
+# `job_agent.applications.providers.structured_ats.load_fixture_forms()` is
+# the ONLY reader of this file. It is disabled by default — see
+# config/automation.yaml's `application_provider` section — and is not
+# consulted at all unless `application_provider.provider` is explicitly set
+# to "structured_ats" AND `application_provider.structured_ats.enabled` is
+# explicitly set to true.
+#
+# Each entry is keyed by `application_url` — the SAME string stored on the
+# Job row being prepared (i.e. the URL a real JobSource adapter would have
+# discovered, or a fake one used for local testing) — because a Job's
+# database id is only assigned once it's scanned/persisted and can't be
+# known ahead of time in a static config file.
+#
+# Every field below is inert, structural data — labels/placeholders/
+# descriptions/options are treated as untrusted external content by
+# StructuredATSProvider exactly as if they came from a real platform (see
+# that module's docstring). Nothing in this file can grant submission
+# capability: StructuredATSProvider.submit() unconditionally refuses
+# regardless of anything configured here.
+# =============================================================================
+
+forms:
+  - application_url: "https://ats.example.test/acme/associate-product-manager"
+    ats_application_url: "https://ats.example.test/acme/associate-product-manager/apply"
+    ats_application_id: "example-fixture-1"
+    captcha_present: false
+    mfa_present: false
+    consent_required: false
+    fields:
+      - field_id: "f1"
+        label: "Tell me about yourself."
+        field_type: "TEXTAREA"
+        required: true
+      - field_id: "f2"
+        label: "Are you willing to relocate?"
+        field_type: "YES_NO"
+        required: false
