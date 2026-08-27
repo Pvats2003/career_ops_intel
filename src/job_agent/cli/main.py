@@ -3,6 +3,8 @@
 Phase 1 implements: init, profile parse, status, health.
 Phase 2 adds: jobs scan.
 Phase 3 adds: jobs match.
+Phase 4 adds: profile parse now also snapshots a validated, versioned
+profile (candidate_profile_versions); profile history lists past versions.
 Later-phase commands are registered now (so the interface contract is
 stable) but exit with a clear "not implemented yet" message rather than
 pretending to do something they can't — see BUILD PROMPT section 48.
@@ -25,6 +27,9 @@ from job_agent.jobs.service import run_scan
 from job_agent.llm.provider import NullLLMProvider, build_llm_provider
 from job_agent.logging.setup import configure_logging, get_logger, log_event
 from job_agent.matching.service import run_matching
+from job_agent.resume.errors import ResumeExtractionError
+from job_agent.resume.repository import list_versions
+from job_agent.resume.service import create_profile_version
 
 app = typer.Typer(help="Autonomous global job discovery and application agent.")
 profile_app = typer.Typer(help="Candidate profile commands.")
@@ -133,6 +138,95 @@ def profile_parse() -> None:
         else "[yellow]NO — HUMAN_REVIEW_REQUIRED[/yellow]"
     )
     table.add_row("Visa info known", visa_known)
+    console.print(table)
+
+    with session_factory() as session:
+        try:
+            result = create_profile_version(session, cfg, profile, candidate_id)
+        except ResumeExtractionError as exc:
+            log_event(
+                logger,
+                component="cli.profile_parse",
+                action="version",
+                result="failure",
+                error=str(exc),
+            )
+            console.print(f"[red]Could not read the authoritative resume file:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+    if not result.passed:
+        console.print(
+            f"[red]Profile version {result.version.version_number} FAILED validation against "
+            f"the resume — {len(result.issues)} unverifiable claim(s):[/red]"
+        )
+        for issue in result.issues:
+            console.print(f"  [red]•[/red] [{issue.field}] {issue.detail}")
+        log_event(
+            logger,
+            component="cli.profile_parse",
+            action="version",
+            result="failure",
+            version_number=result.version.version_number,
+            issue_count=len(result.issues),
+        )
+        raise typer.Exit(code=1)
+
+    status_word = "created" if result.created else "unchanged"
+    console.print(
+        f"[green]Profile version {result.version.version_number}[/green] "
+        f"({status_word}) — verified against resume_master.docx, 0 unverifiable claims."
+    )
+    log_event(
+        logger,
+        component="cli.profile_parse",
+        action="version",
+        result="success",
+        version_number=result.version.version_number,
+        created=result.created,
+    )
+
+
+@profile_app.command("history")
+def profile_history() -> None:
+    """List every candidate profile version, oldest first."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    try:
+        profile = parse_candidate_profile(cfg)
+    except CandidateParseError as exc:
+        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with session_factory() as session:
+        candidate_id = save_candidate_profile(session, profile)
+        versions = list_versions(session, candidate_id)
+
+    if not versions:
+        console.print(
+            "[yellow]No profile versions yet.[/yellow] Run `job-agent profile parse` first."
+        )
+        raise typer.Exit(code=0)
+
+    table = Table(title="Candidate Profile Version History")
+    table.add_column("Version")
+    table.add_column("Status")
+    table.add_column("Profile Hash")
+    table.add_column("Resume Hash")
+    table.add_column("Created At")
+    for v in versions:
+        status_str = (
+            "[green]PASSED[/green]" if v.validation_status == "PASSED" else "[red]FAILED[/red]"
+        )
+        table.add_row(
+            str(v.version_number),
+            status_str,
+            v.profile_hash[:12],
+            v.resume_file_hash[:12],
+            v.created_at.isoformat(),
+        )
     console.print(table)
 
 

@@ -142,6 +142,42 @@ class Project(Base, TimestampMixin):
     candidate: Mapped[Candidate] = relationship(back_populates="projects")
 
 
+class CandidateProfileVersion(Base):
+    """An immutable, hashed snapshot of a CandidateProfile — Phase 4.
+
+    Insert-only, matching job_matches' audit-trail philosophy (section 53):
+    a version is never updated or deleted once created, so any later phase
+    (resume tailoring, applications) can record "this application used
+    profile version N" and that claim stays true forever, even after the
+    candidate's resume/profile files change again.
+
+    `profile_hash`/`resume_file_hash`/`source_file_hashes` are what make a
+    version's identity concrete and checkable — not "when it ran", but
+    "exactly which bytes it was derived from". `validation_status` records
+    whether every fact in `snapshot` was verified against the resume file
+    at creation time (job_agent.resume.validator); a FAILED version is
+    still persisted (never silently dropped) but must never be treated as
+    the current, trustworthy profile by downstream consumers.
+    """
+
+    __tablename__ = "candidate_profile_versions"
+    __table_args__ = (
+        Index("ix_candidate_profile_versions_candidate_id", "candidate_id"),
+        Index("ix_candidate_profile_versions_profile_hash", "profile_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidate.id"))
+    version_number: Mapped[int]
+    profile_hash: Mapped[str] = mapped_column(String(64))
+    resume_file_hash: Mapped[str] = mapped_column(String(64))
+    source_file_hashes: Mapped[dict] = mapped_column(JSON, default=dict)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    validation_status: Mapped[str] = mapped_column(String(16))  # "PASSED" | "FAILED"
+    validation_issues: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 # --------------------------------------------------------------------------
 # Companies
 # --------------------------------------------------------------------------
