@@ -1,7 +1,16 @@
-"""Credential-provider abstraction — Phase 6C groundwork.
+"""Credential-provider abstraction — Phase 6C.5 (Credential Safety &
+Verification Foundation) groundwork.
 
 ============================================================================
-PHASE 6C IS GROUNDWORK ONLY. THIS MODULE IS DORMANT.
+PHASE 6C.5 — CREDENTIAL SAFETY & VERIFICATION FOUNDATION. GROUNDWORK ONLY.
+THIS MODULE IS DORMANT.
+
+Not to be confused with the README's "Phase 6C" — that name is reserved
+for a future, distinct, later phase: controlled real-world execution
+(live-mode submission against a small, human-approved allowlist). This
+module belongs to Phase 6C.5, a foundation phase that sits between Phase
+6B and that future Phase 6C, and grants no part of that later phase's
+capability.
 ============================================================================
 REAL CREDENTIALS: NONE — nothing in this module ever holds, reads, or
     accepts a real ATS credential. `NullCredentialStore`, the only
@@ -53,8 +62,8 @@ None of the following exist yet. Every one of them is required — not just
 "a real credential" — before any phase may enable a real submission:
 
 1. `config/preferences.yaml` fully filled in by the candidate (salary,
-   visa/work authorization, relocation) — as of Phase 6C these are still
-   all `UNKNOWN`, and per `config/rules.yaml` any application question
+   visa/work authorization, relocation) — as of Phase 6C.5 these are
+   still all `UNKNOWN`, and per `config/rules.yaml` any application question
    touching them must route to a human, never be guessed.
 2. A real credential source implementation (e.g. an environment-variable-
    or vault-backed `CredentialProvider`) added and wired to a real
@@ -134,7 +143,7 @@ class NullCredentialStore(CredentialProvider):
     def get_credential(self, name: str) -> str:
         raise CredentialUnavailableError(
             f"No credential is configured for {name!r}. This build ships no "
-            "real credential source (Phase 6C is dormant groundwork only) — "
+            "real credential source (Phase 6C.5 is dormant groundwork only) — "
             "a future, explicitly-reviewed phase must add and wire one "
             "before any real credential can be used."
         )

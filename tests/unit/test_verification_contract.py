@@ -1,4 +1,5 @@
-"""Phase 6C — verification-evidence contract tests.
+"""Phase 6C.5 (Credential Safety & Verification Foundation) —
+verification-evidence contract tests.
 
 Covers `validate_submission_evidence()`'s shape-only plausibility checks
 using synthetic evidence only (nothing here was ever produced by a real
@@ -183,7 +184,7 @@ def test_verify_application_unaffected_by_the_new_stricter_validator(db_session)
 
     # verify_application's own, unchanged rule (has_concrete_evidence)
     # governs here — still reaches VERIFIED exactly as it did before
-    # Phase 6C, proving this new module changed nothing about it.
+    # Phase 6C.5, proving this new module changed nothing about it.
     assert result.status == ApplicationStatus.VERIFIED.value
 
 

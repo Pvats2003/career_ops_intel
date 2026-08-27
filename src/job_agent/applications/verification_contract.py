@@ -1,7 +1,16 @@
-"""Verification-evidence contract — Phase 6C groundwork.
+"""Verification-evidence contract — Phase 6C.5 (Credential Safety &
+Verification Foundation) groundwork.
 
 ============================================================================
-PHASE 6C IS GROUNDWORK ONLY. THIS MODULE IS DORMANT.
+PHASE 6C.5 — CREDENTIAL SAFETY & VERIFICATION FOUNDATION. GROUNDWORK ONLY.
+THIS MODULE IS DORMANT.
+
+Not to be confused with the README's "Phase 6C" — that name is reserved
+for a future, distinct, later phase: controlled real-world execution
+(live-mode submission against a small, human-approved allowlist). This
+module belongs to Phase 6C.5, a foundation phase that sits between Phase
+6B and that future Phase 6C, and grants no part of that later phase's
+capability.
 ============================================================================
 REAL CREDENTIALS: NONE.
 REAL SUBMISSIONS: NONE.
@@ -35,7 +44,7 @@ the behavior of, `job_agent.applications.service.verify_application` — the
 existing, only path to `VERIFIED` (see `job_agent.applications.service`) is
 completely unmodified by this phase. `verify_application` still requires
 `result.verified is True` AND `result.evidence is not None` AND
-`result.evidence.has_concrete_evidence` — exactly as before Phase 6C. This
+`result.evidence.has_concrete_evidence` — exactly as before Phase 6C.5. This
 module's stricter validator has no consumer anywhere in the execution path
 today; it exists as a documented, tested contract for a later phase to
 adopt deliberately (e.g. by additionally requiring

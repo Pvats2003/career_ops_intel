@@ -915,6 +915,20 @@ of which are implemented and none of which should be assumed from Phase
   provider, most likely against Greenhouse or Lever since discovery
   adapters already exist for both), still dry-run-gated in every test and
   by config in production; no real submission.
+- **Phase 6C.5 — Credential Safety & Verification Foundation** — a
+  foundation phase between Phase 6B and Phase 6C, distinct from and not a
+  replacement for the live-execution Phase 6C below: a dormant,
+  provider-agnostic `CredentialProvider` interface (the only shipped
+  implementation, `NullCredentialStore`, holds no credential source of
+  any kind and cannot return a value for any name) and a shape-only
+  verification-evidence validator (`validate_submission_evidence`,
+  explicitly not proof a submission occurred) — both unwired from every
+  execution path, proven by adversarial and structural tests. No real
+  credentials, no real network calls, no real submissions, no browser
+  automation, and no change to any existing application behavior. Exists
+  so a future live-execution phase adds a real implementation against an
+  already-reviewed contract instead of inventing credential handling
+  under pressure.
 - **Phase 6C** — controlled real-world execution: enabling live-mode for
   the 6B provider against a small, explicitly-approved allowlist of real
   postings, automation level capped low, human approval required per

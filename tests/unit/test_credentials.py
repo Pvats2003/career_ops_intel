@@ -1,9 +1,10 @@
-"""Phase 6C — credential-provider safety tests.
+"""Phase 6C.5 (Credential Safety & Verification Foundation) — credential-
+provider safety tests.
 
 Covers: the `CredentialProvider` interface contract, `NullCredentialStore`'s
 structural incapability of returning any value, and adversarial proof that
 a synthetic secret flowing through this abstraction and the EXISTING
-redaction pipeline (never a new one — Phase 6C reuses
+redaction pipeline (never a new one — Phase 6C.5 reuses
 `job_agent.logging.setup.redact_text`/`redact_value` exactly as prior
 phases did) never reaches logs, the audit trail, `Application.error_message`,
 or an unredacted exception string.
@@ -304,7 +305,7 @@ class TestDormancy:
 
     def test_no_config_flag_references_this_module_or_live_submission(self):
         """No config file introduces a switch implying live submission or
-        wires credentials.py in — Phase 6C adds zero configuration."""
+        wires credentials.py in — Phase 6C.5 adds zero configuration."""
         config_dir = REPO_ROOT / "config"
         for yaml_path in config_dir.glob("*.yaml"):
             text = yaml_path.read_text(encoding="utf-8").lower()
