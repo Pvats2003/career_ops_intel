@@ -1,6 +1,7 @@
 """job-agent CLI.
 
 Phase 1 implements: init, profile parse, status, health.
+Phase 2 adds: jobs scan.
 Later-phase commands are registered now (so the interface contract is
 stable) but exit with a clear "not implemented yet" message rather than
 pretending to do something they can't — see BUILD PROMPT section 48.
@@ -19,6 +20,7 @@ from job_agent.candidate.parser import CandidateParseError, parse_candidate_prof
 from job_agent.config.loader import REPO_ROOT, load_config
 from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
+from job_agent.jobs.service import run_scan
 from job_agent.logging.setup import configure_logging, get_logger, log_event
 
 app = typer.Typer(help="Autonomous global job discovery and application agent.")
@@ -205,7 +207,55 @@ def dry_run() -> None:
 
 @jobs_app.command("scan")
 def jobs_scan() -> None:
-    _not_implemented("Phase 2 (Job Engine)")
+    """Poll all enabled job sources and persist newly discovered/updated jobs."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        results = run_scan(session, cfg)
+
+    if not results:
+        console.print(
+            "[yellow]No job sources are enabled.[/yellow] Edit config/sources.yaml "
+            "(set enabled: true and fill in real board tokens) to scan for jobs."
+        )
+        raise typer.Exit(code=0)
+
+    table = Table(title="Job Scan Results")
+    table.add_column("Source")
+    table.add_column("Board")
+    table.add_column("Fetched")
+    table.add_column("Created")
+    table.add_column("Updated")
+    table.add_column("Errors")
+    total_errors = 0
+    for r in results:
+        total_errors += len(r.errors)
+        table.add_row(
+            r.source_name,
+            r.identifier,
+            str(r.fetched),
+            str(r.created),
+            str(r.updated),
+            str(len(r.errors)) if not r.errors else f"[red]{len(r.errors)}[/red]",
+        )
+    console.print(table)
+    for r in results:
+        for err in r.errors:
+            console.print(f"[red]{r.source_name}/{r.identifier}:[/red] {err}")
+
+    log_event(
+        logger,
+        component="cli.jobs_scan",
+        action="scan",
+        result="success" if not total_errors else "partial_failure",
+        sources_scanned=len(results),
+        total_errors=total_errors,
+    )
+    if total_errors:
+        raise typer.Exit(code=1)
 
 
 @jobs_app.command("match")

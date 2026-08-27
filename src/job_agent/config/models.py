@@ -82,12 +82,26 @@ class PreferencesConfig(StrictModel):
 # --------------------------------------------------------------------------
 # sources.yaml
 # --------------------------------------------------------------------------
+class BoardIdentifier(StrictModel):
+    """One company's board within an ATS-API source.
+
+    Field names are generic across ATS kinds: `token` is the Greenhouse
+    board token or Lever company slug; `company_name` is supplied
+    explicitly by the human rather than inferred from the token, since some
+    list endpoints don't reliably return a display name.
+    """
+
+    token: str
+    company_name: str
+
+
 class SourceConfig(StrictModel):
     enabled: bool = False
     kind: Literal["ats_api", "scrape", "restricted"] = "restricted"
     poll_interval_minutes: int | None = None
     rate_limit_per_minute: int | None = None
     notes: str = ""
+    boards: list[BoardIdentifier] = Field(default_factory=list)
 
 
 class GlobalLimits(StrictModel):

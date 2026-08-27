@@ -17,6 +17,16 @@ sources:
     poll_interval_minutes: 10
     rate_limit_per_minute: 20
     notes: "Public job-board JSON API per-company; no auth needed for reads."
+    # Each entry polls https://boards-api.greenhouse.io/v1/boards/{token}/jobs.
+    # `token` is the company's Greenhouse board token (found in their careers
+    # page URL, e.g. boards.greenhouse.io/<token>) and `company_name` is
+    # supplied explicitly rather than inferred. PLACEHOLDER — this sandbox's
+    # network policy blocks outbound calls to boards-api.greenhouse.io, so
+    # these could not be live-verified from here. Confirm real board tokens
+    # (visit the company's careers page) before enabling.
+    boards:
+      - token: "REPLACE_WITH_REAL_GREENHOUSE_BOARD_TOKEN"
+        company_name: "REPLACE_WITH_COMPANY_NAME"
 
   lever:
     enabled: false
@@ -24,6 +34,12 @@ sources:
     poll_interval_minutes: 10
     rate_limit_per_minute: 20
     notes: "Public postings API per-company."
+    # Each entry polls https://api.lever.co/v0/postings/{token}?mode=json.
+    # `token` is the company's Lever slug. Same PLACEHOLDER caveat as above —
+    # api.lever.co is also not reachable from this sandbox to verify.
+    boards:
+      - token: "REPLACE_WITH_REAL_LEVER_COMPANY_SLUG"
+        company_name: "REPLACE_WITH_COMPANY_NAME"
 
   workday:
     enabled: false
