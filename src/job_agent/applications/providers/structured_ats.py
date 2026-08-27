@@ -214,6 +214,13 @@ class StructuredATSProvider(ApplicationProvider):
     """
 
     name = "structured_ats"
+    # Opts into the Phase 6B inspection-wiring capability: discover_
+    # application/inspect_application below perform genuine structural-
+    # fact detection against the local fixture (not the ABC's honest-but-
+    # conservative "not actually inspected" default), so
+    # job_agent.applications.service.prepare_application may safely call
+    # them for this provider. See ApplicationProvider.supports_inspection.
+    supports_inspection = True
 
     def __init__(self, forms: Mapping[int, ATSApplicationForm]) -> None:
         self._forms: dict[int, ATSApplicationForm] = dict(forms)

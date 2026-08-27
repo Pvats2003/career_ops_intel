@@ -28,7 +28,7 @@ from rich.table import Table
 from sqlalchemy import select
 
 from job_agent.applications.provider import ManualReviewProvider
-from job_agent.applications.repository import get_answers
+from job_agent.applications.repository import get_answers, get_latest_event
 from job_agent.applications.schema import ApplicationStatus
 from job_agent.applications.service import prepare_applications_batch, submit_applications_batch
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
@@ -492,6 +492,27 @@ def applications_prepare() -> None:
             session, cfg, items, candidate_id, profile, provider, llm=llm
         )
 
+        # Phase 6B: surface *why* an application landed at HUMAN_REQUIRED
+        # (CAPTCHA/MFA/consent/unexpected form, an inspection-stage
+        # provider error, or a hard-block/missing-fact answer) — read
+        # while `session` is still open, since the audit trail lives in
+        # the DB, not on the in-memory outcome. `get_latest_event` is
+        # read-only and returns already-redacted `details` (every
+        # `ApplicationEvent` row is redacted at write time by
+        # `record_event`), so nothing here needs its own redaction pass.
+        # This is purely informational — it changes nothing about which
+        # provider ran, whether inspection happened (still governed
+        # entirely by `provider.supports_inspection`), or how the status
+        # was decided; only production, not real submission, behavior.
+        reasons: dict[int, str] = {}
+        for item in outcomes:
+            if item.application is not None and item.application.status == (
+                ApplicationStatus.HUMAN_REQUIRED.value
+            ):
+                event = get_latest_event(session, item.application.id)
+                if event is not None:
+                    reasons[item.application.id] = event.event_type
+
     if not outcomes:
         console.print(
             "[yellow]No job matches found.[/yellow] Run `job-agent jobs match` first."
@@ -518,9 +539,12 @@ def applications_prepare() -> None:
             )
             continue
         color = status_colors.get(item.application.status, "white")
+        detail = ""
+        if item.application.status == ApplicationStatus.HUMAN_REQUIRED.value:
+            detail = reasons.get(item.application.id, "")
         table.add_row(
             str(item.job.id), item.job.company_name, item.job.title,
-            f"[{color}]{item.application.status}[/{color}]", "",
+            f"[{color}]{item.application.status}[/{color}]", detail,
         )
     console.print(table)
     if error_count:

@@ -194,6 +194,50 @@ def prepare_application(
 
     llm = llm or NullLLMProvider()
 
+    # Phase 6B: inspection is capability-driven (`provider.
+    # supports_inspection`), never assumed. A provider that never opted in
+    # (every Phase 5/6A provider, and any future one that doesn't
+    # implement real structural inspection) is left on the exact Phase
+    # 5/6A code path below, unchanged. See `ApplicationProvider.
+    # supports_inspection`'s docstring for why an unconditional call here
+    # would be a correctness regression, not a safety improvement.
+    if provider.supports_inspection:
+        try:
+            discovery_target = provider.discover_application(job)
+            inspection = provider.inspect_application(job, discovery_target)
+        except ProviderError as exc:
+            # error_message is a plain DB column, not routed through
+            # record_event()'s redaction — must be scrubbed here explicitly.
+            application.error_message = redact_text(str(exc))
+            transition_status(
+                session,
+                application,
+                ApplicationStatus.FAILED,
+                event_type="INSPECTION_FAILED",
+                details={"error": str(exc)},
+            )
+            session.commit()
+            return PreparationOutcome(application=application)
+
+        # `inspection` carries untrusted external content (field labels/
+        # descriptions the provider parsed) only inside `detail`, a plain
+        # diagnostic string — never inside the boolean facts
+        # `evaluate_inspection` actually decides on. Passing it straight
+        # through changes nothing about that boundary: the provider
+        # reports facts, `evaluate_inspection` (real `config.rules.
+        # safety`, never a provider-side copy) is still the only place a
+        # HUMAN_REQUIRED-from-inspection decision is made.
+        verdict = evaluate_inspection(config.rules, inspection)
+        application = handle_application_inspection(session, config, application, inspection)
+        if verdict.human_required:
+            # A safety gate, not merely informational — matches how every
+            # other gate in this module (submit_application's dry_run/
+            # approval/rate-limit checks) short-circuits rather than
+            # proceeding past a failed check. A human must resolve
+            # CAPTCHA/MFA/consent/an unrecognized form before answer
+            # generation is even meaningful.
+            return PreparationOutcome(application=application)
+
     try:
         questions = provider.get_questions(job)
     except ProviderError as exc:

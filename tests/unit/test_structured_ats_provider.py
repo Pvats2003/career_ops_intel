@@ -1010,7 +1010,15 @@ class TestBatchIsolation:
         good_match = _match_row(db_session, good_job, candidate_row, decision=Decision.APPLY)
         bad_match = _match_row(db_session, bad_job, candidate_row, decision=Decision.APPLY)
 
-        provider = _RaisesForOneJobProvider({}, fail_job_id=bad_job.id)
+        # Both jobs get a clean, recognized fixture form registered so
+        # inspection passes cleanly for both and get_questions() is
+        # actually reached — this test isolates get_questions() failure
+        # specifically, distinct from an inspection-stage failure (see
+        # TestInspectionWiring's dedicated batch-isolation tests below).
+        provider = _RaisesForOneJobProvider(
+            {good_job.id: _answerable_form(), bad_job.id: _answerable_form()},
+            fail_job_id=bad_job.id,
+        )
 
         from job_agent.candidate.parser import parse_candidate_profile
 

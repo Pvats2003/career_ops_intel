@@ -137,6 +137,23 @@ def get_answers(session: Session, application_id: int) -> list[ApplicationAnswer
     )
 
 
+def get_latest_event(session: Session, application_id: int) -> ApplicationEvent | None:
+    """Most recent audit-trail entry for an application — read-only, used
+    by the CLI (Phase 6B) to surface *why* an application landed at
+    HUMAN_REQUIRED (e.g. `CAPTCHA_DETECTED`, `MFA_DETECTED`,
+    `CONSENT_REQUIRED`, `UNEXPECTED_FORM_STRUCTURE`, or a hard-block/
+    answer-driven reason) without duplicating `record_event`'s redaction
+    logic — every `details` value already passed through
+    `redact_value()` before it was written, so nothing extra is needed
+    here to display it safely."""
+    return session.execute(
+        select(ApplicationEvent)
+        .where(ApplicationEvent.application_id == application_id)
+        .order_by(ApplicationEvent.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
 # --------------------------------------------------------------------------
 # Rate limiting queries — BUILD PROMPT section 43 / config/automation.yaml
 # --------------------------------------------------------------------------
