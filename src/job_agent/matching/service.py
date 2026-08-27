@@ -19,12 +19,15 @@ from job_agent.candidate.schema import CandidateProfile
 from job_agent.config.loader import AppConfig
 from job_agent.db.models import Job as JobRow
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
+from job_agent.logging.setup import get_logger, log_event
 from job_agent.matching.decision import finalize
 from job_agent.matching.deterministic import JobText, compute_deterministic_match
 from job_agent.matching.repository import save_job_match
 from job_agent.matching.schema import Decision, JobMatchResult
 from job_agent.matching.scoring import combine_match
 from job_agent.matching.semantic import SemanticOutcome, run_semantic_match
+
+logger = get_logger("job_agent.matching.service")
 
 # Below this deterministic-only estimate, don't bother with an LLM call —
 # see module docstring. Set well below save_threshold so a job that's only
@@ -118,8 +121,28 @@ def run_matching(
 
     outcomes: list[MatchOutcome] = []
     for job_row in job_rows:
-        outcome = match_job(profile, config, job_row, llm)
-        save_job_match(session, job_id=job_row.id, candidate_id=candidate_id, result=outcome.result)
+        try:
+            outcome = match_job(profile, config, job_row, llm)
+            save_job_match(
+                session, job_id=job_row.id, candidate_id=candidate_id, result=outcome.result
+            )
+        except Exception as exc:  # noqa: BLE001
+            # One malformed/unexpected job must never abort the whole batch —
+            # at "thousands of jobs" scale, that would mean a single bad
+            # posting silently loses every other job's match this run. The
+            # failure is logged (not swallowed) and the job is simply left
+            # unmatched this run; it remains eligible on the next `jobs match`.
+            log_event(
+                logger,
+                component="matching.service",
+                action="match_job",
+                result="failure",
+                job_id=job_row.id,
+                title=job_row.title,
+                company=job_row.company_name,
+                error=str(exc),
+            )
+            continue
         outcomes.append(outcome)
     session.commit()
     return outcomes

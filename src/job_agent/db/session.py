@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from job_agent.db.models import Base
@@ -18,12 +18,27 @@ from job_agent.db.models import Base
 
 def get_engine(database_url: str) -> Engine:
     connect_args = {}
-    if database_url.startswith("sqlite"):
+    is_sqlite = database_url.startswith("sqlite")
+    if is_sqlite:
         connect_args = {"check_same_thread": False}
         if ":memory:" not in database_url:
             db_path = database_url.split("///")[-1]
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    return create_engine(database_url, connect_args=connect_args)
+    engine = create_engine(database_url, connect_args=connect_args)
+
+    if is_sqlite:
+        # SQLite ignores FOREIGN KEY constraints unless explicitly told to
+        # enforce them per-connection — without this, every ForeignKey(...)
+        # in db/models.py is purely documentation, and an orphaned or
+        # invalid reference (a job_matches row pointing at a deleted job,
+        # a typo'd candidate_id) would insert silently instead of failing.
+        @event.listens_for(engine, "connect")
+        def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+    return engine
 
 
 def get_session_factory(engine: Engine) -> sessionmaker[Session]:

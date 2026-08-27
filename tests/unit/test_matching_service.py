@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
+from job_agent.db.models import Candidate, JobMatch, JobSource
 from job_agent.db.models import Job as JobRow
-from job_agent.db.models import JobMatch, JobSource
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.llm.provider import LLMCallMetadata, LLMProvider, NullLLMProvider
 from job_agent.matching.schema import Decision
@@ -22,6 +24,21 @@ def db_session():
 @pytest.fixture()
 def source_row(db_session):
     row = JobSource(name="greenhouse", kind="ats_api", enabled=True)
+    db_session.add(row)
+    db_session.flush()
+    return row
+
+
+@pytest.fixture()
+def candidate_row(db_session):
+    # A real row is required now that SQLite foreign keys are enforced
+    # (db.session.get_engine) — job_matches.candidate_id must reference an
+    # actual candidate, matching how the real `jobs match` CLI command
+    # always runs `save_candidate_profile` before `run_matching`.
+    row = Candidate(
+        name="Test Candidate", email="test@example.com", phone="+1", linkedin="li",
+        current_location="Remote", parsed_at=datetime.now(UTC),
+    )
     db_session.add(row)
     db_session.flush()
     return row
@@ -105,7 +122,7 @@ def test_match_job_calls_semantic_for_promising_job(
 
 
 def test_run_matching_persists_and_returns_outcomes(
-    db_session, source_row, real_profile, real_config
+    db_session, source_row, candidate_row, real_profile, real_config
 ):
     job1 = _job_row(source_row, source_job_id="1")
     job2 = _job_row(source_row, source_job_id="2", title="Business Analyst")
@@ -113,21 +130,53 @@ def test_run_matching_persists_and_returns_outcomes(
     db_session.flush()
 
     outcomes = run_matching(
-        db_session, real_config, real_profile, candidate_id=1, llm=NullLLMProvider()
+        db_session, real_config, real_profile, candidate_id=candidate_row.id, llm=NullLLMProvider()
     )
     assert len(outcomes) == 2
     assert db_session.query(JobMatch).count() == 2
 
 
-def test_run_matching_with_job_ids_filter(db_session, source_row, real_profile, real_config):
+def test_run_matching_with_job_ids_filter(
+    db_session, source_row, candidate_row, real_profile, real_config
+):
     job1 = _job_row(source_row, source_job_id="1")
     job2 = _job_row(source_row, source_job_id="2", title="Business Analyst")
     db_session.add_all([job1, job2])
     db_session.flush()
 
     outcomes = run_matching(
-        db_session, real_config, real_profile, candidate_id=1, llm=NullLLMProvider(),
-        job_ids=[job1.id],
+        db_session, real_config, real_profile, candidate_id=candidate_row.id,
+        llm=NullLLMProvider(), job_ids=[job1.id],
     )
     assert len(outcomes) == 1
     assert outcomes[0].job_id == job1.id
+
+
+def test_run_matching_survives_one_bad_job_in_the_batch(
+    db_session, source_row, candidate_row, real_profile, real_config, monkeypatch
+):
+    """A single job that raises during matching must not abort the whole
+    batch — the other jobs' matches must still be computed and persisted."""
+    import job_agent.matching.service as service_module
+
+    job1 = _job_row(source_row, source_job_id="1")
+    job2 = _job_row(source_row, source_job_id="2", title="Business Analyst")
+    job3 = _job_row(source_row, source_job_id="3", title="Data Analyst")
+    db_session.add_all([job1, job2, job3])
+    db_session.flush()
+
+    real_match_job = service_module.match_job
+
+    def _flaky_match_job(profile, config, job_row, llm):
+        if job_row.id == job2.id:
+            raise RuntimeError("simulated unexpected failure for this job only")
+        return real_match_job(profile, config, job_row, llm)
+
+    monkeypatch.setattr(service_module, "match_job", _flaky_match_job)
+
+    outcomes = run_matching(
+        db_session, real_config, real_profile, candidate_id=candidate_row.id, llm=NullLLMProvider()
+    )
+
+    assert {o.job_id for o in outcomes} == {job1.id, job3.id}
+    assert db_session.query(JobMatch).count() == 2

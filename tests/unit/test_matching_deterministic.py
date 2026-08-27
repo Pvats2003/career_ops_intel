@@ -124,3 +124,23 @@ def test_experience_no_requirement_stated(real_profile, real_config):
     job = _job(description="A great opportunity for the right candidate.")
     result = compute_deterministic_match(real_profile, real_config.profile, job)
     assert result.experience_match > 50
+
+
+def test_multiple_hard_stops_all_survive_aggregation(real_profile, real_config):
+    """Independent hard-stop conditions must accumulate, not overwrite each
+    other — decision.py needs to see every one of them, not just the last
+    sub-check that happened to run."""
+    job = _job(
+        title="Staff Product Analyst",  # triggers seniority_mismatch, not excluded
+        description=(
+            "MBA required. Must be authorized to work in the United States "
+            "without sponsorship."
+        ),
+    )
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert set(result.hard_stop_reasons) == {
+        "required_degree_missing",
+        "seniority_mismatch",
+        "unknown_work_authorization",
+    }
+    assert result.excluded_reasons == []
