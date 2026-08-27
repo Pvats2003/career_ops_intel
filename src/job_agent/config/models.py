@@ -199,6 +199,7 @@ class SafetyRules(StrictModel):
     stop_on_captcha: bool = True
     stop_on_mfa: bool = True
     stop_on_unexpected_form: bool = True
+    stop_on_consent_required: bool = True
     never_bypass_access_controls: bool = True
     never_bypass_rate_limits: bool = True
     never_bypass_bot_detection: bool = True

@@ -33,6 +33,7 @@ from job_agent.config.models import RulesConfig
 
 CAPTCHA_DETECTED = "captcha_detected"
 MFA_DETECTED = "mfa_detected"
+CONSENT_REQUIRED = "consent_required"
 UNEXPECTED_FORM_STRUCTURE = "unexpected_form_structure"
 
 
@@ -55,15 +56,17 @@ def evaluate_inspection(rules: RulesConfig, inspection: ApplicationInspection) -
     """Maps a provider's raw structural facts to a HUMAN_REQUIRED verdict,
     driven entirely by the actual, loaded `config/rules.yaml` values.
 
-    Checked in a fixed order (CAPTCHA, then MFA, then unrecognized
-    structure) so the audit reason is always the single most specific
-    condition that applies, not an arbitrary one when more than one fact
-    is true at once.
+    Checked in a fixed order (CAPTCHA, then MFA, then required consent,
+    then unrecognized structure) so the audit reason is always the single
+    most specific condition that applies, not an arbitrary one when more
+    than one fact is true at once.
     """
     if inspection.captcha_detected and rules.safety.stop_on_captcha:
         return InspectionVerdict(human_required=True, reason=CAPTCHA_DETECTED)
     if inspection.mfa_detected and rules.safety.stop_on_mfa:
         return InspectionVerdict(human_required=True, reason=MFA_DETECTED)
+    if inspection.consent_required and rules.safety.stop_on_consent_required:
+        return InspectionVerdict(human_required=True, reason=CONSENT_REQUIRED)
     if not inspection.structure_recognized and rules.safety.stop_on_unexpected_form:
         return InspectionVerdict(human_required=True, reason=UNEXPECTED_FORM_STRUCTURE)
     return InspectionVerdict(human_required=False, reason=None)
