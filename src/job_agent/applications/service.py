@@ -22,6 +22,19 @@ enforced here, not left to the caller's discipline:
 * **No forbidden state jump** — every transition goes through
   `job_agent.applications.repository.transition_status`, which validates
   against `state_machine` and always writes an audit event.
+
+Phase 6A adds two things to this module, both purely additive — no
+existing function's signature or behavior changes:
+
+* **`handle_application_inspection`** — the only place
+  `job_agent.applications.rules_enforcement.evaluate_inspection`'s verdict
+  is applied to a real `Application` row, per the "provider reports, core
+  decides" boundary described in `job_agent.applications.provider`.
+* **`prepare_applications_batch` / `submit_applications_batch`** — per-item
+  failure isolation for the CLI's `applications prepare`/`applications
+  run` commands, following the exact pattern `job_agent.jobs.service.
+  scan_source` already uses for job sources: catch, log, roll back,
+  continue — one bad item can never abort the rest of the batch.
 """
 
 from __future__ import annotations
@@ -44,20 +57,25 @@ from job_agent.applications.repository import (
     save_answer,
     transition_status,
 )
+from job_agent.applications.rules_enforcement import evaluate_inspection
 from job_agent.applications.schema import (
+    ApplicationInspection,
     ApplicationStatus,
     GeneratedAnswer,
     QuestionCategory,
     SubmissionEvidence,
 )
-from job_agent.applications.state_machine import IllegalStateTransitionError
+from job_agent.applications.state_machine import IllegalStateTransitionError, can_transition
 from job_agent.candidate.schema import CandidateProfile
 from job_agent.config.loader import AppConfig
 from job_agent.db.models import Application, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
+from job_agent.logging.setup import get_logger, log_event
 from job_agent.matching.schema import Decision
 from job_agent.resume.extractor import extract_resume_text
+
+logger = get_logger("job_agent.applications.service")
 
 
 @dataclass
@@ -365,3 +383,141 @@ def _answers_from_db(session: Session, application_id: int) -> list[GeneratedAns
         )
         for row in rows
     ]
+
+
+def handle_application_inspection(
+    session: Session,
+    config: AppConfig,
+    application: Application,
+    inspection: ApplicationInspection,
+) -> Application:
+    """Applies `rules_enforcement.evaluate_inspection`'s verdict to a real
+    Application row — the only place a provider-reported structural fact
+    (CAPTCHA/MFA/unrecognized form) is translated into a HUMAN_REQUIRED
+    transition. The provider that produced `inspection` never calls this
+    itself and has no path to; see `job_agent.applications.provider`'s
+    module docstring for why that boundary matters.
+
+    Raises `IllegalStateTransitionError` if the application isn't in a
+    state HUMAN_REQUIRED can legally be reached from (e.g. already
+    VERIFIED/SKIPPED) — this function does not silently no-op on a caller
+    error, it surfaces it exactly like every other transition in this
+    module.
+    """
+    current = ApplicationStatus(application.status)
+    verdict = evaluate_inspection(config.rules, inspection)
+
+    if not verdict.human_required:
+        record_event(
+            session,
+            application.id,
+            "INSPECTION_PASSED",
+            {"detail": inspection.detail},
+        )
+        session.commit()
+        return application
+
+    if not can_transition(current, ApplicationStatus.HUMAN_REQUIRED):
+        raise IllegalStateTransitionError(current, ApplicationStatus.HUMAN_REQUIRED)
+
+    transition_status(
+        session,
+        application,
+        ApplicationStatus.HUMAN_REQUIRED,
+        event_type=verdict.reason.upper() if verdict.reason else "INSPECTION_HUMAN_REQUIRED",
+        details={"reason": verdict.reason, "inspection_detail": inspection.detail},
+    )
+    session.commit()
+    return application
+
+
+@dataclass
+class BatchItemOutcome:
+    """Result of processing one job/application within a batch — see
+    `prepare_applications_batch`/`submit_applications_batch`. `error` is
+    set only when processing this one item raised; a set `error` means
+    `application` reflects whatever state existed before the failure
+    (possibly `None` if the row was never even reached), never a guessed
+    or partially-applied result."""
+
+    job: JobRow
+    application: Application | None
+    error: str | None = None
+
+
+def prepare_applications_batch(
+    session: Session,
+    config: AppConfig,
+    items: list[tuple[JobRow, JobMatch]],
+    candidate_id: int,
+    profile: CandidateProfile,
+    provider: ApplicationProvider,
+    llm: LLMProvider | None = None,
+) -> list[BatchItemOutcome]:
+    """Runs `discover_application` + `prepare_application` for each
+    (job, job_match) pair, isolating failures exactly like
+    `job_agent.jobs.service.scan_source` isolates one job source's
+    failure from the rest of a scan: one bad item is caught, logged, and
+    rolled back so it can never abort the remaining items — and never
+    leaves a half-flushed row from the failed item polluting the next
+    item's transaction.
+    """
+    results: list[BatchItemOutcome] = []
+    for job, job_match in items:
+        try:
+            application = discover_application(session, config, job, job_match, candidate_id)
+            if ApplicationStatus(application.status) in (
+                ApplicationStatus.MATCHED,
+                ApplicationStatus.HUMAN_REQUIRED,
+            ):
+                outcome = prepare_application(
+                    session, config, application, job, profile, provider, llm=llm
+                )
+                application = outcome.application
+            results.append(BatchItemOutcome(job=job, application=application))
+        except Exception as exc:  # noqa: BLE001 — isolate one bad item from the rest of the batch
+            session.rollback()
+            log_event(
+                logger,
+                component="applications.service",
+                action="prepare_applications_batch_item",
+                result="failure",
+                job_id=job.id,
+                error=str(exc),
+            )
+            results.append(BatchItemOutcome(job=job, application=None, error=str(exc)))
+    return results
+
+
+def submit_applications_batch(
+    session: Session,
+    config: AppConfig,
+    items: list[tuple[Application, JobRow]],
+    provider: ApplicationProvider,
+    *,
+    human_approved: bool = False,
+) -> list[BatchItemOutcome]:
+    """Runs `submit_application` for each (application, job) pair with the
+    same per-item isolation as `prepare_applications_batch` — a single
+    application's failure never prevents the rest of the batch from being
+    attempted."""
+    results: list[BatchItemOutcome] = []
+    for application, job in items:
+        try:
+            result = submit_application(
+                session, config, application, job, provider, human_approved=human_approved
+            )
+            results.append(BatchItemOutcome(job=job, application=result))
+        except Exception as exc:  # noqa: BLE001 — isolate one bad item from the rest of the batch
+            session.rollback()
+            log_event(
+                logger,
+                component="applications.service",
+                action="submit_applications_batch_item",
+                result="failure",
+                job_id=job.id,
+                application_id=application.id,
+                error=str(exc),
+            )
+            results.append(BatchItemOutcome(job=job, application=None, error=str(exc)))
+    return results

@@ -1,16 +1,27 @@
-"""Canonical types for the Job Application Engine — Phase 5.
+"""Canonical types for the Job Application Engine — Phase 5, widened by
+Phase 6A's provider-architecture contracts.
 
 `ApplicationStatus` is the fixed, explicit state list this phase was built
 around (not the larger set sketched in earlier BUILD PROMPT drafts):
 
     DISCOVERED -> MATCHED -> PREPARED -> SUBMITTED -> VERIFIED
-         │            │           │
-         ▼            ▼           ▼
-    HUMAN_REQUIRED -> PREPARED   FAILED / SKIPPED
+         │            │           │           │
+         ▼            ▼           ▼           ▼
+    HUMAN_REQUIRED -> PREPARED   FAILED   SUBMISSION_UNCERTAIN -> VERIFIED
+                                 SKIPPED                       -> FAILED
+                                                                -> HUMAN_REQUIRED
 
 `job_agent.applications.state_machine` is the single place that enforces
 which of these transitions are legal — nothing here can jump straight from
-MATCHED to VERIFIED, for instance.
+MATCHED to VERIFIED, for instance. `SUBMISSION_UNCERTAIN` (added in Phase
+6A) exists for exactly one failure mode: a submission attempt whose actual
+outcome could not be determined (e.g. a network timeout after the request
+may already have reached the platform) — the system must never guess
+FAILED or VERIFIED for that case, so it has its own state with its own,
+deliberately narrow set of legal exits. No `ApplicationProvider` shipped in
+Phase 6A can ever produce this state; the transition exists so the
+contract is ready when a real provider that can time out ambiguously is
+eventually built (Phase 6B+).
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ class ApplicationStatus(StrEnum):
     PREPARED = "PREPARED"
     HUMAN_REQUIRED = "HUMAN_REQUIRED"
     SUBMITTED = "SUBMITTED"
+    SUBMISSION_UNCERTAIN = "SUBMISSION_UNCERTAIN"
     VERIFIED = "VERIFIED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
@@ -140,3 +152,64 @@ class VerificationResult(BaseModel):
     verified: bool
     evidence: SubmissionEvidence | None
     reason: str
+
+
+# --------------------------------------------------------------------------
+# Phase 6A — provider-architecture contract types.
+#
+# These describe what a *future*, real `ApplicationProvider` would report
+# about a live platform. No Phase 6A provider populates them from a real
+# platform — `ManualReviewProvider` returns honest, conservative defaults
+# for all three (see job_agent.applications.provider) — but the shape is
+# fixed now so the core engine, the safety-rule enforcement in
+# job_agent.applications.rules_enforcement, and every test written against
+# them do not need to change again when a real provider is eventually
+# built.
+# --------------------------------------------------------------------------
+class ApplicationTarget(BaseModel):
+    """Confirms (or fails to confirm) that a provider-specific application
+    endpoint exists for one job — nothing more. Carries no candidate data
+    and no credential of any kind; `provider_reference` is an opaque
+    handle a real provider could use to re-identify the same target on a
+    later call (e.g. a form ID), never a secret."""
+
+    model_config = ConfigDict(frozen=True)
+
+    job_id: int
+    reachable: bool
+    provider_reference: str | None = None
+    detail: str = ""
+
+
+class ApplicationInspection(BaseModel):
+    """Raw structural facts a provider observed about an application
+    target — CAPTCHA/MFA/consent presence, whether the form structure was
+    recognized. Deliberately **not** a HUMAN_REQUIRED decision: a provider
+    reports facts, it never decides eligibility. That decision is made
+    exactly once, in `job_agent.applications.rules_enforcement.
+    evaluate_inspection`, by consulting the real `config/rules.yaml`
+    values — never duplicated or reimplemented by a provider."""
+
+    model_config = ConfigDict(frozen=True)
+
+    structure_recognized: bool
+    captcha_detected: bool = False
+    mfa_detected: bool = False
+    consent_required: bool = False
+    detail: str = ""
+
+
+class PreparedFormState(BaseModel):
+    """An opaque handle representing 'answers have been staged against a
+    target form but nothing has been transmitted yet' — deliberately
+    inert beyond that fact, so that *filling* a form and *submitting* it
+    remain two separately-audited actions (BUILD PROMPT Phase 6 recon,
+    STEP 2: preparation vs. execution vs. verification). No Phase 6A
+    provider actually stages anything on a real platform."""
+
+    model_config = ConfigDict(frozen=True)
+
+    target_job_id: int
+    answer_count: int
+    provider_reference: str | None = None
+    detail: str = ""

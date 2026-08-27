@@ -18,6 +18,7 @@ from job_agent.applications.errors import ProviderTimeoutError, SubmissionRefuse
 from job_agent.applications.provider import ApplicationProvider, ProviderHealthCheck
 from job_agent.applications.repository import get_answers
 from job_agent.applications.schema import (
+    ApplicationInspection,
     ApplicationQuestion,
     ApplicationStatus,
     QuestionCategory,
@@ -26,9 +27,12 @@ from job_agent.applications.schema import (
 )
 from job_agent.applications.service import (
     discover_application,
+    handle_application_inspection,
     prepare_application,
+    prepare_applications_batch,
     retry_application,
     submit_application,
+    submit_applications_batch,
     verify_application,
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError
@@ -257,6 +261,62 @@ class _FabricatingLLM(LLMProvider):
 class _AlwaysInvalidLLM(LLMProvider):
     def complete_json(self, **kwargs):
         raise LLMOutputValidationError("malformed")
+
+
+class _SelectivelyCrashingQuestionsProvider(ApplicationProvider):
+    """Simulates an actual bug in a provider that only manifests for one
+    specific job (e.g. a malformed listing on the platform) — raises a
+    plain exception (NOT a ProviderError subclass) for that one job, so
+    it is deliberately NOT caught by prepare_application()'s own
+    `except ProviderError` handling, while behaving normally for every
+    other job. A single provider instance processes an entire batch in
+    real usage (one ManualReviewProvider for the whole CLI run), so
+    per-item isolation must hold even against one shared, misbehaving
+    instance — not just against two different provider instances."""
+
+    name = "selectively_crashing"
+
+    def __init__(self, crash_on_job_id: int):
+        self._crash_on_job_id = crash_on_job_id
+
+    def get_questions(self, job):
+        if job.id == self._crash_on_job_id:
+            raise RuntimeError("unexpected provider bug")
+        return [_MOTIVATION_QUESTION]
+
+    def submit(self, job, answers):
+        raise AssertionError("must never reach submit()")
+
+    def verify(self, job, evidence):
+        raise AssertionError("must never reach verify()")
+
+    def health_check(self):
+        return ProviderHealthCheck(healthy=False, detail="broken", checked_at=datetime.now(UTC))
+
+
+class _SelectivelyCrashingSubmitProvider(ApplicationProvider):
+    """Same idea as _SelectivelyCrashingQuestionsProvider, but for the
+    submit path — raises a plain exception submit_application() does not
+    already catch, only for one specific job."""
+
+    name = "selectively_crashing_submit"
+
+    def __init__(self, crash_on_job_id: int):
+        self._crash_on_job_id = crash_on_job_id
+
+    def get_questions(self, job):
+        return [_MOTIVATION_QUESTION]
+
+    def submit(self, job, answers):
+        if job.id == self._crash_on_job_id:
+            raise RuntimeError("unexpected provider bug during submit")
+        return SubmissionEvidence(confirmation_id=f"conf-{job.id}")
+
+    def verify(self, job, evidence):
+        return VerificationResult(verified=False, evidence=None, reason="not checked")
+
+    def health_check(self):
+        return ProviderHealthCheck(healthy=True, detail="ok", checked_at=datetime.now(UTC))
 
 
 # --------------------------------------------------------------------------
@@ -740,3 +800,219 @@ def test_application_events_accumulate_and_are_never_overwritten(
     # appended, nothing was updated or deleted.
     assert event_ids_after_submit.issubset(event_ids_after_verify)
     assert len(event_ids_after_verify) == len(event_ids_after_submit) + 1
+
+
+# --------------------------------------------------------------------------
+# Phase 6A — handle_application_inspection: config.rules actually enforced
+# --------------------------------------------------------------------------
+def test_inspection_captcha_detected_routes_to_human_required(
+    db_session, make_config, job, candidate_row
+):
+    match = _match_row(db_session, job, candidate_row, decision=Decision.APPLY)
+    application = discover_application(db_session, make_config(), job, match, candidate_row.id)
+    assert application.status == ApplicationStatus.MATCHED.value
+
+    inspection = ApplicationInspection(structure_recognized=True, captcha_detected=True)
+    result = handle_application_inspection(db_session, make_config(), application, inspection)
+
+    assert result.status == ApplicationStatus.HUMAN_REQUIRED.value
+    events = db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    assert any(e.event_type == "CAPTCHA_DETECTED" for e in events)
+
+
+def test_inspection_mfa_detected_routes_to_human_required(
+    db_session, make_config, job, candidate_row
+):
+    match = _match_row(db_session, job, candidate_row, decision=Decision.APPLY)
+    application = discover_application(db_session, make_config(), job, match, candidate_row.id)
+
+    inspection = ApplicationInspection(structure_recognized=True, mfa_detected=True)
+    result = handle_application_inspection(db_session, make_config(), application, inspection)
+
+    assert result.status == ApplicationStatus.HUMAN_REQUIRED.value
+    events = db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    assert any(e.event_type == "MFA_DETECTED" for e in events)
+
+
+def test_inspection_unrecognized_structure_routes_to_human_required(
+    db_session, make_config, job, candidate_row
+):
+    match = _match_row(db_session, job, candidate_row, decision=Decision.APPLY)
+    application = discover_application(db_session, make_config(), job, match, candidate_row.id)
+
+    inspection = ApplicationInspection(structure_recognized=False)
+    result = handle_application_inspection(db_session, make_config(), application, inspection)
+
+    assert result.status == ApplicationStatus.HUMAN_REQUIRED.value
+    events = db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    assert any(e.event_type == "UNEXPECTED_FORM_STRUCTURE" for e in events)
+
+
+def test_inspection_clean_result_does_not_change_application_state(
+    db_session, make_config, job, candidate_row
+):
+    match = _match_row(db_session, job, candidate_row, decision=Decision.APPLY)
+    application = discover_application(db_session, make_config(), job, match, candidate_row.id)
+
+    inspection = ApplicationInspection(structure_recognized=True)
+    result = handle_application_inspection(db_session, make_config(), application, inspection)
+
+    assert result.status == ApplicationStatus.MATCHED.value  # unchanged
+    events = db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    assert any(e.event_type == "INSPECTION_PASSED" for e in events)
+
+
+def test_inspection_on_terminal_application_raises_rather_than_silently_transitioning(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    """A CAPTCHA reported against an application that's already VERIFIED
+    (or SKIPPED) is a caller error, not something to silently smooth
+    over — must raise, exactly like every other illegal transition
+    attempt in this module."""
+    application = _submitted_application(db_session, live_config, job, candidate_row, real_profile)
+    provider = _FakeProvider(
+        verify_result=VerificationResult(
+            verified=True, evidence=SubmissionEvidence(confirmation_id="conf-1"), reason="ok"
+        )
+    )
+    verify_application(db_session, application, job, provider)
+    assert application.status == ApplicationStatus.VERIFIED.value
+
+    inspection = ApplicationInspection(structure_recognized=True, captcha_detected=True)
+    with pytest.raises(IllegalStateTransitionError):
+        handle_application_inspection(db_session, live_config, application, inspection)
+
+
+def test_inspection_verdict_respects_the_real_stop_on_captcha_flag_toggle(
+    db_session, make_config, job, candidate_row
+):
+    """Ensures the wiring genuinely flows through to the real
+    config.rules.safety flags, not a hardcoded assumption — flipping
+    stop_on_captcha off changes the outcome, using the SAME config object
+    type the rest of the app loads from config/rules.yaml."""
+    match = _match_row(db_session, job, candidate_row, decision=Decision.APPLY)
+    application = discover_application(db_session, make_config(), job, match, candidate_row.id)
+
+    from job_agent.config.models import SafetyRules
+
+    config = make_config()
+    permissive_rules = config.rules.model_copy(
+        update={"safety": config.rules.safety.model_copy(update={"stop_on_captcha": False})}
+    )
+    assert isinstance(permissive_rules.safety, SafetyRules)
+
+    class _PermissiveConfig:
+        def __getattr__(self, name):
+            return getattr(config, name)
+
+        @property
+        def rules(self):
+            return permissive_rules
+
+    inspection = ApplicationInspection(structure_recognized=True, captcha_detected=True)
+    result = handle_application_inspection(db_session, _PermissiveConfig(), application, inspection)
+    assert result.status == ApplicationStatus.MATCHED.value  # not routed to HUMAN_REQUIRED
+
+
+# --------------------------------------------------------------------------
+# Phase 6A — per-item batch failure isolation
+# --------------------------------------------------------------------------
+def test_prepare_batch_one_crashing_job_does_not_abort_the_rest(
+    db_session, make_config, candidate_row, real_profile
+):
+    good_job = _make_job(db_session, fingerprint="good-fp", source_name="greenhouse")
+    bad_job = _make_job(db_session, fingerprint="bad-fp", source_name="lever")
+    good_match = _match_row(db_session, good_job, candidate_row, decision=Decision.APPLY)
+    bad_match = _match_row(db_session, bad_job, candidate_row, decision=Decision.APPLY)
+
+    items = [(bad_job, bad_match), (good_job, good_match)]
+    provider = _SelectivelyCrashingQuestionsProvider(crash_on_job_id=bad_job.id)
+    outcomes = prepare_applications_batch(
+        db_session, make_config(), items, candidate_row.id, real_profile,
+        provider, llm=NullLLMProvider(),
+    )
+
+    assert len(outcomes) == 2
+    bad_outcome = next(o for o in outcomes if o.job.id == bad_job.id)
+    good_outcome = next(o for o in outcomes if o.job.id == good_job.id)
+
+    assert bad_outcome.error is not None
+    assert "unexpected provider bug" in bad_outcome.error
+    assert bad_outcome.application is None
+
+    # The good job was still fully processed despite the earlier crash —
+    # this is the entire point of per-item isolation.
+    assert good_outcome.error is None
+    assert good_outcome.application is not None
+    assert good_outcome.application.status == ApplicationStatus.PREPARED.value
+
+
+def test_prepare_batch_rolls_back_session_after_crash_so_next_item_is_clean(
+    db_session, make_config, candidate_row, real_profile
+):
+    """The crash happens after discover_application() already flushed a
+    DISCOVERED row for the bad job — without a rollback, that half-done
+    state could corrupt the next item's transaction. Confirm the bad
+    job's Application row still exists (discover_application itself
+    committed successfully) but is left in a legal, un-corrupted state."""
+    bad_job = _make_job(db_session, fingerprint="bad-fp2", source_name="lever")
+    bad_match = _match_row(db_session, bad_job, candidate_row, decision=Decision.APPLY)
+
+    provider = _SelectivelyCrashingQuestionsProvider(crash_on_job_id=bad_job.id)
+    outcomes = prepare_applications_batch(
+        db_session, make_config(), [(bad_job, bad_match)], candidate_row.id, real_profile,
+        provider, llm=NullLLMProvider(),
+    )
+    assert outcomes[0].error is not None
+
+    row = db_session.query(Application).filter_by(job_id=bad_job.id).one()
+    # discover_application's own commit already landed MATCHED before the
+    # crash in prepare_application — rollback only discards the crashed
+    # call's own uncommitted work, never previously-committed history.
+    assert row.status == ApplicationStatus.MATCHED.value
+
+
+def test_submit_batch_one_crashing_application_does_not_abort_the_rest(
+    db_session, live_config, candidate_row, real_profile
+):
+    good_job = _make_job(db_session, fingerprint="good-fp-submit", source_name="greenhouse")
+    bad_job = _make_job(db_session, fingerprint="bad-fp-submit", source_name="lever")
+    good_application = _prepared_application(
+        db_session, live_config, good_job, candidate_row, real_profile
+    )
+    bad_application = _prepared_application(
+        db_session, live_config, bad_job, candidate_row, real_profile
+    )
+
+    items = [(bad_application, bad_job), (good_application, good_job)]
+    provider = _SelectivelyCrashingSubmitProvider(crash_on_job_id=bad_job.id)
+    outcomes = submit_applications_batch(db_session, live_config, items, provider)
+
+    assert len(outcomes) == 2
+    bad_outcome = next(o for o in outcomes if o.job.id == bad_job.id)
+    good_outcome = next(o for o in outcomes if o.job.id == good_job.id)
+
+    assert bad_outcome.error is not None
+    assert "unexpected provider bug" in bad_outcome.error
+
+    # The good application was still submitted despite the earlier crash.
+    assert good_outcome.error is None
+    assert good_outcome.application is not None
+    assert good_outcome.application.status == ApplicationStatus.SUBMITTED.value
+
+
+def test_submit_batch_never_reaches_provider_for_dry_run_items(
+    db_session, make_config, candidate_row, real_profile
+):
+    """Batch isolation must not weaken the existing dry-run gate — a
+    provider that would assert if submit() were called must still never
+    see it, even inside the batch helper."""
+    job1 = _make_job(db_session, fingerprint="dryrun-fp1", source_name="greenhouse")
+    config = make_config()  # default: safe (dry_run True, live_mode False)
+    application1 = _prepared_application(db_session, config, job1, candidate_row, real_profile)
+
+    outcomes = submit_applications_batch(
+        db_session, config, [(application1, job1)], _AssertNeverSubmitsProvider()
+    )
+    assert outcomes[0].error is None
+    assert outcomes[0].application.status == ApplicationStatus.PREPARED.value
