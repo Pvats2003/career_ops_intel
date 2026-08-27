@@ -15,18 +15,30 @@ from datetime import UTC, datetime
 
 import pytest
 
-from job_agent.applications.errors import ProviderTimeoutError, SubmissionRefusedError
+from job_agent.applications.allowlist import create_allowlist_entry, revoke_allowlist_entry
+from job_agent.applications.approvals import (
+    compute_answer_fingerprint,
+    create_approval,
+    revoke_approval,
+)
+from job_agent.applications.errors import (
+    ProviderTimeoutError,
+    SubmissionOutcomeUnknownError,
+    SubmissionRefusedError,
+)
 from job_agent.applications.provider import ApplicationProvider, ProviderHealthCheck
-from job_agent.applications.repository import get_answers
+from job_agent.applications.repository import get_answers, save_answer
 from job_agent.applications.schema import (
     ApplicationInspection,
     ApplicationQuestion,
     ApplicationStatus,
+    GeneratedAnswer,
     QuestionCategory,
     SubmissionEvidence,
     VerificationResult,
 )
 from job_agent.applications.service import (
+    answers_from_db,
     discover_application,
     handle_application_inspection,
     prepare_application,
@@ -655,6 +667,308 @@ def test_submit_cannot_be_called_twice_on_same_application(
     with pytest.raises(IllegalStateTransitionError):
         submit_application(db_session, live_config, application, job, provider)
     assert provider.submit_calls == 1  # the illegal second call never reached the provider
+
+
+# --------------------------------------------------------------------------
+# Phase 6C — strict approval gate for `requires_persisted_approval`
+# providers. `live_config` sets automation level 4 throughout this section
+# specifically so every "blocked" assertion below also proves the exact
+# "Finding A" gap this phase closes: level 4 (and human_approved=True,
+# where passed) is never sufficient on its own for such a provider.
+# --------------------------------------------------------------------------
+class _StrictFakeProvider(_FakeProvider):
+    """Identical to `_FakeProvider` except it opts into
+    `requires_persisted_approval` — proves the allowlist + persisted-
+    approval gate actually engages, and that automation level/
+    human_approved never substitute for it."""
+
+    requires_persisted_approval = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # _FakeProvider.__init__ unconditionally sets self.name = "fake" —
+        # override it here so allowlist entries keyed by provider name
+        # actually match this provider, not its parent's.
+        self.name = "strict_fake"
+
+
+def test_strict_provider_blocked_with_no_allowlist_entry(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    provider = _StrictFakeProvider()
+
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+    events = db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    assert any(e.event_type == "SUBMISSION_BLOCKED_NOT_ALLOWLISTED" for e in events)
+
+
+def test_strict_provider_blocked_with_allowlist_but_no_approval(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    db_session.commit()
+    provider = _StrictFakeProvider()
+
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+    events = db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    assert any(e.event_type == "SUBMISSION_BLOCKED_NO_APPROVAL" for e in events)
+
+
+def test_strict_provider_automation_level_4_and_human_approved_never_substitute_for_approval(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    """Regression test for the exact 'Finding A' gap this phase closes."""
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    provider = _StrictFakeProvider()
+
+    result = submit_application(
+        db_session, live_config, application, job, provider, human_approved=True,
+    )
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+
+
+def test_strict_provider_allowlist_and_approval_reaches_submitted_and_consumes_approval(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    approval = create_approval(db_session, application.id, job.job_fingerprint, answer_fp)
+    db_session.commit()
+
+    evidence = SubmissionEvidence(confirmation_id="conf-strict-1")
+    provider = _StrictFakeProvider(submit_result=evidence)
+
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.SUBMITTED.value
+    assert provider.submit_calls == 1
+    db_session.refresh(approval)
+    assert approval.consumed_at is not None
+
+
+def test_strict_provider_consumed_approval_cannot_be_reused(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    create_approval(db_session, application.id, job.job_fingerprint, answer_fp)
+    db_session.commit()
+
+    provider = _StrictFakeProvider(submit_result=SubmissionEvidence(confirmation_id="conf-1"))
+    submit_application(db_session, live_config, application, job, provider)
+    assert application.status == ApplicationStatus.SUBMITTED.value
+
+    # Force back to PREPARED to simulate a caller retrying submission with
+    # the same, now-consumed approval.
+    application.status = ApplicationStatus.PREPARED.value
+    db_session.commit()
+
+    result = submit_application(db_session, live_config, application, job, provider)
+    assert result.status == ApplicationStatus.PREPARED.value  # blocked again
+    assert provider.submit_calls == 1  # never called a second time
+
+
+def test_strict_provider_approval_bound_to_stale_answers_does_not_match_after_reprepare(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    """An approval is bound to the EXACT answer fingerprint at approval
+    time. If a question's answer is regenerated (e.g. a re-run of
+    `applications prepare`) after approval, the old approval must no
+    longer validate."""
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    stale_answers = answers_from_db(db_session, application.id)
+    stale_fp = compute_answer_fingerprint(stale_answers)
+    create_approval(db_session, application.id, job.job_fingerprint, stale_fp)
+    db_session.commit()
+
+    save_answer(
+        db_session, application.id,
+        GeneratedAnswer(
+            question=_MOTIVATION_QUESTION.text, category=QuestionCategory.MOTIVATION,
+            answer="A completely different answer than what was approved.",
+            confidence=0.9, source="template", requires_human=False, validated=True,
+        ),
+    )
+    db_session.commit()
+
+    provider = _StrictFakeProvider()
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+
+
+def test_strict_provider_drifted_application_url_blocks_despite_valid_approval(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    create_approval(db_session, application.id, job.job_fingerprint, answer_fp)
+    db_session.commit()
+
+    job.application_url = job.application_url + "-drifted"
+    db_session.commit()
+
+    provider = _StrictFakeProvider()
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+
+
+def test_strict_provider_allowlist_for_different_provider_name_does_not_match(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    """Allowlist entries are per-provider, not just per-job — an entry
+    created for a different provider name must not authorize this one."""
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(
+        db_session, job.job_fingerprint, "some_other_provider", job.application_url
+    )
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    create_approval(db_session, application.id, job.job_fingerprint, answer_fp)
+    db_session.commit()
+
+    provider = _StrictFakeProvider()
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+
+
+def test_strict_provider_revoked_allowlist_entry_blocks(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    entry = create_allowlist_entry(
+        db_session, job.job_fingerprint, "strict_fake", job.application_url
+    )
+    revoke_allowlist_entry(db_session, entry)
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    create_approval(db_session, application.id, job.job_fingerprint, answer_fp)
+    db_session.commit()
+
+    provider = _StrictFakeProvider()
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+
+
+def test_strict_provider_revoked_approval_blocks(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    approval = create_approval(db_session, application.id, job.job_fingerprint, answer_fp)
+    revoke_approval(db_session, approval)
+    db_session.commit()
+
+    provider = _StrictFakeProvider()
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+
+
+def test_strict_provider_expired_approval_blocks(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    create_approval(db_session, application.id, job.job_fingerprint, answer_fp, ttl_hours=-1)
+    db_session.commit()
+
+    provider = _StrictFakeProvider()
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.PREPARED.value
+    assert provider.submit_calls == 0
+
+
+def test_strict_provider_ambiguous_outcome_routes_to_submission_uncertain(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    approval = create_approval(db_session, application.id, job.job_fingerprint, answer_fp)
+    db_session.commit()
+
+    provider = _StrictFakeProvider(
+        submit_error=SubmissionOutcomeUnknownError("ambiguous network failure mid-request")
+    )
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.SUBMISSION_UNCERTAIN.value
+    assert result.error_message is not None
+    db_session.refresh(approval)
+    # Burned even though the outcome is ambiguous — fail closed, never
+    # leave a replayable approval around after a possibly-sent submission.
+    assert approval.consumed_at is not None
+
+
+def test_submission_uncertain_can_never_be_retried_as_failed(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    """SUBMISSION_UNCERTAIN's only legal exits are VERIFIED, FAILED, and
+    HUMAN_REQUIRED (state_machine) — but `retry_application` only ever
+    resurrects a FAILED application, never SUBMISSION_UNCERTAIN, so there
+    is no code path that blindly re-attempts an ambiguous submission."""
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    create_allowlist_entry(db_session, job.job_fingerprint, "strict_fake", job.application_url)
+    answers = answers_from_db(db_session, application.id)
+    answer_fp = compute_answer_fingerprint(answers)
+    create_approval(db_session, application.id, job.job_fingerprint, answer_fp)
+    db_session.commit()
+
+    provider = _StrictFakeProvider(submit_error=SubmissionOutcomeUnknownError("ambiguous"))
+    submit_application(db_session, live_config, application, job, provider)
+    assert application.status == ApplicationStatus.SUBMISSION_UNCERTAIN.value
+
+    with pytest.raises(IllegalStateTransitionError):
+        retry_application(db_session, application)
+
+
+def test_non_strict_provider_completely_unaffected_by_phase_6c_gate(
+    db_session, live_config, job, candidate_row, real_profile
+):
+    """Regression proof: a provider that does NOT opt into
+    requires_persisted_approval (every pre-Phase-6C provider) still uses
+    the exact original automation-level/human_approved gate — no
+    allowlist, no approval, is ever consulted for it."""
+    application = _prepared_application(db_session, live_config, job, candidate_row, real_profile)
+    evidence = SubmissionEvidence(confirmation_id="conf-non-strict")
+    provider = _FakeProvider(submit_result=evidence)  # requires_persisted_approval defaults False
+
+    result = submit_application(db_session, live_config, application, job, provider)
+
+    assert result.status == ApplicationStatus.SUBMITTED.value
+    assert provider.submit_calls == 1
 
 
 # --------------------------------------------------------------------------

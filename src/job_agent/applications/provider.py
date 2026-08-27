@@ -103,6 +103,32 @@ class ApplicationProvider(ABC):
     # ------------------------------------------------------------------
     supports_inspection: bool = False
 
+    # ------------------------------------------------------------------
+    # Capability flag (Phase 6C — controlled real-world execution).
+    # Defaults to `False` so every existing provider — `ManualReviewProvider`,
+    # `StructuredATSProvider`, every fake provider in the test suite — is
+    # completely unaffected and keeps using the original Phase 5 submission
+    # gate in `job_agent.applications.service.submit_application` (automation
+    # level 4 OR an explicit `human_approved=True` argument). That original
+    # gate remains exactly as it was — `applications run` is untouched.
+    #
+    # A provider that sets this `True` is instead gated by the STRICTER
+    # Phase 6C path: a valid, unexpired, unconsumed, fingerprint-matching
+    # `ApplicationApproval` record is the ONLY way past the gate.
+    # `config.automation.automation.level` is never even consulted for such
+    # a provider — there is no automation level, including 4, that can
+    # substitute for a real, persisted, human-created approval. This closes
+    # the gap where `automation_level == 4` alone could satisfy the old
+    # gate's `automation_level >= 4 OR human_approved` check regardless of
+    # whether anyone had actually approved anything.
+    #
+    # Opting in is a capability declaration, not a grant of authority: it
+    # only changes which gate `submit_application` enforces before ever
+    # calling `provider.submit()` — the provider itself still decides
+    # nothing about whether it gets called.
+    # ------------------------------------------------------------------
+    requires_persisted_approval: bool = False
+
     @abstractmethod
     def get_questions(self, job: JobRow) -> list[ApplicationQuestion]:
         """Return the questions this job's application requires answering.
@@ -238,6 +264,10 @@ class ManualReviewProvider(ApplicationProvider):
     # provider inspected this and found it unrecognized" from "this
     # provider never inspects anything at all").
     supports_inspection = False
+    # Explicit, not just inherited — ManualReviewProvider stays on the
+    # original Phase 5 gate (automation level 4 OR human_approved=True);
+    # it never persists or requires an ApplicationApproval record.
+    requires_persisted_approval = False
 
     def get_questions(self, job: JobRow) -> list[ApplicationQuestion]:
         return list(_STANDARD_QUESTIONS)

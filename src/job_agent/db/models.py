@@ -359,6 +359,68 @@ class ApplicationEvent(Base):
 
 
 # --------------------------------------------------------------------------
+# Phase 6C — controlled real-world execution. Both tables below are
+# additive only; neither existing `applications`/`application_events`
+# table's columns or semantics change. Validity (expired/consumed/revoked)
+# is deliberately NOT stored as a redundant status string — it's always
+# computed from these timestamp columns (see
+# `job_agent.applications.approvals`/`job_agent.applications.allowlist`),
+# so there is exactly one source of truth per row, never a status column
+# that could drift out of sync with the timestamps that actually govern it.
+# --------------------------------------------------------------------------
+class ApplicationApproval(Base, TimestampMixin):
+    """One human's explicit, single-use authorization to submit ONE
+    specific `Application` — never reusable across applications, never
+    valid past `expires_at`, never valid a second time past `consumed_at`.
+
+    `posting_fingerprint`/`answer_fingerprint` bind the approval to the
+    EXACT job content and EXACT generated answers the human reviewed —
+    see `job_agent.applications.approvals.compute_answer_fingerprint`.
+    `job_agent.applications.service.submit_application` recomputes both
+    fingerprints from the application's CURRENT state immediately before
+    submitting and refuses if either has drifted since approval, so an
+    approval can never be silently stretched to cover different content.
+    """
+
+    __tablename__ = "application_approvals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id"), index=True)
+    posting_fingerprint: Mapped[str] = mapped_column(String(128))
+    answer_fingerprint: Mapped[str] = mapped_column(String(128))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ApplicationAllowlistEntry(Base, TimestampMixin):
+    """One explicitly, individually approved posting a real provider may
+    ever be asked to submit to. Keyed by `job_fingerprint` (the same
+    content fingerprint `job_agent.jobs.fingerprint` already computes for
+    cross-source duplicate detection) — deliberately NOT by company name,
+    search query, or domain, so authorization can never silently widen
+    beyond the exact posting a human reviewed.
+
+    `provider_name` binds the entry to one specific provider's view of
+    the posting; `canonical_url` is re-checked against the `Job` row's
+    current `application_url` at submission time so a changed target URL
+    is treated as drift, not silently followed.
+    """
+
+    __tablename__ = "application_allowlist_entries"
+    __table_args__ = (
+        Index("ix_application_allowlist_entries_job_fingerprint", "job_fingerprint"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_fingerprint: Mapped[str] = mapped_column(String(128))
+    provider_name: Mapped[str] = mapped_column(String(64))
+    canonical_url: Mapped[str] = mapped_column(String(1024))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# --------------------------------------------------------------------------
 # Notifications and system observability
 # --------------------------------------------------------------------------
 class Notification(Base):

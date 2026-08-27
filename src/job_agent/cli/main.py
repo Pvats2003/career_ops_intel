@@ -27,17 +27,26 @@ from rich.console import Console
 from rich.table import Table
 from sqlalchemy import select
 
+from job_agent.applications.allowlist import (
+    create_allowlist_entry,
+    revoke_allowlist_entry,
+)
+from job_agent.applications.approvals import compute_answer_fingerprint, create_approval
 from job_agent.applications.provider import ManualReviewProvider
 from job_agent.applications.repository import get_answers, get_latest_event
 from job_agent.applications.schema import ApplicationStatus
 from job_agent.applications.service import (
+    answers_from_db,
     build_application_provider,
     prepare_applications_batch,
+    submit_application,
     submit_applications_batch,
+    verify_application,
 )
+from job_agent.applications.state_machine import IllegalStateTransitionError
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
 from job_agent.config.loader import REPO_ROOT, load_config
-from job_agent.db.models import Application, JobMatch
+from job_agent.db.models import Application, ApplicationAllowlistEntry, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
@@ -53,9 +62,13 @@ app = typer.Typer(help="Autonomous global job discovery and application agent.")
 profile_app = typer.Typer(help="Candidate profile commands.")
 jobs_app = typer.Typer(help="Job discovery commands (Phase 2+).")
 applications_app = typer.Typer(help="Application pipeline commands (Phase 5+).")
+allowlist_app = typer.Typer(
+    help="Exact-posting submission allowlist (Phase 6C — controlled real-world execution)."
+)
 app.add_typer(profile_app, name="profile")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(applications_app, name="applications")
+applications_app.add_typer(allowlist_app, name="allowlist")
 
 console = Console()
 logger = get_logger("job_agent.cli")
@@ -676,6 +689,295 @@ def applications_run() -> None:
             f"[red]{error_count} application(s) failed to process[/red] — see the messages "
             "above and logs; every other application in this run was attempted independently."
         )
+
+
+@applications_app.command("approve")
+def applications_approve(
+    application_id: int = typer.Argument(..., help="Application id to approve."),
+    ttl_hours: int = typer.Option(
+        24, "--ttl-hours", help="Hours this approval stays valid before expiring unused."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the interactive confirmation prompt."
+    ),
+) -> None:
+    """Record a human's approval to submit ONE specific application, bound
+    to its EXACT current job content and EXACT current answers (Phase 6C
+    — controlled real-world execution).
+
+    This is the only way to satisfy the approval half of
+    `submit_application`'s gate for a provider with
+    `requires_persisted_approval = True` (e.g. `real_structured_ats`) —
+    no automation level and no other flag can substitute for it; that
+    provider never even looks at automation level. The approval is
+    single-use and expires after `--ttl-hours` (default 24); re-running
+    `applications prepare` regenerates answers and invalidates any
+    outstanding approval, since its answer fingerprint would no longer
+    match. Approving also requires a matching, unexpired allowlist entry
+    (see `applications allowlist add`) — this command only ever creates
+    the approval half of the gate, never the allowlist half.
+    """
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        if application is None:
+            console.print(f"[red]No application with id {application_id}.[/red]")
+            raise typer.Exit(code=1)
+        if application.status != ApplicationStatus.PREPARED.value:
+            console.print(
+                f"[red]Application {application_id} is {application.status}, not "
+                "PREPARED.[/red] Only a PREPARED application can be approved."
+            )
+            raise typer.Exit(code=1)
+        job = session.get(JobRow, application.job_id)
+        if job is None:
+            console.print(f"[red]Application {application_id} has no matching job row.[/red]")
+            raise typer.Exit(code=1)
+
+        answers = answers_from_db(session, application.id)
+        if any(a.requires_human for a in answers):
+            console.print(
+                f"[red]Application {application_id} still has answer(s) requiring human "
+                "input.[/red] Resolve them via `applications review` before approving."
+            )
+            raise typer.Exit(code=1)
+
+        console.print(
+            f"\n[bold]{job.company_name} — {job.title}[/bold] "
+            f"(application id {application.id})"
+        )
+        console.print(f"  Target URL: {job.application_url}")
+        console.print(f"  Job fingerprint: {job.job_fingerprint}")
+        console.print(f"  {len(answers)} answer(s) will be submitted if approved:")
+        for answer in answers:
+            console.print(f"    Q: {answer.question}")
+            console.print(f"    A: {answer.answer}")
+
+        if not yes:
+            typer.confirm(
+                "\nApprove this EXACT application (this job content + these exact "
+                "answers) for one real submission attempt?",
+                abort=True,
+            )
+
+        answer_fingerprint = compute_answer_fingerprint(answers)
+        approval = create_approval(
+            session, application.id, job.job_fingerprint, answer_fingerprint,
+            ttl_hours=ttl_hours,
+        )
+        session.commit()
+
+    console.print(
+        f"[green]Approved.[/green] approval id {approval.id}, expires at "
+        f"{approval.expires_at.isoformat()} — single-use, bound to this exact content."
+    )
+
+
+@applications_app.command("submit")
+def applications_submit(
+    application_id: int = typer.Argument(..., help="Application id to submit."),
+    confirm: bool = typer.Option(
+        False, "--confirm", help="Actually attempt the submission; without this, no-op."
+    ),
+) -> None:
+    """Attempt a real submission for ONE application (Phase 6C).
+
+    Unlike `applications run` (which always uses `ManualReviewProvider`
+    and can never actually submit anything), this command resolves the
+    provider from config exactly like `applications prepare` does
+    (`build_application_provider`) — so it CAN reach a real provider if
+    one is explicitly configured. Every safety gate in
+    `job_agent.applications.service.submit_application` still applies in
+    full: dry_run/live_mode, rate limits, and — for a provider with
+    `requires_persisted_approval = True` — a valid allowlist entry AND a
+    valid `applications approve`-created approval bound to this exact
+    content. Without `--confirm`, this command does nothing and makes no
+    database change.
+    """
+    if not confirm:
+        console.print(
+            "[yellow]No action taken.[/yellow] Pass --confirm to actually attempt "
+            f"submission for application {application_id}."
+        )
+        raise typer.Exit(code=0)
+
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        if application is None:
+            console.print(f"[red]No application with id {application_id}.[/red]")
+            raise typer.Exit(code=1)
+        job = session.get(JobRow, application.job_id)
+        if job is None:
+            console.print(f"[red]Application {application_id} has no matching job row.[/red]")
+            raise typer.Exit(code=1)
+
+        provider = build_application_provider(cfg, [job])
+        try:
+            result = submit_application(session, cfg, application, job, provider)
+        except IllegalStateTransitionError as exc:
+            console.print(
+                f"[red]Cannot submit application {application_id}:[/red] {exc}. Only a "
+                "PREPARED application can be submitted."
+            )
+            raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"Application {application_id} ({job.company_name} — {job.title}): "
+        f"[cyan]{result.status}[/cyan]"
+        + (f" ({result.error_message})" if result.error_message else "")
+    )
+
+
+@applications_app.command("verify")
+def applications_verify(
+    application_id: int = typer.Argument(..., help="Application id to verify."),
+) -> None:
+    """Attempt to independently verify a prior SUBMITTED application
+    (Phase 6C). Only `verify_application` can reach VERIFIED; for a
+    provider with `requires_persisted_approval = True`, this additionally
+    requires `job_agent.applications.verification_contract.validate_
+    submission_evidence` to pass, on top of the provider's own
+    `verified=True` + concrete-evidence result."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        if application is None:
+            console.print(f"[red]No application with id {application_id}.[/red]")
+            raise typer.Exit(code=1)
+        job = session.get(JobRow, application.job_id)
+        if job is None:
+            console.print(f"[red]Application {application_id} has no matching job row.[/red]")
+            raise typer.Exit(code=1)
+
+        provider = build_application_provider(cfg, [job])
+        try:
+            result = verify_application(session, application, job, provider)
+        except IllegalStateTransitionError as exc:
+            console.print(
+                f"[red]Cannot verify application {application_id}:[/red] {exc}. Only a "
+                "SUBMITTED application can be verified."
+            )
+            raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"Application {application_id} ({job.company_name} — {job.title}): "
+        f"[cyan]{result.status}[/cyan]"
+    )
+
+
+@allowlist_app.command("add")
+def allowlist_add(
+    job_id: int = typer.Argument(..., help="Job id to allowlist for real submission."),
+    provider_name: str = typer.Argument(
+        ..., help='Exact provider name, e.g. "real_structured_ats".'
+    ),
+    ttl_days: int = typer.Option(
+        7, "--ttl-days", help="Days this allowlist entry stays valid before expiring unused."
+    ),
+) -> None:
+    """Allowlist exactly ONE posting for exactly ONE provider (Phase 6C).
+
+    Keyed by the job's current content fingerprint and its CURRENT
+    `application_url` — never a company, a search query, or a domain.
+    `submit_application` requires the job's `application_url` to still
+    match this exact URL at submission time; a drifted target blocks
+    rather than silently following the new URL. This is only half of
+    the submission gate — an `applications approve`-created approval is
+    still required separately for each individual application.
+    """
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        job = session.get(JobRow, job_id)
+        if job is None:
+            console.print(f"[red]No job with id {job_id}.[/red]")
+            raise typer.Exit(code=1)
+        if not job.application_url:
+            console.print(f"[red]Job {job_id} has no application_url to allowlist.[/red]")
+            raise typer.Exit(code=1)
+
+        entry = create_allowlist_entry(
+            session, job.job_fingerprint, provider_name, job.application_url, ttl_days=ttl_days,
+        )
+        session.commit()
+
+    console.print(
+        f"[green]Allowlisted.[/green] entry id {entry.id}, provider {provider_name!r}, "
+        f"url {entry.canonical_url!r}, expires at {entry.expires_at.isoformat()}."
+    )
+
+
+@allowlist_app.command("revoke")
+def allowlist_revoke(
+    entry_id: int = typer.Argument(..., help="Allowlist entry id to revoke."),
+) -> None:
+    """Revoke one allowlist entry immediately — any application whose
+    submission attempt would have relied on it is blocked from that
+    point on, even if the entry hadn't expired yet."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        entry = session.get(ApplicationAllowlistEntry, entry_id)
+        if entry is None:
+            console.print(f"[red]No allowlist entry with id {entry_id}.[/red]")
+            raise typer.Exit(code=1)
+        revoke_allowlist_entry(session, entry)
+        session.commit()
+
+    console.print(f"[green]Revoked.[/green] allowlist entry id {entry_id}.")
+
+
+@allowlist_app.command("list")
+def allowlist_list() -> None:
+    """List every allowlist entry (active, expired, and revoked) — purely
+    informational, read-only."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        entries = list(
+            session.execute(
+                select(ApplicationAllowlistEntry).order_by(ApplicationAllowlistEntry.id.desc())
+            ).scalars()
+        )
+
+    if not entries:
+        console.print("[yellow]No allowlist entries.[/yellow]")
+        raise typer.Exit(code=0)
+
+    table = Table(title="Submission Allowlist")
+    table.add_column("ID")
+    table.add_column("Provider")
+    table.add_column("URL")
+    table.add_column("Expires At")
+    table.add_column("Revoked")
+    for entry in entries:
+        table.add_row(
+            str(entry.id), entry.provider_name, entry.canonical_url,
+            entry.expires_at.isoformat(), "yes" if entry.revoked_at else "no",
+        )
+    console.print(table)
 
 
 @app.command()

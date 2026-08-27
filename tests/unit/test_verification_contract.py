@@ -1,12 +1,17 @@
-"""Phase 6C.5 (Credential Safety & Verification Foundation) —
-verification-evidence contract tests.
+"""Verification-evidence contract tests — built as Phase 6C.5 groundwork,
+now actually wired into `verify_application` by Phase 6C.
 
 Covers `validate_submission_evidence()`'s shape-only plausibility checks
 using synthetic evidence only (nothing here was ever produced by a real
-submission — none exists, since every shipped `submit()` unconditionally
-refuses), plus an explicit, direct demonstration that this validator has
-NO effect on `job_agent.applications.service.verify_application` — the
-one existing, unmodified path to `VERIFIED`.
+submission), plus an explicit, direct demonstration of the Phase 6C
+capability-flag boundary: this validator has NO effect on
+`job_agent.applications.service.verify_application` for a provider that
+leaves `requires_persisted_approval` at its default `False` (still every
+provider except `RealStructuredATSProvider`) — `verify_application`'s
+original two-condition check is completely unchanged for those. For a
+provider that opts in, this validator DOES gate `VERIFIED` — see
+`test_verify_application_enforces_shape_validity_for_approval_requiring_providers`
+below.
 """
 
 from __future__ import annotations
@@ -115,10 +120,13 @@ def test_shape_valid_evidence_can_still_be_entirely_fabricated():
 
 
 # --------------------------------------------------------------------------
-# Dormancy, demonstrated directly: verify_application()'s existing,
-# unmodified evidence-checking logic reaches VERIFIED using evidence this
-# validator would REJECT — proving this module has zero effect on the
-# real execution path.
+# Capability-flag boundary, demonstrated directly: verify_application()'s
+# original evidence-checking logic reaches VERIFIED using evidence this
+# validator would REJECT, for a provider that does NOT opt into
+# `requires_persisted_approval` — proving this module has zero effect on
+# that (still the overwhelming majority of) provider's execution path. A
+# provider that DOES opt in gets a different outcome for the identical
+# evidence — see `_FakeApprovalRequiringProvider` further below.
 # --------------------------------------------------------------------------
 class _FakeProvider(ApplicationProvider):
     def __init__(self, *, verify_result):
@@ -138,6 +146,15 @@ class _FakeProvider(ApplicationProvider):
         return ProviderHealthCheck(healthy=True, detail="fake", checked_at=datetime.now(UTC))
 
 
+class _FakeApprovalRequiringProvider(_FakeProvider):
+    """Identical to `_FakeProvider` except it opts into
+    `requires_persisted_approval` — used to prove the stricter
+    `validate_submission_evidence` path actually engages for such a
+    provider, unlike `_FakeProvider` above."""
+
+    requires_persisted_approval = True
+
+
 @pytest.fixture()
 def db_session():
     engine = get_engine("sqlite:///:memory:")
@@ -147,7 +164,7 @@ def db_session():
         yield session
 
 
-def test_verify_application_unaffected_by_the_new_stricter_validator(db_session):
+def _make_submitted_application(db_session):
     company = Company(name="Acme")
     db_session.add(company)
     db_session.flush()
@@ -169,11 +186,18 @@ def test_verify_application_unaffected_by_the_new_stricter_validator(db_session)
     application, _ = get_or_create_application(db_session, job.id, candidate.id, dry_run=True)
     application.status = ApplicationStatus.SUBMITTED.value
     db_session.commit()
+    return application, job
+
+
+def test_verify_application_unaffected_for_a_non_approval_requiring_provider(db_session):
+    application, job = _make_submitted_application(db_session)
 
     # Evidence with a 1-character confirmation_id: has_concrete_evidence
     # is True (existing rule), but validate_submission_evidence would
     # reject it as implausibly short. If verify_application consulted
-    # this module at all, this test would fail to reach VERIFIED.
+    # this module for THIS provider, this test would fail to reach
+    # VERIFIED — but it never does, since the provider does not opt into
+    # requires_persisted_approval.
     thin_evidence = SubmissionEvidence(confirmation_id="a")
     assert validate_submission_evidence(thin_evidence).valid is False  # sanity check
 
@@ -184,7 +208,47 @@ def test_verify_application_unaffected_by_the_new_stricter_validator(db_session)
 
     # verify_application's own, unchanged rule (has_concrete_evidence)
     # governs here — still reaches VERIFIED exactly as it did before
-    # Phase 6C.5, proving this new module changed nothing about it.
+    # Phase 6C, proving this module changes nothing for a provider that
+    # doesn't explicitly opt in.
+    assert result.status == ApplicationStatus.VERIFIED.value
+
+
+def test_verify_application_enforces_shape_validity_for_approval_requiring_providers(db_session):
+    """The Phase 6C flip side of the test above: the IDENTICAL thin,
+    implausible evidence, from a provider that DOES set
+    `requires_persisted_approval = True`, must NOT reach VERIFIED."""
+    application, job = _make_submitted_application(db_session)
+
+    thin_evidence = SubmissionEvidence(confirmation_id="a")
+    assert validate_submission_evidence(thin_evidence).valid is False  # sanity check
+
+    provider = _FakeApprovalRequiringProvider(
+        verify_result=VerificationResult(verified=True, evidence=thin_evidence, reason="ok")
+    )
+    result = verify_application(db_session, application, job, provider)
+
+    assert result.status == ApplicationStatus.SUBMITTED.value  # never promoted to VERIFIED
+
+
+def test_verify_application_reaches_verified_for_approval_requiring_provider_with_good_evidence(
+    db_session,
+):
+    """A provider that opts into `requires_persisted_approval` CAN still
+    reach VERIFIED — the stricter check adds a requirement, it doesn't
+    block every outcome."""
+    application, job = _make_submitted_application(db_session)
+
+    good_evidence = SubmissionEvidence(
+        confirmation_id="genuine-looking-id-123456",
+        confirmation_url="https://ats.example.test/confirm/123456",
+    )
+    assert validate_submission_evidence(good_evidence).valid is True  # sanity check
+
+    provider = _FakeApprovalRequiringProvider(
+        verify_result=VerificationResult(verified=True, evidence=good_evidence, reason="ok")
+    )
+    result = verify_application(db_session, application, job, provider)
+
     assert result.status == ApplicationStatus.VERIFIED.value
 
 

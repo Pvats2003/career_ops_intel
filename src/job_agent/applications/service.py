@@ -46,6 +46,45 @@ leak through any of those three surfaces. `details={"error": str(exc)}`
 dicts passed to `record_event()`/`transition_status()` are additionally
 redacted centrally inside `record_event()` itself, so the audit trail
 persisted to `application_events` is protected the same way.
+
+Phase 6C (controlled real-world execution) adds two purely additive
+changes to `submit_application`/`verify_application`, both gated entirely
+by `provider.requires_persisted_approval` — every existing provider
+(`ManualReviewProvider`, `StructuredATSProvider`) leaves that flag `False`
+and is completely unaffected; `applications run`'s original behavior for
+them is byte-for-byte unchanged:
+
+* **Stricter submission gate.** A provider that opts into
+  `requires_persisted_approval` is NEVER gated by `config.automation.
+  automation.level` or a caller-passed `human_approved=True` — those
+  cannot substitute for a real approval, closing the gap where automation
+  level 4 alone could reach a real submission with no human having
+  actually approved anything. Instead: an active
+  `job_agent.applications.allowlist.ApplicationAllowlistEntry` for this
+  exact job/provider (canonical URL matched against the job's CURRENT
+  `application_url` — a drifted target blocks, it never silently follows
+  the new URL) AND a valid, unexpired, unconsumed
+  `job_agent.applications.approvals.ApplicationApproval` bound to the
+  CURRENT posting and answer fingerprints are both required. The approval
+  is consumed immediately before calling `provider.submit()` — fail
+  closed on "burn a valid approval that turned out unnecessary" rather
+  than leave one sitting around after an ambiguous outcome that might get
+  replayed.
+* **`SubmissionOutcomeUnknownError` routes to `SUBMISSION_UNCERTAIN`,
+  never `FAILED`.** This applies to every provider, not just
+  approval-requiring ones — no provider that can raise this exception
+  ships before Phase 6C, so this is a new, previously-unreachable branch,
+  never a change to how any existing provider's failures are handled.
+  `retry_application` only resurrects FAILED, never
+  SUBMISSION_UNCERTAIN — an ambiguous outcome can never be blindly
+  retried.
+* **Stricter verification for approval-requiring providers.**
+  `verify_application` additionally requires
+  `job_agent.applications.verification_contract.validate_submission_evidence`
+  to pass before VERIFIED, on top of the existing `verified=True` +
+  concrete-evidence check every provider has always needed — never
+  applied to a provider that leaves `requires_persisted_approval` at its
+  default `False`.
 """
 
 from __future__ import annotations
@@ -55,11 +94,22 @@ from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
+from job_agent.applications.allowlist import get_active_allowlist_entry
 from job_agent.applications.answer_bank import load_answer_bank
 from job_agent.applications.answer_engine import generate_answer
+from job_agent.applications.approvals import (
+    compute_answer_fingerprint,
+    consume_approval,
+    get_valid_approval,
+)
 from job_agent.applications.duplicates import find_cross_source_duplicate_application
-from job_agent.applications.errors import ProviderError
+from job_agent.applications.errors import ProviderError, SubmissionOutcomeUnknownError
 from job_agent.applications.provider import ApplicationProvider, ManualReviewProvider
+from job_agent.applications.providers.real_structured_ats import (
+    RealATSSubmissionConfig,
+    RealStructuredATSProvider,
+    load_real_fixture_forms,
+)
 from job_agent.applications.providers.structured_ats import (
     ATSApplicationForm,
     StructuredATSProvider,
@@ -82,9 +132,10 @@ from job_agent.applications.schema import (
     SubmissionEvidence,
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError, can_transition
+from job_agent.applications.verification_contract import validate_submission_evidence
 from job_agent.candidate.schema import CandidateProfile
 from job_agent.config.loader import REPO_ROOT, AppConfig
-from job_agent.db.models import Application, JobMatch
+from job_agent.db.models import Application, ApplicationApproval, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
 from job_agent.logging.setup import get_logger, log_event, redact_text
@@ -127,6 +178,15 @@ def build_application_provider(
     that Job's real `job_id`) — never every fixture entry regardless of
     relevance.
 
+    `RealStructuredATSProvider` (Phase 6C) is constructed only when BOTH
+    `provider: "real_structured_ats"` AND `application_provider.
+    real_structured_ats.enabled: true` are set — the identical two-switch
+    pattern, plus a THIRD independent gate: its `CredentialProvider`
+    (`EnvCredentialStore`) only NAMES an environment variable here; it
+    still raises unless that variable is actually set at call time (never
+    during this phase — no shipped config or `.env` sets it). No shipped
+    `config/automation.yaml` selects this provider.
+
     This function decides nothing about application eligibility,
     submission, or safety — it only chooses which honest adapter answers
     `get_questions`/`discover_application`/`inspect_application`/`submit`/
@@ -134,6 +194,22 @@ def build_application_provider(
     unchanged by this choice.
     """
     provider_cfg = config.automation.application_provider
+
+    if provider_cfg.provider == "real_structured_ats" and provider_cfg.real_structured_ats.enabled:
+        real_cfg = provider_cfg.real_structured_ats
+        fixture_path = REPO_ROOT / real_cfg.fixture_path
+        real_forms_by_url = load_real_fixture_forms(fixture_path)
+        real_forms: dict[int, RealATSSubmissionConfig] = {}
+        for job in jobs or []:
+            if job.application_url is None:
+                continue
+            real_form = real_forms_by_url.get(job.application_url)
+            if real_form is not None:
+                real_forms[job.id] = real_form
+        return RealStructuredATSProvider.from_env_credential(
+            real_forms, real_cfg.credential_name, real_cfg.credential_env_var
+        )
+
     if provider_cfg.provider != "structured_ats" or not provider_cfg.structured_ats.enabled:
         return ManualReviewProvider()
 
@@ -349,12 +425,29 @@ def submit_application(
 
     1. `config.is_submission_allowed()` — dry_run disabled AND live_mode
        enabled (BUILD PROMPT sections 36-37's existing choke point).
-    2. Automation level 4, OR `human_approved=True` passed explicitly.
+    2. The approval gate. Exactly one of two paths applies, chosen by
+       `provider.requires_persisted_approval` — a provider never gets to
+       choose which path governs it at call time, only at class
+       definition time (see `ApplicationProvider.requires_persisted_
+       approval`'s own docstring):
+       - `False` (every provider before Phase 6C): automation level 4, OR
+         `human_approved=True` passed explicitly. Unchanged from Phase 5.
+       - `True` (Phase 6C real providers): automation level and
+         `human_approved` are never consulted at all. Instead, an active
+         `ApplicationAllowlistEntry` for this exact (job, provider) whose
+         `canonical_url` matches the job's CURRENT `application_url`, AND
+         a valid `ApplicationApproval` bound to the CURRENT posting and
+         answer fingerprints, are both required. The approval is consumed
+         (single-use) immediately before `provider.submit()` is called.
     3. Rate limits (daily/hourly/per-company/per-source) not exceeded.
-    4. The provider itself must succeed and return evidence — a
-       `ProviderError` (including `SubmissionRefusedError`, which is what
-       the only shipped provider always raises) moves the application to
-       FAILED, never SUBMITTED.
+    4. The provider itself must succeed and return evidence.
+       - A `SubmissionOutcomeUnknownError` (the request may have already
+         reached the platform) moves the application to
+         SUBMISSION_UNCERTAIN, never FAILED and never SUBMITTED — see the
+         module docstring.
+       - Any other `ProviderError` (including `SubmissionRefusedError`,
+         what every non-real provider always raises) moves the
+         application to FAILED.
     """
     current = ApplicationStatus(application.status)
     if current != ApplicationStatus.PREPARED:
@@ -370,16 +463,47 @@ def submit_application(
         session.commit()
         return application
 
-    automation_level = config.automation.automation.level
-    if automation_level < 4 and not human_approved:
-        record_event(
-            session,
-            application.id,
-            "SUBMISSION_BLOCKED_NO_APPROVAL",
-            {"automation_level": automation_level},
+    answers = answers_from_db(session, application.id)
+
+    approval_to_consume: ApplicationApproval | None = None
+    if provider.requires_persisted_approval:
+        allowlist_entry = get_active_allowlist_entry(session, job.job_fingerprint, provider.name)
+        if allowlist_entry is None or allowlist_entry.canonical_url != job.application_url:
+            record_event(
+                session,
+                application.id,
+                "SUBMISSION_BLOCKED_NOT_ALLOWLISTED",
+                {"job_fingerprint": job.job_fingerprint, "provider": provider.name},
+            )
+            session.commit()
+            return application
+
+        answer_fingerprint = compute_answer_fingerprint(answers)
+        approval = get_valid_approval(
+            session, application.id, job.job_fingerprint, answer_fingerprint
         )
-        session.commit()
-        return application
+        if approval is None:
+            record_event(
+                session,
+                application.id,
+                "SUBMISSION_BLOCKED_NO_APPROVAL",
+                {"requires_persisted_approval": True},
+            )
+            session.commit()
+            return application
+        approval_to_consume = approval
+        automation_level = config.automation.automation.level
+    else:
+        automation_level = config.automation.automation.level
+        if automation_level < 4 and not human_approved:
+            record_event(
+                session,
+                application.id,
+                "SUBMISSION_BLOCKED_NO_APPROVAL",
+                {"automation_level": automation_level},
+            )
+            session.commit()
+            return application
 
     limit_result = check_rate_limits(
         session, application.candidate_id, job, config.automation.applications
@@ -395,9 +519,28 @@ def submit_application(
         session.commit()
         return application
 
-    answers = _answers_from_db(session, application.id)
+    if approval_to_consume is not None:
+        # Fail closed BEFORE the risky call: an ambiguous or crashed
+        # outcome must never leave a still-valid, replayable approval
+        # sitting around. See approvals.consume_approval's own docstring.
+        consume_approval(session, approval_to_consume)
+        session.commit()
+
     try:
         evidence = provider.submit(job, answers)
+    except SubmissionOutcomeUnknownError as exc:
+        # error_message is a plain DB column, not routed through
+        # record_event()'s redaction — must be scrubbed here explicitly.
+        application.error_message = redact_text(str(exc))
+        transition_status(
+            session,
+            application,
+            ApplicationStatus.SUBMISSION_UNCERTAIN,
+            event_type="SUBMISSION_OUTCOME_UNKNOWN",
+            details={"error": str(exc), "provider": provider.name},
+        )
+        session.commit()
+        return application
     except ProviderError as exc:
         # error_message is a plain DB column, not routed through
         # record_event()'s redaction — must be scrubbed here explicitly.
@@ -440,7 +583,16 @@ def verify_application(
     a missing evidence object, or a `ProviderError` all leave the
     application at SUBMITTED (attempted, unconfirmed), never VERIFIED and
     never silently downgraded to FAILED (a submission may well have
-    succeeded even if we can't yet prove it)."""
+    succeeded even if we can't yet prove it).
+
+    For a provider with `requires_persisted_approval = True` (Phase 6C
+    real providers), a THIRD condition applies on top of the two above:
+    `job_agent.applications.verification_contract.validate_submission_
+    evidence` must also pass. This never runs for, and never changes
+    anything about, a provider that leaves that flag at its default
+    `False` — see this module's own docstring for why this check is
+    additive-only.
+    """
     current = ApplicationStatus(application.status)
     if current != ApplicationStatus.SUBMITTED:
         raise IllegalStateTransitionError(current, ApplicationStatus.VERIFIED)
@@ -470,6 +622,21 @@ def verify_application(
         session.commit()
         return application
 
+    if provider.requires_persisted_approval:
+        shape_check = validate_submission_evidence(result.evidence)
+        if not shape_check.valid:
+            record_event(
+                session,
+                application.id,
+                "VERIFICATION_INCONCLUSIVE",
+                {
+                    "reason": "evidence failed shape-validity check",
+                    "shape_reasons": list(shape_check.reasons),
+                },
+            )
+            session.commit()
+            return application
+
     transition_status(
         session,
         application,
@@ -481,7 +648,14 @@ def verify_application(
     return application
 
 
-def _answers_from_db(session: Session, application_id: int) -> list[GeneratedAnswer]:
+def answers_from_db(session: Session, application_id: int) -> list[GeneratedAnswer]:
+    """Public (Phase 6C): the exact same question/answer reconstruction
+    `submit_application` uses internally to compute the answer fingerprint
+    it checks approvals against — the CLI's `applications approve` command
+    must use this SAME function to compute the fingerprint it stores,
+    never a re-derived one, or a human's approval could silently fail to
+    match what `submit_application` later checks (or worse, silently match
+    something the human never actually reviewed)."""
     rows = get_answers(session, application_id)
     return [
         GeneratedAnswer(

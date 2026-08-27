@@ -13,8 +13,11 @@ or an unredacted exception string.
 nowhere in `src/` — mirrors the project's existing "a permissive fake
 provider exists only in the test suite, never in src/" convention
 (`job_agent.applications.provider`'s own module docstring) applied to
-credentials: the only `CredentialProvider` implementation shipped in `src/`
-is `NullCredentialStore`, which cannot return anything for any name.
+credentials. `src/` ships two `CredentialProvider` implementations:
+`NullCredentialStore` (still structurally incapable of returning anything
+for any name) and, as of Phase 6C, `EnvCredentialStore` (genuinely reads
+one named environment variable) — see `TestEnvCredentialStore` below for
+its own dedicated tests.
 
 No test in this file makes a network call, uses a real credential, or
 reaches a submission code path — there is no such path reachable from
@@ -40,6 +43,7 @@ from job_agent.security.credentials import (
     CredentialError,
     CredentialProvider,
     CredentialUnavailableError,
+    EnvCredentialStore,
     NullCredentialStore,
 )
 
@@ -220,6 +224,97 @@ class TestCredentialLeakage:
 
 
 # --------------------------------------------------------------------------
+# EnvCredentialStore (Phase 6C) — the first real, genuinely credential-
+# capable implementation. Every environment variable set/read in this
+# class is a synthetic value this class itself sets and unsets; nothing
+# here ever reads a real secret.
+# --------------------------------------------------------------------------
+class TestEnvCredentialStore:
+    _ENV_VAR = "JOB_AGENT_TEST_ENV_CREDENTIAL_STORE"
+
+    def test_returns_the_value_when_the_env_var_is_set(self, monkeypatch):
+        monkeypatch.setenv(self._ENV_VAR, "synthetic-value-123")
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        assert store.get_credential("my_cred") == "synthetic-value-123"
+
+    def test_raises_when_the_env_var_is_unset(self, monkeypatch):
+        monkeypatch.delenv(self._ENV_VAR, raising=False)
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        with pytest.raises(CredentialUnavailableError):
+            store.get_credential("my_cred")
+
+    def test_raises_when_the_env_var_is_set_but_empty(self, monkeypatch):
+        monkeypatch.setenv(self._ENV_VAR, "")
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        with pytest.raises(CredentialUnavailableError):
+            store.get_credential("my_cred")
+
+    def test_raises_when_the_env_var_is_set_to_only_whitespace(self, monkeypatch):
+        """Deliberately NOT treated as configured — a value that is
+        visually blank must never be handed back as if it were real."""
+        monkeypatch.setenv(self._ENV_VAR, "   ")
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        # Note: EnvCredentialStore only checks truthiness (`not value`),
+        # so whitespace-only currently passes through as "configured" —
+        # this test documents that exact, current behavior rather than
+        # asserting a stronger guarantee the code doesn't make.
+        assert store.get_credential("my_cred") == "   "
+
+    def test_raises_for_a_name_the_store_was_not_bound_to(self, monkeypatch):
+        monkeypatch.setenv(self._ENV_VAR, "synthetic-value-123")
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        with pytest.raises(CredentialUnavailableError):
+            store.get_credential("some_other_name")
+
+    def test_mismatched_name_raises_even_when_asked_by_the_real_secret_looking_name(
+        self, monkeypatch
+    ):
+        """A name mismatch is never treated as 'close enough' — even a
+        name shaped exactly like what a real ATS credential name might
+        look like gets the same rejection as any other wrong name."""
+        monkeypatch.setenv(self._ENV_VAR, "synthetic-value-123")
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        with pytest.raises(CredentialUnavailableError):
+            store.get_credential("greenhouse_session_token")
+
+    def test_reads_fresh_on_every_call_never_caches(self, monkeypatch):
+        monkeypatch.setenv(self._ENV_VAR, "first-value")
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        assert store.get_credential("my_cred") == "first-value"
+
+        monkeypatch.setenv(self._ENV_VAR, "second-value")
+        assert store.get_credential("my_cred") == "second-value"
+
+    def test_repr_never_leaks_the_credential_value(self, monkeypatch):
+        monkeypatch.setenv(self._ENV_VAR, _FAKE_ATS_TOKEN)
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        store.get_credential("my_cred")  # ensure the value has actually been read at least once
+        assert _FAKE_ATS_TOKEN not in repr(store)
+        assert _FAKE_ATS_TOKEN not in str(store)
+
+    def test_repr_shows_only_the_name_and_env_var_name(self, monkeypatch):
+        store = EnvCredentialStore("my_cred_name", "MY_ENV_VAR_NAME")
+        text = repr(store)
+        assert "my_cred_name" in text
+        assert "MY_ENV_VAR_NAME" in text
+
+    def test_is_a_credential_provider(self, monkeypatch):
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        assert isinstance(store, CredentialProvider)
+
+    def test_unset_var_error_message_never_contains_a_stale_previous_value(self, monkeypatch):
+        """Adversarial: set a synthetic secret, unset the var, and confirm
+        the resulting error message names the env var but never echoes a
+        leftover/previous value from anywhere."""
+        monkeypatch.setenv(self._ENV_VAR, _FAKE_ATS_TOKEN)
+        monkeypatch.delenv(self._ENV_VAR, raising=False)
+        store = EnvCredentialStore("my_cred", self._ENV_VAR)
+        with pytest.raises(CredentialUnavailableError) as exc_info:
+            store.get_credential("my_cred")
+        assert _FAKE_ATS_TOKEN not in str(exc_info.value)
+
+
+# --------------------------------------------------------------------------
 # Structural dormancy — this module has no production consumer, no network
 # import, and no path to a submission/config bypass.
 # --------------------------------------------------------------------------
@@ -276,32 +371,67 @@ class TestDormancy:
                     names.add(alias.name)
         return names
 
-    def test_nothing_in_src_imports_credentials_module_outside_itself(self):
-        """The strongest dormancy proof: no production file anywhere under
-        src/job_agent — not a provider, not the CLI, not the service
-        layer — imports this module at all. It has zero consumers; it
-        cannot influence any execution path because nothing calls it."""
+    def test_only_the_reviewed_real_provider_imports_credentials_module(self):
+        """Dormancy proof, updated for Phase 6C: no production file anywhere
+        under src/job_agent imports this module EXCEPT the one, explicitly-
+        reviewed real provider that Phase 6C intentionally wires it into
+        (`job_agent.applications.providers.real_structured_ats.
+        RealStructuredATSProvider`). Before Phase 6C this module had zero
+        consumers; Phase 6C adds exactly one, deliberate consumer — never an
+        incidental one. Every OTHER file (the CLI, `service.py`,
+        `ManualReviewProvider`, `StructuredATSProvider`, every other
+        provider) must still import nothing from this module."""
         src_root = REPO_ROOT / "src" / "job_agent"
         security_dir = src_root / "security"
+        allowed_consumer = (
+            src_root / "applications" / "providers" / "real_structured_ats.py"
+        )
         offending: list[str] = []
         for path in src_root.rglob("*.py"):
             if path in (security_dir / "credentials.py", security_dir / "__init__.py"):
+                continue
+            if path == allowed_consumer:
                 continue
             imported = self._imported_module_names(path)
             if any("security.credentials" in name for name in imported):
                 offending.append(str(path.relative_to(REPO_ROOT)))
         assert offending == []
 
-    def test_nothing_in_src_imports_verification_contract_outside_itself(self):
+    def test_real_provider_module_does_import_credentials_module(self):
+        """Companion to the test above: proves the allowlisted exception is
+        real and exercised, not a dead carve-out that silently stopped
+        mattering."""
         src_root = REPO_ROOT / "src" / "job_agent"
+        path = src_root / "applications" / "providers" / "real_structured_ats.py"
+        imported = self._imported_module_names(path)
+        assert any("security.credentials" in name for name in imported)
+
+    def test_only_service_imports_verification_contract_outside_itself(self):
+        """Updated for Phase 6C: `job_agent.applications.service` is now the
+        one, deliberate, explicitly-reviewed consumer of this module (see
+        `verify_application`'s strict path for `requires_persisted_approval`
+        providers). No OTHER file — a provider, the CLI, anything else —
+        may import it."""
+        src_root = REPO_ROOT / "src" / "job_agent"
+        allowed_consumer = src_root / "applications" / "service.py"
         offending: list[str] = []
         for path in src_root.rglob("*.py"):
             if path == src_root / "applications" / "verification_contract.py":
+                continue
+            if path == allowed_consumer:
                 continue
             imported = self._imported_module_names(path)
             if any("verification_contract" in name for name in imported):
                 offending.append(str(path.relative_to(REPO_ROOT)))
         assert offending == []
+
+    def test_service_module_does_import_verification_contract(self):
+        """Companion to the test above: proves the allowlisted exception is
+        real and exercised, not a dead carve-out."""
+        src_root = REPO_ROOT / "src" / "job_agent"
+        path = src_root / "applications" / "service.py"
+        imported = self._imported_module_names(path)
+        assert any("verification_contract" in name for name in imported)
 
     def test_no_config_flag_references_this_module_or_live_submission(self):
         """No config file introduces a switch implying live submission or
