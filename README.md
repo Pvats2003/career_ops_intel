@@ -5,9 +5,9 @@ a truthful candidate knowledge base, and (in later phases) prepares and
 submits applications — with humans in the loop by default and every
 generated fact traceable to a source.
 
-**This repository is at the end of Phase 3 (Matching Engine).** Resume
-tailoring, answer generation, and browser automation do not exist yet.
-Nothing in this codebase can submit a job application.
+**This repository is at the end of Phase 4 (Resume Engine).** Resume
+variant selection/tailoring, answer generation, and browser automation do
+not exist yet. Nothing in this codebase can submit a job application.
 
 ## Core principle
 
@@ -59,6 +59,12 @@ src/job_agent/
     decision.py                   Thresholds + hard-stop/excluded overrides
     repository.py                 Insert-only job_matches persistence
     service.py                     Orchestrates matching for jobs in the DB
+  resume/                  Resume Engine (Phase 4)
+    extractor.py              Deterministic raw-text extraction from resume_master.docx
+    validator.py               Cross-checks CandidateProfile facts against resume text
+    versioning.py                Content hashing (profile + source files)
+    repository.py                  Insert-only candidate_profile_versions persistence
+    service.py                       Orchestrates extract → validate → hash → persist-or-noop
   cli/                     Typer CLI (main.py)
 
 prompts/                 Versioned prompt text (job_matcher.md)
@@ -244,21 +250,125 @@ never overwrites a prior score — it adds a new row, so match history
 survives config/threshold changes and eventually supports the outcome
 analytics in section 24 ("which match score predicts interviews?").
 
+## Architecture (Phase 4 — Resume Engine)
+
+```
+candidate/resume_master.docx  (authoritative source — python-docx, no LLM)
+        │
+        ▼
+extract_resume_text()   →  raw plain text (paragraphs + tables)
+        │
+CandidateProfile  ──────────────┤
+(from Phase 1's parser,         ▼
+ unchanged)              validate_profile_against_resume()
+                            STRICT substring match: identity, contact,
+                              experience title/company, project names,
+                              education institutions, certification names,
+                              HAS-level skills (self-declared, so literal)
+                            FUZZY word-overlap match: achievements (some
+                              are honest paraphrases of resume bullets),
+                              DEMONSTRATED-skill evidence notes
+                                │
+                    ┌───────────┴───────────┐
+                 0 issues                 N issues
+                    │                         │
+                    ▼                         ▼
+          validation_status=PASSED   validation_status=FAILED
+                    │                         │
+                    └───────────┬─────────────┘
+                                 ▼
+                    compute hashes (profile + resume file + every
+                    candidate/*.md + config/profile.yaml/preferences.yaml)
+                                 │
+                    same as latest version?  ──yes──▶  no-op, return it unchanged
+                                 │ no
+                                 ▼
+                    create_version()  →  candidate_profile_versions
+                    (insert-only — PASSED and FAILED attempts both kept,
+                     forever; never updated, never deleted)
+```
+
+**Why validation exists at all, given Phase 1 already hand-authored the
+candidate files faithfully:** it's the ongoing safety net, not a one-time
+check. `candidate/*.md` could drift from `resume_master.docx` in the
+future — the resume gets updated and the markdown doesn't, or vice versa —
+and nothing before Phase 4 would have caught that. This module makes
+"every fact traces to the actual resume file" something the system
+*proves* on every `profile parse`, not something asserted once during
+authoring and never checked again.
+
+**Why two matching strategies, not one:** strict substring matching on
+`candidate/achievements.md`'s "Notable Project Metrics" entries produces
+false positives — that file legitimately rewrites some resume bullets into
+cleaner prose (e.g. resume's "(116 businesses, 19 categories)" becomes
+"covering 116 businesses across 19 categories" in the markdown). A fuzzy,
+word-overlap threshold (≥60% of a claim's significant words must appear in
+the resume) tolerates that honest rewording while still catching real
+fabrication — a fabricated achievement referencing a nonexistent employer,
+number, or technology shares few or no words with the actual resume. This
+was verified empirically, not just reasoned about: `tests/unit/
+test_resume_validator.py` injects real fabricated facts (a fake job title,
+a fake employer, a fake HAS-level skill, a fake achievement with a fake
+statistic) into the real profile and confirms every one is caught, while
+the actual, unmodified candidate profile produces **zero** false-positive
+issues against the actual resume file.
+
+**Versioning is content-addressed, not timestamp-based.** `profile_hash`
+excludes `parsed_at` specifically so re-running `profile parse` with
+nothing actually changed is a no-op (checked against `resume_file_hash`
+and every `source_file_hashes` entry too) — it doesn't spam a new "version"
+every time the command runs, only when the candidate's actual resume or
+markdown files change. `job-agent profile history` lists every version
+ever created, including FAILED ones — a validation failure is recorded for
+audit, never silently dropped, but `get_latest_verified_version()` (the
+function future phases must use) only ever returns a PASSED version, so a
+failed re-parse can never silently become "the current profile" something
+downstream trusts.
+
+**No LLM anywhere in this phase.** Extraction is pure `python-docx`
+structural parsing; validation is pure string matching. Asking a model
+"does this claim appear in the resume?" would reintroduce the exact
+hallucination risk this module exists to guard against (BUILD PROMPT
+section 59: prefer deterministic code over LLM calls wherever one works).
+
+**Integration with Phase 1–3 is additive only.** `job-agent profile parse`
+keeps its exact Phase 1 output and behavior (same table, same candidate
+row, same exit code on a parse error) and now *additionally* creates/checks
+a profile version as a second step — nothing about Phase 1's contract
+changed. No existing table's schema changed; `candidate_profile_versions`
+is a new table with its own migration. Phase 3's matching engine still
+calls `parse_candidate_profile()` fresh each run, unchanged — profile
+versioning is infrastructure Phase 5+ (resume tailoring, applications) can
+build on for "which exact profile was this application based on", not a
+retrofit onto Phase 3's already-verified matching pipeline.
+
+**What Phase 4 explicitly does NOT include**, despite being listed under
+"Resume Engine" in the original BUILD PROMPT (section 12/49): a registry of
+multiple resume *file* variants (master/product/operations/analytics), a
+resume selector that picks among them per job, controlled resume
+*tailoring* (reordering bullets, adjusting emphasis), or PDF generation.
+There is currently exactly one resume file, so "selecting among variants"
+has nothing to select among yet — that work is deferred, not silently
+dropped; see "What remains" below.
+
 ## Database schema
 
-SQLite via SQLAlchemy 2.0, migrated with Alembic. 15 tables (BUILD PROMPT
-section 21's minimum set): `candidate`, `candidate_facts`, `skills`,
-`experiences`, `projects`, `companies`, `job_sources`, `jobs`, `job_matches`,
-`resumes`, `applications`, `application_answers`, `application_events`,
-`notifications`, `system_events`.
+SQLite via SQLAlchemy 2.0, migrated with Alembic. 16 tables: BUILD PROMPT
+section 21's original 15-table minimum set (`candidate`, `candidate_facts`,
+`skills`, `experiences`, `projects`, `companies`, `job_sources`, `jobs`,
+`job_matches`, `resumes`, `applications`, `application_answers`,
+`application_events`, `notifications`, `system_events`) plus Phase 4's
+`candidate_profile_versions`.
 
 Phase 1 populates `candidate`, `candidate_facts`, `skills`, `experiences`,
 `projects` (via `job-agent profile parse`). Phase 2 adds `job_sources`,
 `companies`, and `jobs` (via `job-agent jobs scan`). Phase 3 adds
-`job_matches` (via `job-agent jobs match`; insert-only, see above). The
-remaining tables (`resumes`, `applications`, `application_answers`,
-`application_events`, `notifications`) are defined now so schema and code
-evolve together, and get populated starting in Phase 4.
+`job_matches` (via `job-agent jobs match`; insert-only, see above). Phase 4
+adds `candidate_profile_versions` (also via `job-agent profile parse`;
+insert-only, see above). The remaining tables (`resumes`, `applications`,
+`application_answers`, `application_events`, `notifications`) are defined
+now so schema and code evolve together, and get populated starting in
+Phase 5.
 
 Indexes exist on `job_fingerprint`, `company_name`, `title`, `posted_at`
 (jobs), `overall_score`/`decision` (job_matches), `status`/`match_score`
@@ -290,11 +400,18 @@ alembic upgrade head        # create the SQLite schema (data/job_agent.db)
 
 job-agent status            # show effective dry-run/live-mode/automation-level state
 job-agent health            # config loads + candidate profile parses + DB reachable
-job-agent profile parse     # parse candidate/*.md + config/*.yaml, persist to DB
+job-agent profile parse     # parse candidate/*.md + config/*.yaml, persist to DB,
+                             # then validate + version the profile against the resume
+job-agent profile history   # list every candidate profile version (PASSED and FAILED)
 job-agent dry-run           # confirm submission is currently impossible
 job-agent jobs scan         # poll enabled job sources, persist new/updated jobs
 job-agent jobs match        # score every job in the DB against the candidate profile
 ```
+
+`profile parse` exits non-zero if the resume file can't be read, or if any
+fact in the profile can't be traced back to it — printing exactly which
+claims failed and why, never silently proceeding with an unverified
+profile.
 
 To actually discover jobs: edit `config/sources.yaml`, set `enabled: true`
 on `greenhouse` and/or `lever`, and replace the placeholder `token`/
@@ -313,26 +430,32 @@ clear "not implemented yet" message — see `job_agent/cli/main.py`.
 ## Testing
 
 ```bash
-pytest -q            # 121 tests: config, candidate schema/parser, db, job engine, matching engine
+pytest -q            # 165 tests: config, candidate schema/parser, db, job engine,
+                      # matching engine, resume engine
 ruff check src tests # lint — currently clean
 mypy -p job_agent     # type check — currently clean
 ```
 
-Tests run against the **real** `candidate/*.md` and `config/*.yaml` files
-(not synthetic fixtures), so they double as a regression check on the
-shipped candidate data itself — e.g. `test_full_profile_assembly_never_
-fabricates_preferences` asserts that salary/visa stay `UNKNOWN` because the
-resume never states them, and the deterministic matcher tests run against
-the real profile to confirm actual skills (SQL, Excel, Agile/Scrum, Figma)
-are correctly fuzzy-matched rather than reported MISSING due to naming
-differences ("Basic SQL" vs. "SQL"). Job-source and LLM-provider tests never
-make a real network call — Greenhouse/Lever tests inject an
+Tests run against the **real** `candidate/*.md`, `config/*.yaml`, and
+`resume_master.docx` files (not synthetic fixtures), so they double as a
+regression check on the shipped candidate data itself — e.g. `test_full_
+profile_assembly_never_fabricates_preferences` asserts that salary/visa
+stay `UNKNOWN` because the resume never states them, the deterministic
+matcher tests confirm actual skills (SQL, Excel, Agile/Scrum, Figma) are
+correctly fuzzy-matched rather than reported MISSING due to naming
+differences ("Basic SQL" vs. "SQL"), and `test_real_profile_has_zero_
+issues` proves the entire shipped candidate profile is traceable to the
+actual resume file with zero unverifiable claims. The same test module
+also injects real fabricated facts (a fake job, employer, skill,
+achievement, education, certification, and project) into the real profile
+and confirms every single one is caught. Job-source and LLM-provider tests
+never make a real network call — Greenhouse/Lever tests inject an
 `httpx.MockTransport`, and `AnthropicLLMProvider` tests inject a fake
 Anthropic client, both because this sandbox can't reach those APIs anyway
 and because deterministic mocked responses are the right way to test this
 regardless (BUILD PROMPT section 35).
 
-## What's implemented (Phase 1 + Phase 2 + Phase 3)
+## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4)
 
 **Phase 1 — Foundation**
 - [x] Project structure, `pyproject.toml`, `.gitignore`, `.env.example`
@@ -372,18 +495,47 @@ regardless (BUILD PROMPT section 35).
 - [x] 56 new unit tests (deterministic sub-scores, LLM provider, semantic retry/fallback,
       scoring blend, decision thresholds, repository, service orchestration)
 
-121 passing unit tests total; clean `ruff` and `mypy`.
+**Phase 4 — Resume Engine**
+- [x] Deterministic resume text extraction (`job_agent.resume.extractor`, python-docx,
+      no LLM) with explicit `ResumeExtractionError` on missing/corrupt/empty files
+- [x] Resume consistency validator (`job_agent.resume.validator`) cross-checking every
+      identity/contact/experience/project/education/certification/achievement/skill
+      claim in the CandidateProfile against the actual resume file
+- [x] Two matching strategies chosen per field's authoring convention: strict substring
+      for direct transcriptions, word-overlap fuzzy matching for honest paraphrases
+      (tolerates truthful rewording, still catches genuine fabrication — verified
+      empirically with injected fake facts, not just reasoned about)
+- [x] Content-addressed profile versioning (`job_agent.resume.versioning`): hashes the
+      profile snapshot plus every source file (resume + candidate/*.md + config), so
+      re-parsing with nothing changed is a no-op rather than spamming new versions
+- [x] Insert-only `candidate_profile_versions` table — PASSED and FAILED attempts both
+      preserved forever; `get_latest_verified_version()` never returns a FAILED one
+- [x] `job-agent profile parse` now also creates/checks a profile version (additive —
+      Phase 1's exact output/behavior for the base command is unchanged); new
+      `job-agent profile history` command
+- [x] Zero code or schema changes to Phase 1–3 tables/behavior — one new table,
+      one new package, existing commands extended additively only
+- [x] 39 new unit tests, including deliberate hallucination-injection tests (fake job,
+      employer, HAS-skill, DEMONSTRATED-skill, achievement, education, certification,
+      project all confirmed caught) and a paraphrase-tolerance regression guard
 
-## What remains (Phases 4–8)
+165 passing unit tests total; clean `ruff` and `mypy`.
 
-Not started: resume selection/tailoring, the answer-generation engine,
-Playwright browser automation, the application state machine, the FastAPI
-dashboard, the scheduler, notifications, and live-mode submission. Also not
-started within "job sources": Workday, company career pages, and the
-ToS-restricted sources (LinkedIn, Indeed, Wellfound) — see
-`config/sources.yaml` notes on each. See the BUILD PROMPT's Phase 4–8
-breakdown for the full plan — each phase stops for review before the next
-begins.
+## What remains (Phase 4 continuation + Phases 5–8)
+
+Not yet built, explicitly deferred rather than silently dropped: BUILD
+PROMPT section 12/49's remaining "Resume Engine" scope — a registry of
+multiple resume *file* variants, a resume selector that picks among them
+per job, controlled resume tailoring (reordering/emphasis without
+fabrication), and PDF generation. These need more than one resume variant
+to meaningfully build against, which doesn't exist yet.
+
+Beyond that: the answer-generation engine, Playwright browser automation,
+the application state machine, the FastAPI dashboard, the scheduler,
+notifications, and live-mode submission. Also not started within "job
+sources": Workday, company career pages, and the ToS-restricted sources
+(LinkedIn, Indeed, Wellfound) — see `config/sources.yaml` notes on each.
+Each phase stops for review before the next begins.
 
 **Before Level 4 (auto-submit) automation is ever safe to enable:** fill in
 `config/preferences.yaml` (salary, visa/work authorization, relocation) —
