@@ -12,6 +12,7 @@ from job_agent.applications.repository import (
     count_submissions_to_company,
     get_answers,
     get_application,
+    get_latest_event,
     get_or_create_application,
     record_event,
     save_answer,
@@ -292,3 +293,61 @@ def test_transition_status_redacted_details_reach_the_audit_trail(db_session, jo
     combined = json.dumps([e.details for e in events])
     assert "hunter2secret" not in combined
     assert "***REDACTED***" in combined
+
+
+# --------------------------------------------------------------------------
+# get_latest_event (Phase 6B — CLI inspection-reason surfacing)
+# --------------------------------------------------------------------------
+def test_get_latest_event_returns_none_for_application_with_no_events(
+    db_session, job_and_candidate
+):
+    job, candidate = job_and_candidate
+    application = Application(job_id=job.id, candidate_id=candidate.id, status="DISCOVERED")
+    db_session.add(application)
+    db_session.flush()
+    assert get_latest_event(db_session, application.id) is None
+
+
+def test_get_latest_event_returns_the_most_recent_event(db_session, job_and_candidate):
+    job, candidate = job_and_candidate
+    application, _ = get_or_create_application(db_session, job.id, candidate.id, dry_run=True)
+    db_session.commit()
+
+    record_event(db_session, application.id, "MATCHED", {"decision": "APPLY"})
+    record_event(db_session, application.id, "CAPTCHA_DETECTED", {"reason": "captcha_detected"})
+    db_session.commit()
+
+    latest = get_latest_event(db_session, application.id)
+    assert latest is not None
+    assert latest.event_type == "CAPTCHA_DETECTED"
+
+
+def test_get_latest_event_only_considers_the_given_application(db_session, job_and_candidate):
+    """A second application's events must never leak into another
+    application's 'latest event' — otherwise the CLI could display the
+    wrong reason next to the wrong job."""
+    job, candidate = job_and_candidate
+    application_a, _ = get_or_create_application(db_session, job.id, candidate.id, dry_run=True)
+    db_session.commit()
+
+    company_b = Company(name="Other Co")
+    db_session.add(company_b)
+    db_session.flush()
+    source_b = JobSource(name="lever", kind="ats_api", enabled=True)
+    db_session.add(source_b)
+    db_session.flush()
+    job_b = JobRow(
+        source_id=source_b.id, source_job_id="2", company_id=company_b.id,
+        company_name="Other Co", title="Engineer", application_url="https://x.test/2",
+        job_fingerprint="fp2",
+    )
+    db_session.add(job_b)
+    db_session.flush()
+    application_b, _ = get_or_create_application(db_session, job_b.id, candidate.id, dry_run=True)
+    db_session.commit()
+
+    record_event(db_session, application_a.id, "MFA_DETECTED", {})
+    db_session.commit()
+
+    assert get_latest_event(db_session, application_b.id).event_type == "APPLICATION_DISCOVERED"
+    assert get_latest_event(db_session, application_a.id).event_type == "MFA_DETECTED"

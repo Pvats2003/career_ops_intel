@@ -59,7 +59,12 @@ from job_agent.applications.answer_bank import load_answer_bank
 from job_agent.applications.answer_engine import generate_answer
 from job_agent.applications.duplicates import find_cross_source_duplicate_application
 from job_agent.applications.errors import ProviderError
-from job_agent.applications.provider import ApplicationProvider
+from job_agent.applications.provider import ApplicationProvider, ManualReviewProvider
+from job_agent.applications.providers.structured_ats import (
+    ATSApplicationForm,
+    StructuredATSProvider,
+    load_fixture_forms,
+)
 from job_agent.applications.rate_limits import check_rate_limits
 from job_agent.applications.repository import (
     get_answers,
@@ -78,7 +83,7 @@ from job_agent.applications.schema import (
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError, can_transition
 from job_agent.candidate.schema import CandidateProfile
-from job_agent.config.loader import AppConfig
+from job_agent.config.loader import REPO_ROOT, AppConfig
 from job_agent.db.models import Application, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
@@ -93,6 +98,55 @@ logger = get_logger("job_agent.applications.service")
 class PreparationOutcome:
     application: Application
     answers: list[GeneratedAnswer] = field(default_factory=list)
+
+
+def build_application_provider(
+    config: AppConfig, jobs: list[JobRow] | None = None
+) -> ApplicationProvider:
+    """Resolves which `ApplicationProvider` `applications prepare` should
+    use for a batch, driven entirely by `config.automation.
+    application_provider` (Phase 6B CLI wiring) — mirrors `job_agent.jobs.
+    service.build_sources`'s config-driven resolution pattern: read the
+    real, loaded config, construct nothing unless explicitly enabled,
+    never silently substitute one provider for another.
+
+    Default — `provider: "manual_review"`, the value every shipped
+    `config/automation.yaml` carries — always returns
+    `ManualReviewProvider()`, byte-for-byte the same provider
+    `applications prepare` used before this function existed. There is no
+    configuration that changes that default.
+
+    `StructuredATSProvider` is constructed only when BOTH
+    `provider: "structured_ats"` AND `application_provider.structured_ats.
+    enabled: true` are set (two explicit switches, matching `dry_run`/
+    `live_mode`'s own defense-in-depth posture) — and even then, only from
+    a LOCAL fixture file (`load_fixture_forms`, no network I/O). `jobs`
+    supplies the batch actually being prepared so the provider is given
+    exactly the fixture forms relevant to it (matched by each Job's
+    `application_url` against the fixture file's keys, then translated to
+    that Job's real `job_id`) — never every fixture entry regardless of
+    relevance.
+
+    This function decides nothing about application eligibility,
+    submission, or safety — it only chooses which honest adapter answers
+    `get_questions`/`discover_application`/`inspect_application`/`submit`/
+    `verify` for the rest of the pipeline, which remains entirely
+    unchanged by this choice.
+    """
+    provider_cfg = config.automation.application_provider
+    if provider_cfg.provider != "structured_ats" or not provider_cfg.structured_ats.enabled:
+        return ManualReviewProvider()
+
+    fixture_path = REPO_ROOT / provider_cfg.structured_ats.fixture_path
+    forms_by_url = load_fixture_forms(fixture_path)
+    forms: dict[int, ATSApplicationForm] = {}
+    for job in jobs or []:
+        if job.application_url is None:
+            continue
+        form = forms_by_url.get(job.application_url)
+        if form is not None:
+            forms[job.id] = form
+    return StructuredATSProvider(forms)
 
 
 def discover_application(
@@ -193,6 +247,50 @@ def prepare_application(
         raise IllegalStateTransitionError(current, ApplicationStatus.PREPARED)
 
     llm = llm or NullLLMProvider()
+
+    # Phase 6B: inspection is capability-driven (`provider.
+    # supports_inspection`), never assumed. A provider that never opted in
+    # (every Phase 5/6A provider, and any future one that doesn't
+    # implement real structural inspection) is left on the exact Phase
+    # 5/6A code path below, unchanged. See `ApplicationProvider.
+    # supports_inspection`'s docstring for why an unconditional call here
+    # would be a correctness regression, not a safety improvement.
+    if provider.supports_inspection:
+        try:
+            discovery_target = provider.discover_application(job)
+            inspection = provider.inspect_application(job, discovery_target)
+        except ProviderError as exc:
+            # error_message is a plain DB column, not routed through
+            # record_event()'s redaction — must be scrubbed here explicitly.
+            application.error_message = redact_text(str(exc))
+            transition_status(
+                session,
+                application,
+                ApplicationStatus.FAILED,
+                event_type="INSPECTION_FAILED",
+                details={"error": str(exc)},
+            )
+            session.commit()
+            return PreparationOutcome(application=application)
+
+        # `inspection` carries untrusted external content (field labels/
+        # descriptions the provider parsed) only inside `detail`, a plain
+        # diagnostic string — never inside the boolean facts
+        # `evaluate_inspection` actually decides on. Passing it straight
+        # through changes nothing about that boundary: the provider
+        # reports facts, `evaluate_inspection` (real `config.rules.
+        # safety`, never a provider-side copy) is still the only place a
+        # HUMAN_REQUIRED-from-inspection decision is made.
+        verdict = evaluate_inspection(config.rules, inspection)
+        application = handle_application_inspection(session, config, application, inspection)
+        if verdict.human_required:
+            # A safety gate, not merely informational — matches how every
+            # other gate in this module (submit_application's dry_run/
+            # approval/rate-limit checks) short-circuits rather than
+            # proceeding past a failed check. A human must resolve
+            # CAPTCHA/MFA/consent/an unrecognized form before answer
+            # generation is even meaningful.
+            return PreparationOutcome(application=application)
 
     try:
         questions = provider.get_questions(job)

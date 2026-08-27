@@ -63,3 +63,20 @@ llm:
   # 40's cost-optimization guidance). Override via LLM_MODEL env var or here.
   model: "claude-haiku-4-5-20251001"
   max_requests_per_minute: 20
+
+# `job-agent applications prepare`'s application-provider selection
+# (Phase 6B). "manual_review" is the default and only production provider
+# — no real ATS integration exists, submission always requires a human.
+# Setting provider to "structured_ats" ADDITIONALLY requires
+# structured_ats.enabled: true below (two explicit switches, matching
+# dry_run/live_mode's own defense-in-depth posture) before
+# StructuredATSProvider is ever constructed, and even then it only ever
+# reads LOCAL fixture data from fixture_path — never a network call, never
+# a real ATS platform — and its submit() unconditionally refuses regardless
+# of any setting here or in dry_run/live_mode. See
+# config/fixtures/structured_ats_forms.example.yaml.
+application_provider:
+  provider: "manual_review"
+  structured_ats:
+    enabled: false
+    fixture_path: "config/fixtures/structured_ats_forms.example.yaml"

@@ -72,6 +72,37 @@ class ProviderHealthCheck:
 class ApplicationProvider(ABC):
     name: str
 
+    # ------------------------------------------------------------------
+    # Capability flag (Phase 6B inspection wiring). Defaults to `False` so
+    # every existing provider — `ManualReviewProvider`, every fake
+    # provider in the test suite, anything written against the Phase 5/6A
+    # interface before this flag existed — is treated as "does not
+    # perform real inspection" without any code change on its part.
+    #
+    # This exists because `inspect_application`'s ABC default reports
+    # `structure_recognized=False` (a conservative "not actually
+    # inspected", never an optimistic guess) — which is exactly correct
+    # for a provider that never overrides it, but is also exactly the
+    # signal `rules_enforcement.evaluate_inspection` uses to route to
+    # HUMAN_REQUIRED via `unexpected_form_structure`. If
+    # `job_agent.applications.service.prepare_application` called
+    # `inspect_application` unconditionally for every provider, every
+    # existing provider that has never implemented real inspection would
+    # suddenly route every application to HUMAN_REQUIRED — a correctness
+    # regression, not a safety improvement (see Phase 6A's own README:
+    # this exact risk was flagged and deliberately deferred). A provider
+    # must explicitly opt in by setting `supports_inspection = True` once
+    # it has implemented `discover_application`/`inspect_application`
+    # with genuine structural-fact detection.
+    #
+    # Opting in is purely a capability declaration — it grants no new
+    # authority. `inspect_application`'s result still only ever reaches
+    # `job_agent.applications.rules_enforcement.evaluate_inspection`,
+    # which is still the only place a HUMAN_REQUIRED-from-inspection
+    # decision is made; the provider decides nothing.
+    # ------------------------------------------------------------------
+    supports_inspection: bool = False
+
     @abstractmethod
     def get_questions(self, job: JobRow) -> list[ApplicationQuestion]:
         """Return the questions this job's application requires answering.
@@ -200,6 +231,13 @@ class ManualReviewProvider(ApplicationProvider):
     """
 
     name = "manual_review"
+    # Explicit, not just inherited — never claims real inspection since it
+    # never performs any (its inspect_application below always reports
+    # structure_recognized=False honestly, but without this flag set to
+    # False the *caller* has no reliable way to distinguish "a real
+    # provider inspected this and found it unrecognized" from "this
+    # provider never inspects anything at all").
+    supports_inspection = False
 
     def get_questions(self, job: JobRow) -> list[ApplicationQuestion]:
         return list(_STANDARD_QUESTIONS)

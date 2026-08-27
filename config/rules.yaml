@@ -12,6 +12,7 @@ safety:
   stop_on_captcha: true
   stop_on_mfa: true
   stop_on_unexpected_form: true
+  stop_on_consent_required: true
   never_bypass_access_controls: true
   never_bypass_rate_limits: true
   never_bypass_bot_detection: true
@@ -29,6 +30,7 @@ hard_stop_conditions:
   - "captcha_detected"
   - "mfa_detected"
   - "unexpected_form_structure"
+  - "consent_required"
 
 truth_validation:
   # Any candidate fact used in a generated answer/resume must trace back to

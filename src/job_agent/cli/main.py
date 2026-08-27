@@ -28,9 +28,13 @@ from rich.table import Table
 from sqlalchemy import select
 
 from job_agent.applications.provider import ManualReviewProvider
-from job_agent.applications.repository import get_answers
+from job_agent.applications.repository import get_answers, get_latest_event
 from job_agent.applications.schema import ApplicationStatus
-from job_agent.applications.service import prepare_applications_batch, submit_applications_batch
+from job_agent.applications.service import (
+    build_application_provider,
+    prepare_applications_batch,
+    submit_applications_batch,
+)
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
 from job_agent.config.loader import REPO_ROOT, load_config
 from job_agent.db.models import Application, JobMatch
@@ -467,7 +471,6 @@ def applications_prepare() -> None:
         raise typer.Exit(code=1) from exc
 
     llm = build_llm_provider(cfg)
-    provider = ManualReviewProvider()
 
     with session_factory() as session:
         candidate_id = save_candidate_profile(session, profile)
@@ -488,9 +491,53 @@ def applications_prepare() -> None:
                 continue
             items.append((job, jm))
 
+        # Phase 6B: which ApplicationProvider to use is config-driven
+        # (`config.automation.application_provider`), mirroring
+        # `job_agent.jobs.service.build_sources`'s pattern. Default
+        # ("manual_review") is byte-for-byte the same provider this
+        # command has always hardcoded — StructuredATSProvider only ever
+        # runs when explicitly enabled, and only against a local fixture
+        # file (never a network call, never a real ATS). A misconfigured
+        # fixture_path (e.g. a typo) must fail loudly with a clear,
+        # redacted message here — never as an unhandled traceback, and
+        # never by silently falling back to a different provider.
+        try:
+            provider = build_application_provider(cfg, [job for job, _ in items])
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(
+                f"[red]Failed to resolve application provider:[/red] {redact_text(str(exc))}"
+            )
+            raise typer.Exit(code=1) from exc
+        if provider.name != "manual_review":
+            console.print(
+                f"[cyan]Using application provider:[/cyan] {provider.name} "
+                "(local fixture data only — submission remains disabled)"
+            )
+
         outcomes = prepare_applications_batch(
             session, cfg, items, candidate_id, profile, provider, llm=llm
         )
+
+        # Phase 6B: surface *why* an application landed at HUMAN_REQUIRED
+        # (CAPTCHA/MFA/consent/unexpected form, an inspection-stage
+        # provider error, or a hard-block/missing-fact answer) — read
+        # while `session` is still open, since the audit trail lives in
+        # the DB, not on the in-memory outcome. `get_latest_event` is
+        # read-only and returns already-redacted `details` (every
+        # `ApplicationEvent` row is redacted at write time by
+        # `record_event`), so nothing here needs its own redaction pass.
+        # This is purely informational — it changes nothing about which
+        # provider ran, whether inspection happened (still governed
+        # entirely by `provider.supports_inspection`), or how the status
+        # was decided; only production, not real submission, behavior.
+        reasons: dict[int, str] = {}
+        for item in outcomes:
+            if item.application is not None and item.application.status == (
+                ApplicationStatus.HUMAN_REQUIRED.value
+            ):
+                event = get_latest_event(session, item.application.id)
+                if event is not None:
+                    reasons[item.application.id] = event.event_type
 
     if not outcomes:
         console.print(
@@ -518,9 +565,12 @@ def applications_prepare() -> None:
             )
             continue
         color = status_colors.get(item.application.status, "white")
+        detail = ""
+        if item.application.status == ApplicationStatus.HUMAN_REQUIRED.value:
+            detail = reasons.get(item.application.id, "")
         table.add_row(
             str(item.job.id), item.job.company_name, item.job.title,
-            f"[{color}]{item.application.status}[/{color}]", "",
+            f"[{color}]{item.application.status}[/{color}]", detail,
         )
     console.print(table)
     if error_count:
