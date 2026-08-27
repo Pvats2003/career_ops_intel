@@ -194,10 +194,40 @@ class StructuredATSProviderConfig(StrictModel):
     fixture_path: str = "config/fixtures/structured_ats_forms.example.yaml"
 
 
+# --------------------------------------------------------------------------
+# Real-submission-capable provider selection (Phase 6C). Mirrors
+# `StructuredATSProviderConfig`'s exact "enabled: false" opt-in pattern —
+# and adds a third, independent gate on top: `credential_env_var` only
+# NAMES an environment variable; it never carries a secret value itself,
+# and `job_agent.security.credentials.EnvCredentialStore` (the only thing
+# that ever reads it) raises rather than proceeds if that variable isn't
+# actually set. So even `provider: "real_structured_ats"` +
+# `enabled: true` together are not sufficient for a real submission to
+# occur — a real credential must ALSO be configured (Stage 2, never this
+# phase), on top of `job_agent.applications.service.submit_application`'s
+# allowlist+approval gate, on top of `dry_run`/`live_mode`. No shipped
+# config in this repository sets `provider` to this value.
+# --------------------------------------------------------------------------
+class RealStructuredATSProviderConfig(StrictModel):
+    enabled: bool = False
+    # Relative to the repo root; points at a LOCAL fixture file only — see
+    # config/fixtures/real_structured_ats_forms.example.yaml. Never a URL.
+    fixture_path: str = "config/fixtures/real_structured_ats_forms.example.yaml"
+    # The name `RealStructuredATSProvider` asks its `CredentialProvider`
+    # for — never a secret value itself.
+    credential_name: str = "real_structured_ats_credential"
+    # NAMES an environment variable; never the credential's value. See
+    # `job_agent.security.credentials.EnvCredentialStore`.
+    credential_env_var: str = "JOB_AGENT_REAL_STRUCTURED_ATS_CREDENTIAL"
+
+
 class ApplicationProviderConfig(StrictModel):
-    provider: Literal["manual_review", "structured_ats"] = "manual_review"
+    provider: Literal["manual_review", "structured_ats", "real_structured_ats"] = "manual_review"
     structured_ats: StructuredATSProviderConfig = Field(
         default_factory=StructuredATSProviderConfig
+    )
+    real_structured_ats: RealStructuredATSProviderConfig = Field(
+        default_factory=RealStructuredATSProviderConfig
     )
 
 

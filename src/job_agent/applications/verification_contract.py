@@ -1,19 +1,25 @@
-"""Verification-evidence contract — Phase 6C.5 (Credential Safety &
-Verification Foundation) groundwork.
+"""Verification-evidence contract — built as Phase 6C.5 (Credential Safety
+& Verification Foundation) groundwork, now actually wired into
+`verify_application` by Phase 6C (controlled real-world execution).
 
 ============================================================================
-PHASE 6C.5 — CREDENTIAL SAFETY & VERIFICATION FOUNDATION. GROUNDWORK ONLY.
-THIS MODULE IS DORMANT.
+PHASE 6C.5 groundwork; PHASE 6C is the deliberate consumer.
 
-Not to be confused with the README's "Phase 6C" — that name is reserved
-for a future, distinct, later phase: controlled real-world execution
-(live-mode submission against a small, human-approved allowlist). This
-module belongs to Phase 6C.5, a foundation phase that sits between Phase
-6B and that future Phase 6C, and grants no part of that later phase's
-capability.
+This module's shape-only plausibility check (`validate_submission_evidence`)
+was built one phase before it had a real caller — exactly the same
+"abstraction before any real implementation" pattern this project uses
+throughout. Phase 6C is that caller: `job_agent.applications.service.
+verify_application` now additionally requires this check to pass, but
+ONLY for a provider with `requires_persisted_approval = True` (i.e. only
+`job_agent.applications.providers.real_structured_ats.
+RealStructuredATSProvider` today) — every other provider
+(`ManualReviewProvider`, `StructuredATSProvider`) is completely unaffected;
+`verify_application`'s original two-condition check
+(`verified=True` AND concrete evidence) still governs them exactly as
+before this phase.
 ============================================================================
-REAL CREDENTIALS: NONE.
-REAL SUBMISSIONS: NONE.
+REAL CREDENTIALS: NONE — this module itself never reads or holds one.
+REAL SUBMISSIONS: NONE — this module makes no submission of any kind.
 REAL NETWORK SUBMISSION CALLS: NONE — this module makes no network call.
 BROWSER AUTOMATION: NONE.
 ============================================================================
@@ -39,23 +45,20 @@ kind of real-provider capability explicitly out of scope for this phase.
 Treat a "valid" result from this function as "well-formed enough to be
 worth a human's attention," never as "confirmed genuine."
 
-WHAT THIS IS NOT (2): this module is never imported by, and never changes
-the behavior of, `job_agent.applications.service.verify_application` — the
-existing, only path to `VERIFIED` (see `job_agent.applications.service`) is
-completely unmodified by this phase. `verify_application` still requires
-`result.verified is True` AND `result.evidence is not None` AND
-`result.evidence.has_concrete_evidence` — exactly as before Phase 6C.5. This
-module's stricter validator has no consumer anywhere in the execution path
-today; it exists as a documented, tested contract for a later phase to
-adopt deliberately (e.g. by additionally requiring
-`validate_submission_evidence(evidence).valid` at that future callsite),
-not as something silently already governing application state.
+WHAT THIS IS NOT (2): this module changes `verify_application`'s behavior
+for exactly one provider — `RealStructuredATSProvider`
+(`requires_persisted_approval = True`) — and nothing else. For every other
+provider, `verify_application` still requires only `result.verified is
+True` AND `result.evidence is not None` AND `result.evidence.
+has_concrete_evidence`, exactly as before Phase 6C. This module was never
+retroactively made to govern any provider that doesn't explicitly opt in
+via that flag.
 
-No provider shipped through this phase (or any prior phase) ever produces
-evidence that reaches this validator in production — every shipped
-`submit()` (`ManualReviewProvider`, `StructuredATSProvider`)
-unconditionally refuses, so no real `SubmissionEvidence` object exists
-outside this module's own tests.
+`ManualReviewProvider` and `StructuredATSProvider` still never produce
+evidence that reaches this validator in production — both unconditionally
+refuse `submit()`. `RealStructuredATSProvider` is the first (and, in this
+Stage 1 pass, still only-ever-exercised-with-synthetic-data) provider whose
+evidence this validator actually gates.
 """
 
 from __future__ import annotations

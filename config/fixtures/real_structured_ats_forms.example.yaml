@@ -1,0 +1,47 @@
+# =============================================================================
+# real_structured_ats_forms.example.yaml — LOCAL/FAKE fixture data for
+# RealStructuredATSProvider (Phase 6C, Stage 1)
+# =============================================================================
+# This file is NEVER fetched from a network and NEVER represents a real ATS
+# platform, a real employer, or a real job posting — "example.test" domains
+# only, matching the synthetic-target requirement Phase 6C Stage 1 was built
+# under. It exists so `RealStructuredATSProvider` can be exercised end to end
+# (discovery/inspection/question extraction) without contacting anything
+# real.
+#
+# `job_agent.applications.providers.real_structured_ats.load_real_fixture_
+# forms()` is the ONLY reader of this file. It is disabled by default — see
+# config/automation.yaml's `application_provider` section — and is not
+# consulted at all unless `application_provider.provider` is explicitly set
+# to "real_structured_ats" AND `application_provider.real_structured_ats.
+# enabled` is explicitly set to true. No shipped config does either.
+#
+# `verification_url` is deliberately a SEPARATE endpoint from
+# `application_url` — RealStructuredATSProvider.verify() makes an
+# independent request to it, never re-confirming against the same endpoint
+# submit() already used. See that module's docstring.
+#
+# This file alone can never cause a real submission: RealStructuredATSProvider.
+# submit() also requires a real credential to actually be configured (never
+# by this file — see config/automation.yaml's real_structured_ats.
+# credential_env_var), AND a human-created allowlist entry + persisted
+# approval (job_agent.applications.service.submit_application's gate) before
+# it is ever called at all.
+# =============================================================================
+
+forms:
+  - application_url: "https://ats.example.test/acme/staff-engineer"
+    verification_url: "https://ats.example.test/acme/staff-engineer/verify"
+    ats_application_id: "example-real-fixture-1"
+    captcha_present: false
+    mfa_present: false
+    consent_required: false
+    fields:
+      - field_id: "f1"
+        label: "Tell me about yourself."
+        field_type: "TEXTAREA"
+        required: true
+      - field_id: "f2"
+        label: "Are you willing to relocate?"
+        field_type: "YES_NO"
+        required: false
