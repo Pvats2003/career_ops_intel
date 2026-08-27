@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -12,6 +13,7 @@ from job_agent.applications.repository import (
     get_answers,
     get_application,
     get_or_create_application,
+    record_event,
     save_answer,
     transition_status,
 )
@@ -221,3 +223,72 @@ def test_count_submissions_from_source_since(db_session, job_and_candidate):
 def test_get_application_returns_none_when_absent(db_session, job_and_candidate):
     job, candidate = job_and_candidate
     assert get_application(db_session, job.id, candidate.id) is None
+
+
+# --------------------------------------------------------------------------
+# Security fix (post-Phase-6A audit): record_event() must never persist a
+# secret into the immutable application_events audit trail.
+# --------------------------------------------------------------------------
+def test_record_event_redacts_sensitive_keys_before_persisting(db_session, job_and_candidate):
+    job, candidate = job_and_candidate
+    application, _ = get_or_create_application(db_session, job.id, candidate.id, dry_run=True)
+    db_session.commit()
+
+    record_event(
+        db_session, application.id, "PROVIDER_ERROR",
+        {"api_key": "sk-liveSECRET1234567890", "provider": "manual_review"},
+    )
+    db_session.commit()
+
+    event = (
+        db_session.query(ApplicationEvent)
+        .filter_by(application_id=application.id, event_type="PROVIDER_ERROR")
+        .one()
+    )
+    assert event.details["api_key"] == "***REDACTED***"
+    assert event.details["provider"] == "manual_review"  # non-sensitive, untouched
+
+
+def test_record_event_redacts_a_secret_embedded_in_a_free_text_error_message(
+    db_session, job_and_candidate
+):
+    """The realistic shape of a leak: a raw exception message (never a
+    conveniently-named dict key) embedding a credential."""
+    job, candidate = job_and_candidate
+    application, _ = get_or_create_application(db_session, job.id, candidate.id, dry_run=True)
+    db_session.commit()
+
+    record_event(
+        db_session, application.id, "SUBMISSION_FAILED",
+        {"error": "provider auth failed: api_key=sk-liveSECRET1234567890 rejected"},
+    )
+    db_session.commit()
+
+    event = (
+        db_session.query(ApplicationEvent)
+        .filter_by(application_id=application.id, event_type="SUBMISSION_FAILED")
+        .one()
+    )
+    assert "sk-liveSECRET1234567890" not in event.details["error"]
+    assert "***REDACTED***" in event.details["error"]
+
+
+def test_transition_status_redacted_details_reach_the_audit_trail(db_session, job_and_candidate):
+    """transition_status() delegates to record_event() — confirm the
+    redaction is applied end-to-end through the actual status-change path,
+    not just when record_event() is called directly."""
+    job, candidate = job_and_candidate
+    application, _ = get_or_create_application(db_session, job.id, candidate.id, dry_run=True)
+    db_session.commit()
+
+    transition_status(
+        db_session, application, ApplicationStatus.FAILED,
+        event_type="SUBMISSION_FAILED",
+        details={"error": "auth failed: password=hunter2secret", "provider": "manual_review"},
+    )
+    db_session.commit()
+
+    events = db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    combined = json.dumps([e.details for e in events])
+    assert "hunter2secret" not in combined
+    assert "***REDACTED***" in combined

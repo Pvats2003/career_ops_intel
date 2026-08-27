@@ -39,7 +39,7 @@ from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.jobs.service import run_scan
 from job_agent.llm.provider import NullLLMProvider, build_llm_provider
-from job_agent.logging.setup import configure_logging, get_logger, log_event
+from job_agent.logging.setup import configure_logging, get_logger, log_event, redact_text
 from job_agent.matching.service import run_matching
 from job_agent.resume.errors import ResumeExtractionError
 from job_agent.resume.repository import list_versions
@@ -113,7 +113,7 @@ def profile_parse() -> None:
         log_event(
             logger, component="cli.profile_parse", action="parse", result="failure", error=str(exc)
         )
-        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     engine = get_engine(cfg.env.database_url)
@@ -165,7 +165,9 @@ def profile_parse() -> None:
                 result="failure",
                 error=str(exc),
             )
-            console.print(f"[red]Could not read the authoritative resume file:[/red] {exc}")
+            console.print(
+                f"[red]Could not read the authoritative resume file:[/red] {redact_text(str(exc))}"
+            )
             raise typer.Exit(code=1) from exc
 
     if not result.passed:
@@ -211,7 +213,7 @@ def profile_history() -> None:
     try:
         profile = parse_candidate_profile(cfg)
     except CandidateParseError as exc:
-        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     with session_factory() as session:
@@ -271,7 +273,7 @@ def health() -> None:
         cfg = load_config()
         checks.append(("config", True, "loaded"))
     except Exception as exc:  # noqa: BLE001
-        checks.append(("config", False, str(exc)))
+        checks.append(("config", False, redact_text(str(exc))))
         cfg = None
 
     if cfg is not None:
@@ -279,14 +281,17 @@ def health() -> None:
             parse_candidate_profile(cfg)
             checks.append(("candidate_profile", True, "parses cleanly"))
         except Exception as exc:  # noqa: BLE001
-            checks.append(("candidate_profile", False, str(exc)))
+            checks.append(("candidate_profile", False, redact_text(str(exc))))
 
         try:
             engine = get_engine(cfg.env.database_url)
             init_db(engine)
-            checks.append(("database", True, cfg.env.database_url))
+            # database_url may embed a credential for a non-SQLite
+            # deployment (scheme://user:password@host/db) — must never be
+            # displayed unredacted, success path included.
+            checks.append(("database", True, redact_text(cfg.env.database_url)))
         except Exception as exc:  # noqa: BLE001
-            checks.append(("database", False, str(exc)))
+            checks.append(("database", False, redact_text(str(exc))))
 
     table = Table(title="job-agent health")
     table.add_column("Check")
@@ -380,7 +385,7 @@ def jobs_match() -> None:
     try:
         profile = parse_candidate_profile(cfg)
     except CandidateParseError as exc:
-        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     llm = build_llm_provider(cfg)
@@ -396,7 +401,7 @@ def jobs_match() -> None:
         try:
             outcomes = run_matching(session, cfg, profile, candidate_id, llm=llm)
         except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
+            console.print(f"[red]{redact_text(str(exc))}[/red]")
             raise typer.Exit(code=1) from exc
 
     if not outcomes:
@@ -458,7 +463,7 @@ def applications_prepare() -> None:
     try:
         profile = parse_candidate_profile(cfg)
     except CandidateParseError as exc:
-        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     llm = build_llm_provider(cfg)

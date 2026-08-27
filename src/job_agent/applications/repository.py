@@ -1,6 +1,6 @@
 """Persistence for the application engine.
 
-Two invariants this module exists to guarantee:
+Three invariants this module exists to guarantee:
 
 * **No status change without an audit record.** `transition_status()` is
   the only function that may change `Application.status`, and it always
@@ -11,6 +11,15 @@ Two invariants this module exists to guarantee:
   an existing row first and the DB's own unique constraint on
   `(job_id, candidate_id)` (see db/models.py) backs it up — even a racing
   concurrent call cannot create two Application rows for the same job.
+* **No secret ever lands in the audit trail.** `record_event()` is the one
+  function that writes every `ApplicationEvent` row in the system, so it is
+  where `details` is redacted (security fix, post-Phase-6A audit) — a
+  `details={"error": str(exc)}` call whose exception message happened to
+  embed a credential (e.g. a future provider's HTTP client error) would
+  otherwise persist that credential permanently in the database, not just
+  transiently in a log line. Uses the exact same
+  `job_agent.logging.setup.redact_value()` the logging boundary uses, so
+  there is one definition of "what looks like a secret," not two.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ from sqlalchemy.orm import Session
 from job_agent.applications.schema import ApplicationStatus, GeneratedAnswer
 from job_agent.applications.state_machine import validate_transition
 from job_agent.db.models import Application, ApplicationAnswer, ApplicationEvent
+from job_agent.logging.setup import redact_value
 
 
 def get_application(session: Session, job_id: int, candidate_id: int) -> Application | None:
@@ -60,7 +70,13 @@ def get_or_create_application(
 def record_event(
     session: Session, application_id: int, event_type: str, details: dict
 ) -> ApplicationEvent:
-    event = ApplicationEvent(application_id=application_id, event_type=event_type, details=details)
+    """The only function that writes `ApplicationEvent` rows — `details` is
+    redacted here (`job_agent.logging.setup.redact_value`) before it ever
+    reaches the database, so no caller across the codebase needs to
+    remember to sanitize its own `details` dict."""
+    event = ApplicationEvent(
+        application_id=application_id, event_type=event_type, details=redact_value(details)
+    )
     session.add(event)
     session.flush()
     return event
