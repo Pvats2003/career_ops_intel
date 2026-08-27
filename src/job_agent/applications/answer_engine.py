@@ -42,6 +42,7 @@ from job_agent.applications.schema import (
 from job_agent.candidate.schema import CandidateProfile
 from job_agent.llm.errors import LLMOutputValidationError, LLMUnavailableError
 from job_agent.llm.provider import LLMProvider
+from job_agent.logging.setup import redact_text
 from job_agent.matching.text import contains_keyword
 
 PROMPT_VERSION = "answer_generator.v1"
@@ -234,6 +235,11 @@ def generate_answer(
             )
             break
         except LLMUnavailableError as exc:
+            # validation_notes is persisted verbatim to ApplicationAnswer
+            # and displayed by `job-agent applications review` — redact
+            # before it ever leaves this function, not at the display/
+            # persistence boundary (an AnthropicLLMProvider transport
+            # failure could in principle embed request/response detail).
             return GeneratedAnswer(
                 question=question.text,
                 category=category,
@@ -242,7 +248,7 @@ def generate_answer(
                 source="llm_unavailable",
                 requires_human=True,
                 validated=True,
-                validation_notes=(str(exc),),
+                validation_notes=(redact_text(str(exc)),),
             )
         except LLMOutputValidationError as exc:
             if attempt == 2:
@@ -254,7 +260,7 @@ def generate_answer(
                     source="llm_invalid_output",
                     requires_human=True,
                     validated=True,
-                    validation_notes=(f"LLM output invalid after retry: {exc}",),
+                    validation_notes=(redact_text(f"LLM output invalid after retry: {exc}"),),
                 )
             continue
 

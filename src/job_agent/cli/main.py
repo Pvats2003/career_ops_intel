@@ -8,6 +8,10 @@ profile (candidate_profile_versions); profile history lists past versions.
 Phase 5 adds: applications prepare/review/run (dry-run by default; no real
 ATS integration exists yet, so `run` always reports what a human still
 needs to do rather than actually submitting anything).
+Phase 6A (architecture/contracts only — no real provider, no real
+submission) adds per-item failure isolation to `applications prepare`/
+`applications run`: one job/application raising an unexpected error is
+logged and skipped, never aborting the rest of the batch.
 Later-phase commands are registered now (so the interface contract is
 stable) but exit with a clear "not implemented yet" message rather than
 pretending to do something they can't — see BUILD PROMPT section 48.
@@ -26,11 +30,7 @@ from sqlalchemy import select
 from job_agent.applications.provider import ManualReviewProvider
 from job_agent.applications.repository import get_answers
 from job_agent.applications.schema import ApplicationStatus
-from job_agent.applications.service import (
-    discover_application,
-    prepare_application,
-    submit_application,
-)
+from job_agent.applications.service import prepare_applications_batch, submit_applications_batch
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
 from job_agent.config.loader import REPO_ROOT, load_config
 from job_agent.db.models import Application, JobMatch
@@ -39,7 +39,7 @@ from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.jobs.service import run_scan
 from job_agent.llm.provider import NullLLMProvider, build_llm_provider
-from job_agent.logging.setup import configure_logging, get_logger, log_event
+from job_agent.logging.setup import configure_logging, get_logger, log_event, redact_text
 from job_agent.matching.service import run_matching
 from job_agent.resume.errors import ResumeExtractionError
 from job_agent.resume.repository import list_versions
@@ -113,7 +113,7 @@ def profile_parse() -> None:
         log_event(
             logger, component="cli.profile_parse", action="parse", result="failure", error=str(exc)
         )
-        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     engine = get_engine(cfg.env.database_url)
@@ -165,7 +165,9 @@ def profile_parse() -> None:
                 result="failure",
                 error=str(exc),
             )
-            console.print(f"[red]Could not read the authoritative resume file:[/red] {exc}")
+            console.print(
+                f"[red]Could not read the authoritative resume file:[/red] {redact_text(str(exc))}"
+            )
             raise typer.Exit(code=1) from exc
 
     if not result.passed:
@@ -211,7 +213,7 @@ def profile_history() -> None:
     try:
         profile = parse_candidate_profile(cfg)
     except CandidateParseError as exc:
-        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     with session_factory() as session:
@@ -271,7 +273,7 @@ def health() -> None:
         cfg = load_config()
         checks.append(("config", True, "loaded"))
     except Exception as exc:  # noqa: BLE001
-        checks.append(("config", False, str(exc)))
+        checks.append(("config", False, redact_text(str(exc))))
         cfg = None
 
     if cfg is not None:
@@ -279,14 +281,17 @@ def health() -> None:
             parse_candidate_profile(cfg)
             checks.append(("candidate_profile", True, "parses cleanly"))
         except Exception as exc:  # noqa: BLE001
-            checks.append(("candidate_profile", False, str(exc)))
+            checks.append(("candidate_profile", False, redact_text(str(exc))))
 
         try:
             engine = get_engine(cfg.env.database_url)
             init_db(engine)
-            checks.append(("database", True, cfg.env.database_url))
+            # database_url may embed a credential for a non-SQLite
+            # deployment (scheme://user:password@host/db) — must never be
+            # displayed unredacted, success path included.
+            checks.append(("database", True, redact_text(cfg.env.database_url)))
         except Exception as exc:  # noqa: BLE001
-            checks.append(("database", False, str(exc)))
+            checks.append(("database", False, redact_text(str(exc))))
 
     table = Table(title="job-agent health")
     table.add_column("Check")
@@ -380,7 +385,7 @@ def jobs_match() -> None:
     try:
         profile = parse_candidate_profile(cfg)
     except CandidateParseError as exc:
-        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     llm = build_llm_provider(cfg)
@@ -396,7 +401,7 @@ def jobs_match() -> None:
         try:
             outcomes = run_matching(session, cfg, profile, candidate_id, llm=llm)
         except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
+            console.print(f"[red]{redact_text(str(exc))}[/red]")
             raise typer.Exit(code=1) from exc
 
     if not outcomes:
@@ -445,7 +450,11 @@ def jobs_match() -> None:
 def applications_prepare() -> None:
     """Discover + prepare an Application for every job_matches row that
     doesn't have one yet (APPLY/REVIEW decisions proceed toward PREPARED;
-    HUMAN_REQUIRED/SAVE/SKIP land in the matching states directly)."""
+    HUMAN_REQUIRED/SAVE/SKIP land in the matching states directly).
+
+    Each job is processed independently (`prepare_applications_batch`) —
+    one job raising an unexpected error is logged and skipped, it never
+    aborts preparation for the rest of the batch (Phase 6A)."""
     cfg = load_config()
     engine = get_engine(cfg.env.database_url)
     init_db(engine)
@@ -454,7 +463,7 @@ def applications_prepare() -> None:
     try:
         profile = parse_candidate_profile(cfg)
     except CandidateParseError as exc:
-        console.print(f"[red]Failed to parse candidate profile:[/red] {exc}")
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     llm = build_llm_provider(cfg)
@@ -472,23 +481,18 @@ def applications_prepare() -> None:
         for jm in job_matches:
             latest_by_job[jm.job_id] = jm
 
-        rows = []
+        items = []
         for job_id, jm in latest_by_job.items():
             job = session.get(JobRow, job_id)
             if job is None:
                 continue
-            application = discover_application(session, cfg, job, jm, candidate_id)
-            if ApplicationStatus(application.status) in (
-                ApplicationStatus.MATCHED,
-                ApplicationStatus.HUMAN_REQUIRED,
-            ):
-                outcome = prepare_application(
-                    session, cfg, application, job, profile, provider, llm=llm
-                )
-                application = outcome.application
-            rows.append((job, application))
+            items.append((job, jm))
 
-    if not rows:
+        outcomes = prepare_applications_batch(
+            session, cfg, items, candidate_id, profile, provider, llm=llm
+        )
+
+    if not outcomes:
         console.print(
             "[yellow]No job matches found.[/yellow] Run `job-agent jobs match` first."
         )
@@ -499,16 +503,31 @@ def applications_prepare() -> None:
     table.add_column("Company")
     table.add_column("Title")
     table.add_column("Status")
+    table.add_column("Detail")
     status_colors = {
         "PREPARED": "green", "HUMAN_REQUIRED": "yellow", "SKIPPED": "dim",
         "FAILED": "red", "MATCHED": "cyan",
     }
-    for job, application in rows:
-        color = status_colors.get(application.status, "white")
+    error_count = 0
+    for item in outcomes:
+        if item.error is not None or item.application is None:
+            error_count += 1
+            table.add_row(
+                str(item.job.id), item.job.company_name, item.job.title,
+                "[red]ERROR[/red]", item.error or "unknown error",
+            )
+            continue
+        color = status_colors.get(item.application.status, "white")
         table.add_row(
-            str(job.id), job.company_name, job.title, f"[{color}]{application.status}[/{color}]"
+            str(item.job.id), item.job.company_name, item.job.title,
+            f"[{color}]{item.application.status}[/{color}]", "",
         )
     console.print(table)
+    if error_count:
+        console.print(
+            f"[red]{error_count} job(s) failed to process[/red] — see the Detail column "
+            "and logs; every other job in this run was processed independently."
+        )
 
 
 @applications_app.command("review")
@@ -553,7 +572,12 @@ def applications_run() -> None:
     There is no real ATS integration in this phase — `ManualReviewProvider`
     always refuses (see job_agent.applications.provider) — so this command
     exists to exercise the safety gates honestly and report exactly what a
-    human still needs to do, never to actually submit anything."""
+    human still needs to do, never to actually submit anything.
+
+    Each application is processed independently
+    (`submit_applications_batch`) — one raising an unexpected error is
+    logged and skipped, it never aborts submission attempts for the rest
+    of the batch (Phase 6A)."""
     cfg = load_config()
     engine = get_engine(cfg.env.database_url)
     init_db(engine)
@@ -576,15 +600,32 @@ def applications_run() -> None:
             console.print("[yellow]No PREPARED applications to submit.[/yellow]")
             raise typer.Exit(code=0)
 
+        items = []
         for application in prepared:
             job = session.get(JobRow, application.job_id)
             if job is None:
                 continue
-            result = submit_application(session, cfg, application, job, provider)
+            items.append((application, job))
+
+        outcomes = submit_applications_batch(session, cfg, items, provider)
+
+    error_count = 0
+    for item in outcomes:
+        if item.error is not None or item.application is None:
+            error_count += 1
             console.print(
-                f"{job.company_name} — {job.title}: [cyan]{result.status}[/cyan]"
-                + (f" ({result.error_message})" if result.error_message else "")
+                f"{item.job.company_name} — {item.job.title}: [red]ERROR[/red] ({item.error})"
             )
+            continue
+        console.print(
+            f"{item.job.company_name} — {item.job.title}: [cyan]{item.application.status}[/cyan]"
+            + (f" ({item.application.error_message})" if item.application.error_message else "")
+        )
+    if error_count:
+        console.print(
+            f"[red]{error_count} application(s) failed to process[/red] — see the messages "
+            "above and logs; every other application in this run was attempted independently."
+        )
 
 
 @app.command()

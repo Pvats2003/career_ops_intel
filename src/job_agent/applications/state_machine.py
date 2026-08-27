@@ -43,8 +43,27 @@ _ALLOWED_TRANSITIONS: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
     # IllegalStateTransitionError instead of no-op'ing with a fresh audit
     # event (see the Phase 5 adversarial review notes in service.py).
     _S.HUMAN_REQUIRED: frozenset({_S.PREPARED, _S.HUMAN_REQUIRED, _S.SKIPPED, _S.FAILED}),
-    _S.PREPARED: frozenset({_S.SUBMITTED, _S.HUMAN_REQUIRED, _S.SKIPPED, _S.FAILED}),
+    # Includes PREPARED -> SUBMISSION_UNCERTAIN (Phase 6A): a submission
+    # attempt whose outcome could not be determined (e.g. a network timeout
+    # after the request may already have reached the platform) must never
+    # be forced into SUBMITTED or FAILED — see SUBMISSION_UNCERTAIN's own
+    # entry below. No Phase 6A provider can actually produce this
+    # transition (ManualReviewProvider always raises SubmissionRefusedError
+    # instead); the edge exists so the contract is ready for Phase 6B+.
+    _S.PREPARED: frozenset(
+        {_S.SUBMITTED, _S.SUBMISSION_UNCERTAIN, _S.HUMAN_REQUIRED, _S.SKIPPED, _S.FAILED}
+    ),
     _S.SUBMITTED: frozenset({_S.VERIFIED, _S.FAILED}),
+    # Deliberately narrow: an uncertain submission may only be *resolved*
+    # (by independent verification finding it either did or didn't happen)
+    # or escalated to a human — never blindly retried. In particular:
+    #   - NOT -> PREPARED or -> SUBMITTED: re-attempting a submission whose
+    #     outcome is unknown is exactly how a duplicate application to a
+    #     real platform would happen; there is no safe automatic retry.
+    #   - NOT -> itself: no blind re-poll loop lives in the state machine.
+    # See job_agent.applications.service module docstring and the Phase 6A
+    # adversarial review notes for the reasoning this graph enforces.
+    _S.SUBMISSION_UNCERTAIN: frozenset({_S.VERIFIED, _S.FAILED, _S.HUMAN_REQUIRED}),
     _S.VERIFIED: frozenset(),
     _S.FAILED: frozenset({_S.MATCHED}),
     _S.SKIPPED: frozenset(),

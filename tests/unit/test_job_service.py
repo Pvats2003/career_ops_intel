@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 
@@ -7,6 +9,7 @@ from job_agent.config.loader import load_config
 from job_agent.db.models import Job as JobRow
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.jobs.service import build_sources, run_scan, scan_source
+from job_agent.jobs.source import HealthCheckResult, JobSource
 from job_agent.jobs.sources.greenhouse import GreenhouseJobSource
 from job_agent.jobs.sources.lever import LeverJobSource
 from job_agent.net.http_client import ResilientHttpClient
@@ -109,3 +112,88 @@ def test_run_scan_with_injected_sources(db_session, real_config):
     results = run_scan(db_session, real_config, sources=[src])
     assert len(results) == 1
     assert results[0].created == 1
+
+
+# --------------------------------------------------------------------------
+# Security fix (post-Phase-6A audit, remaining-sites pass): ScanResult.errors
+# is returned to `job-agent jobs scan`, which prints every entry verbatim —
+# a source adapter's exception message must never reach that surface with a
+# credential embedded in it.
+# --------------------------------------------------------------------------
+class _LeakySource(JobSource):
+    """A minimal fake JobSource whose search()/fetch_job() can be made to
+    raise an arbitrary exception on demand — isolates scan_source()'s own
+    redaction wiring from ResilientHttpClient's retry/backoff behavior,
+    which would otherwise make these tests slow and which Greenhouse/Lever
+    already have their own mocked-HTTP tests for."""
+
+    name = "leaky"
+
+    def __init__(
+        self, *, search_error: Exception | None = None, fetch_error: Exception | None = None
+    ):
+        self._search_error = search_error
+        self._fetch_error = fetch_error
+
+    def search(self):
+        if self._search_error:
+            raise self._search_error
+        return [{"id": 1}]
+
+    def fetch_job(self, raw):
+        if self._fetch_error:
+            raise self._fetch_error
+        return raw
+
+    def normalize(self, raw):
+        raise AssertionError("normalize() should not be reached when fetch_job() already failed")
+
+    def get_posted_time(self, raw):
+        return None
+
+    def health_check(self):
+        return HealthCheckResult(healthy=True, detail="n/a", checked_at=datetime.now(UTC))
+
+
+def test_scan_source_redacts_secret_in_top_level_search_failure(db_session, real_config):
+    src = _LeakySource(
+        search_error=RuntimeError("upstream auth failed: api_key=sk-liveSECRET1234567890")
+    )
+    result = scan_source(db_session, real_config, src)
+
+    assert len(result.errors) == 1
+    assert "sk-liveSECRET1234567890" not in result.errors[0]
+    assert "***REDACTED***" in result.errors[0]
+
+
+def test_scan_source_redacts_secret_in_per_posting_failure(db_session, real_config):
+    src = _LeakySource(fetch_error=RuntimeError("upstream error: password=hunter2secretvalue"))
+    result = scan_source(db_session, real_config, src)
+
+    assert len(result.errors) == 1
+    assert "hunter2secretvalue" not in result.errors[0]
+    assert "***REDACTED***" in result.errors[0]
+    assert "posting 1:" in result.errors[0]  # ordinary diagnostic context preserved
+
+
+def test_scan_source_preserves_ordinary_error_diagnostics_when_nothing_sensitive_present(
+    db_session, real_config
+):
+    """Confirms the fix does not blindly redact everything — an error with
+    no secret-shaped content passes through unchanged."""
+    src = _LeakySource(search_error=RuntimeError("connection timed out after 30s"))
+    result = scan_source(db_session, real_config, src)
+
+    assert result.errors == ["connection timed out after 30s"]
+
+
+def test_run_scan_results_list_carries_redacted_errors_end_to_end(db_session, real_config):
+    """The full run_scan() -> list[ScanResult] path (what the CLI actually
+    consumes) still carries the redacted string, not the raw one."""
+    src = _LeakySource(
+        search_error=RuntimeError("provider rejected token: refresh_token=abcDEF123xyzSECRET")
+    )
+    results = run_scan(db_session, real_config, sources=[src])
+
+    assert len(results) == 1
+    assert "abcDEF123xyzSECRET" not in results[0].errors[0]

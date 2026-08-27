@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from job_agent.candidate.schema import CandidateProfile
 from job_agent.llm.errors import LLMOutputValidationError, LLMUnavailableError
 from job_agent.llm.provider import LLMCallMetadata, LLMProvider
+from job_agent.logging.setup import redact_text
 from job_agent.matching.deterministic import JobText
 
 PROMPT_VERSION = "job_matcher.v1"
@@ -129,12 +130,17 @@ def run_semantic_match(
             )
             return SemanticOutcome(available=True, result=result, metadata=metadata)
         except LLMUnavailableError as exc:
-            return SemanticOutcome(available=False, unavailable_reason=str(exc))
+            # unavailable_reason flows into JobMatchResult.concerns, which
+            # is persisted to job_matches and displayed by `job-agent jobs
+            # match` — same credential-capable path as answer_engine.py's
+            # validation_notes (both wrap AnthropicLLMProvider transport/
+            # API failures), so it gets the same redaction here.
+            return SemanticOutcome(available=False, unavailable_reason=redact_text(str(exc)))
         except LLMOutputValidationError as exc:
             if attempt == 2:
                 return SemanticOutcome(
                     available=False,
-                    unavailable_reason=f"LLM output invalid after retry: {exc}",
+                    unavailable_reason=redact_text(f"LLM output invalid after retry: {exc}"),
                 )
             continue
 

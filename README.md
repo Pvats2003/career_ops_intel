@@ -5,13 +5,17 @@ a truthful candidate knowledge base, and (in later phases) prepares and
 submits applications — with humans in the loop by default and every
 generated fact traceable to a source.
 
-**This repository is at the end of Phase 5 (Job Application Engine).**
-Application preparation, truthful answer generation, and the application
-state machine now exist — but only one `ApplicationProvider` is shipped
-(`ManualReviewProvider`), and its `submit()` always refuses. Resume variant
-selection/tailoring, real ATS/browser-automation integrations, and live
-submission do not exist yet. **Nothing in this codebase can submit a real
-job application.**
+**This repository is at the end of Phase 6A (Provider Architecture &
+Contracts).** Phase 6A is architecture/contracts only — see "Architecture
+(Phase 6A" below. It widens the `ApplicationProvider` interface, adds a
+`SUBMISSION_UNCERTAIN` state, and wires `config/rules.yaml`'s safety rules
+into actual enforcement for the first time — but ships **no real provider,
+no browser automation, no credential handling, and no new way to reach
+SUBMITTED/VERIFIED**. `ManualReviewProvider` remains the only shipped
+`ApplicationProvider`, and its `submit()` still always refuses. Resume
+variant selection/tailoring, real ATS/browser-automation integrations, and
+live submission do not exist yet. **Nothing in this codebase can submit a
+real job application.**
 
 ## Core principle
 
@@ -69,18 +73,24 @@ src/job_agent/
     versioning.py                Content hashing (profile + source files)
     repository.py                  Insert-only candidate_profile_versions persistence
     service.py                       Orchestrates extract → validate → hash → persist-or-noop
-  applications/            Job Application Engine (Phase 5)
+  applications/            Job Application Engine (Phase 5) + Provider Architecture (Phase 6A)
     schema.py                 ApplicationStatus/QuestionCategory enums, GeneratedAnswer,
-                                SubmissionEvidence, VerificationResult
+                                SubmissionEvidence, VerificationResult, and (Phase 6A)
+                                ApplicationTarget/ApplicationInspection/PreparedFormState
     state_machine.py           Legal-transition graph + IllegalStateTransitionError
+                                 (Phase 6A: adds SUBMISSION_UNCERTAIN)
     provider.py                  ApplicationProvider interface + ManualReviewProvider
-    answer_bank.py                 Loads candidate/answers/*.md
-    answer_validator.py              Deterministic fabrication detector for LLM answers
-    answer_engine.py                   3-tier answer resolution (hard-block/bank/LLM)
-    rate_limits.py                       Day/hour/company/source submission caps
-    duplicates.py                          Cross-source duplicate application detection
-    repository.py                            Insert-only application_events audit trail
-    service.py                                 discover/prepare/submit/verify/retry orchestration
+                                   (Phase 6A: widened with 4 concrete, safe-default methods)
+    rules_enforcement.py           Phase 6A: config/rules.yaml -> HUMAN_REQUIRED enforcement
+    answer_bank.py                   Loads candidate/answers/*.md
+    answer_validator.py                Deterministic fabrication detector for LLM answers
+    answer_engine.py                     3-tier answer resolution (hard-block/bank/LLM)
+    rate_limits.py                         Day/hour/company/source submission caps
+    duplicates.py                            Cross-source duplicate application detection
+    repository.py                              Insert-only application_events audit trail
+    service.py                                   discover/prepare/submit/verify/retry
+                                                   orchestration + (Phase 6A) per-item batch
+                                                   isolation and inspection-driven HUMAN_REQUIRED
   cli/                     Typer CLI (main.py)
 
 prompts/                 Versioned prompt text (job_matcher.md, answer_generator.md)
@@ -463,6 +473,93 @@ a truthful answer using real resume facts passes with zero false positives,
 while fabricated employers/metrics are reliably caught (`tests/unit/
 test_answer_validator.py`, `test_answer_engine.py`).
 
+## Architecture (Phase 6A — Provider Architecture & Contracts)
+
+**Phase 6A is architecture and contracts only.** It was preceded by a
+dedicated reconnaissance pass (repository inspection + a written
+architecture proposal, not committed as code) that this section
+summarizes the outcome of. Nothing in this phase talks to a real job
+platform, opens a browser, handles a credential, or creates any new path
+to SUBMITTED/VERIFIED — see "What remains" for everything explicitly
+deferred to Phase 6B+.
+
+**1. Widened `ApplicationProvider` interface** (`job_agent.applications.
+provider`) — four new methods, all **concrete with safe defaults**, not
+abstract, so every existing provider (`ManualReviewProvider` and every
+fake provider across the test suite) keeps instantiating and passing
+unchanged:
+
+```
+discover_application(job) -> ApplicationTarget          # confirms a target exists; default reachable=False
+inspect_application(job, target) -> ApplicationInspection # raw structural facts; default structure_recognized=False
+retrieve_application_questions(job, target) -> [Question]  # default delegates to get_questions()
+fill_application(job, target, answers) -> PreparedFormState  # stages answers; NEVER transmits anything
+```
+
+`submit`/`verify`/`get_questions`/`health_check` (Phase 5) are unchanged —
+they remain the only methods that can produce `SubmissionEvidence`/
+`VerificationResult`. `ApplicationTarget`, `ApplicationInspection`, and
+`PreparedFormState` (`job_agent.applications.schema`) carry no candidate
+data and no credential of any kind — `ApplicationTarget.provider_reference`
+is an opaque handle, never a secret.
+
+**Architectural boundary, enforced automatically, not just by
+convention:** `job_agent.applications.provider` never imports
+`applications.service`, `applications.state_machine`,
+`applications.rate_limits`, or `config.loader` — a provider reports facts
+(does this target exist? is a CAPTCHA present? is the form structure
+recognized?), it never decides consequences. `tests/unit/
+test_applications_provider.py::test_provider_module_never_imports_core_
+decision_logic` parses `provider.py`'s own AST and asserts this on every
+test run, so the boundary can't silently erode as the module grows.
+
+**2. `SUBMISSION_UNCERTAIN` state** — added for exactly one failure mode a
+real provider will eventually hit: a submission attempt whose outcome
+couldn't be determined (e.g. a network timeout after the request may
+already have reached the platform). Legal transitions:
+
+```
+PREPARED -> SUBMISSION_UNCERTAIN
+SUBMISSION_UNCERTAIN -> VERIFIED / FAILED / HUMAN_REQUIRED
+```
+
+Deliberately **no** path back to PREPARED or SUBMITTED, and no self-loop —
+an ambiguous submission can only be resolved by independent verification
+or escalated to a human, never blindly retried (which is exactly how a
+duplicate real-world application would happen). No Phase 6A provider can
+actually produce this transition — `ManualReviewProvider` always raises
+`SubmissionRefusedError` instead — the state exists so the contract is
+ready for Phase 6B+.
+
+**3. `config/rules.yaml` wired into actual enforcement for the first
+time.** Before Phase 6A, `RulesConfig` was loaded and strictly validated
+at startup but never consulted by any decision code —
+`stop_on_captcha`/`stop_on_mfa`/`stop_on_unexpected_form` were declared,
+not enforced. `job_agent.applications.rules_enforcement.
+evaluate_inspection()` is now the sole reader of `config.rules.safety` for
+this purpose — no second, independent copy of these flags exists anywhere.
+It maps a provider's raw `ApplicationInspection` facts to a verdict, and
+`job_agent.applications.service.handle_application_inspection()` is the
+only place that verdict is applied to a real `Application` row (never the
+provider itself — same "reports facts, doesn't decide" boundary as
+above). `handle_application_inspection()` is not yet called from the CLI
+or from `prepare_applications_batch()`: with `ManualReviewProvider`'s
+honest-but-conservative default inspection (`structure_recognized=False`
+for everything, since it performs no real inspection), wiring it into the
+main flow today would route every single job to HUMAN_REQUIRED via
+`unexpected_form_structure` — a behavioral regression against Phase 5,
+not a Phase 6A goal. Wiring it into the live pipeline is Phase 6B+ work,
+once a real provider exists that can report genuine structural facts.
+
+**4. Per-item failure isolation** for `applications prepare`/`applications
+run` (`job_agent.applications.service.prepare_applications_batch()` /
+`submit_applications_batch()`), following the exact pattern
+`job_agent.jobs.service.scan_source()` already uses for job sources: catch,
+log via `log_event()`, roll back the session, continue. One job/application
+raising an unexpected error can no longer abort the rest of the batch —
+each CLI command now reports a per-item result table/line including any
+errors, rather than crashing the whole run.
+
 ## Database schema
 
 SQLite via SQLAlchemy 2.0, migrated with Alembic. 16 tables: BUILD PROMPT
@@ -566,12 +663,15 @@ implemented yet" message — see `job_agent/cli/main.py`.
 ## Testing
 
 ```bash
-pytest -q            # 299 tests: config, candidate schema/parser, db, job engine,
-                      # matching engine, resume engine, job application engine
+pytest -q            # 350 tests: config, candidate schema/parser, db, job engine,
+                      # matching engine, resume engine, job application engine,
+                      # Phase 6A provider-architecture contracts
 ruff check src tests # lint — currently clean (some pre-existing long lines in
                       # Phase 4's auto-generated Alembic migrations are exempt)
 mypy -p job_agent     # type check — currently clean
 alembic check         # no drift between models and the latest migration
+                      # (Phase 6A adds no schema changes — SUBMISSION_UNCERTAIN
+                      # is a value in the existing free-text status column)
 ```
 
 Tests run against the **real** `candidate/*.md`, `config/*.yaml`, and
@@ -610,7 +710,25 @@ accumulate and are never overwritten), retry-from-FAILED idempotency
 application can never reach `VERIFIED` without genuine, non-blank
 verification evidence.
 
-## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5)
+Phase 6A's tests (`test_rules_enforcement.py`, plus additions to
+`test_applications_provider.py`, `test_applications_schema.py`,
+`test_applications_state_machine.py`, `test_applications_service.py`)
+cover: the widened provider contract on both `ManualReviewProvider` and a
+minimal legacy provider that implements only the Phase 5 methods (proving
+backward compatibility), the `provider.py` import-boundary check described
+above, every legal and forbidden `SUBMISSION_UNCERTAIN` transition,
+`evaluate_inspection()` against the **real, loaded** `config/rules.yaml`
+(not a hardcoded copy — one test asserts the real file's `stop_on_*` flags
+are `True`, others prove flipping a flag off changes the outcome),
+`handle_application_inspection()`'s CAPTCHA/MFA/unexpected-form routing
+and its guard against an illegal target state, and per-item batch
+isolation for both `prepare_applications_batch()` and
+`submit_applications_batch()` — including a test where a single shared,
+selectively-crashing provider instance fails on one job and the batch
+still fully processes the next one, and a test confirming the crash never
+weakens the existing dry-run gate.
+
+## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6A)
 
 **Phase 1 — Foundation**
 - [x] Project structure, `pyproject.toml`, `.gitignore`, `.env.example`
@@ -727,9 +845,6 @@ verification evidence.
       duplicates, and a full lifecycle integration suite) plus one
       adversarial-review fix found and closed during testing (see below)
 
-299 passing unit tests total; clean `ruff` and `mypy`; no drift between
-the ORM models and the latest Alembic migration (`alembic check`).
-
 **Adversarial review finding (fixed):** `discover_application()`'s
 hard-stop-match branch (`Decision.HUMAN_REQUIRED`) attempted a direct
 `DISCOVERED → HUMAN_REQUIRED` transition that the state machine's
@@ -743,7 +858,41 @@ strings (`" "`) as evidence, closing a theoretical loophole a future
 provider could otherwise exploit to satisfy the VERIFIED gate without
 providing anything genuinely checkable.
 
-## What remains (Phase 4 continuation + Phase 5 continuation + Phases 6–8)
+**Phase 6A — Provider Architecture & Contracts** (architecture/contracts
+only — see the "Architecture (Phase 6A" section above for full detail)
+- [x] Widened `ApplicationProvider` interface: `discover_application`,
+      `inspect_application`, `retrieve_application_questions`,
+      `fill_application` — all concrete with conservative safe defaults,
+      so every pre-existing provider (production and test-only) keeps
+      instantiating and passing unchanged
+- [x] `ApplicationTarget`/`ApplicationInspection`/`PreparedFormState`
+      contract types — no candidate data, no credentials, ever
+- [x] Automated, AST-based test proving `provider.py` never imports
+      `applications.service`/`state_machine`/`rate_limits`/`config.loader`
+      — a provider reports facts, it structurally cannot decide
+      consequences
+- [x] `SUBMISSION_UNCERTAIN` state with a deliberately narrow transition
+      set (`PREPARED -> SUBMISSION_UNCERTAIN -> {VERIFIED, FAILED,
+      HUMAN_REQUIRED}`) — no path back to PREPARED/SUBMITTED, no self-loop,
+      so an ambiguous submission outcome can never be blindly retried
+- [x] `config/rules.yaml` wired into real enforcement for the first time
+      (`job_agent.applications.rules_enforcement.evaluate_inspection`) —
+      `stop_on_captcha`/`stop_on_mfa`/`stop_on_unexpected_form` now
+      actually drive a HUMAN_REQUIRED verdict, with no second/duplicated
+      copy of these flags anywhere
+- [x] Per-item failure isolation for `applications prepare`/`applications
+      run` (`prepare_applications_batch`/`submit_applications_batch`) —
+      one bad job/application can no longer abort the whole batch
+- [x] 51 new unit tests, including one that reproduces a real provider bug
+      (a plain, non-`ProviderError` exception) inside a shared provider
+      instance mid-batch and confirms every other item still completes
+- [x] Zero database schema changes (`SUBMISSION_UNCERTAIN` is a value in
+      the existing free-text `status` column) — no new Alembic migration
+
+350 passing unit tests total; clean `ruff` and `mypy`; no drift between
+the ORM models and the latest Alembic migration (`alembic check`).
+
+## What remains (Phase 4 continuation + Phase 5 continuation + Phases 6B–8)
 
 Not yet built, explicitly deferred rather than silently dropped: BUILD
 PROMPT section 12/49's remaining "Resume Engine" scope — a registry of
@@ -753,14 +902,32 @@ fabrication), and PDF generation. These need more than one resume variant
 to meaningfully build against, which doesn't exist yet.
 
 Also not yet built: any real `ApplicationProvider` (Playwright browser
-automation or a real ATS integration) — Phase 5 deliberately ships only
-`ManualReviewProvider`, which always refuses to submit. Building a real
-provider, and only then enabling live-mode submission, is later-phase
-scope requiring its own explicit review. Beyond that: the FastAPI
-dashboard, the scheduler, and notifications. Also not started within "job
-sources": Workday, company career pages, and the ToS-restricted sources
-(LinkedIn, Indeed, Wellfound) — see `config/sources.yaml` notes on each.
-Each phase stops for review before the next begins.
+automation or a real ATS integration), any credential storage/handling,
+`handle_application_inspection()` wired into the live CLI pipeline, and any
+new path to SUBMITTED/VERIFIED beyond what Phase 5 already gates — Phase
+6A deliberately ships contracts and enforcement plumbing only.
+`ManualReviewProvider` remains the only shipped provider and still always
+refuses to submit. This work is explicitly split into further phases, none
+of which are implemented and none of which should be assumed from Phase
+6A's existence:
+
+- **Phase 6B** — first real provider integration (a structured-ATS
+  provider, most likely against Greenhouse or Lever since discovery
+  adapters already exist for both), still dry-run-gated in every test and
+  by config in production; no real submission.
+- **Phase 6C** — controlled real-world execution: enabling live-mode for
+  the 6B provider against a small, explicitly-approved allowlist of real
+  postings, automation level capped low, human approval required per
+  submission.
+- **Phase 6D** — multi-provider scaling: `BrowserFormProvider`/
+  `CompanyCareerPortalProvider` families, queueing, concurrency, provider
+  health monitoring at scale.
+
+Beyond that: the FastAPI dashboard, the scheduler, and notifications. Also
+not started within "job sources": Workday, company career pages, and the
+ToS-restricted sources (LinkedIn, Indeed, Wellfound) — see
+`config/sources.yaml` notes on each. Each phase stops for review before the
+next begins.
 
 **Before Level 4 (auto-submit) automation is ever safe to enable:** fill in
 `config/preferences.yaml` (salary, visa/work authorization, relocation) —

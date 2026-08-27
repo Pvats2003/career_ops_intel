@@ -121,3 +121,51 @@ def test_lever_search_raises_on_unexpected_shape():
 def test_lever_missing_created_at_returns_none_posted_time():
     src = LeverJobSource("acme2", "Acme Analytics", _http(lambda r: httpx.Response(200)))
     assert src.get_posted_time({"id": "x"}) is None
+
+
+# --------------------------------------------------------------------------
+# Security fix (post-Phase-6A audit, remaining-sites pass): health_check()'s
+# `detail` must never carry a secret embedded in an HTTP client failure.
+# --------------------------------------------------------------------------
+def test_greenhouse_health_check_redacts_secret_in_connection_failure():
+    def handler(request):
+        raise RuntimeError("upstream auth failed: api_key=sk-liveSECRET1234567890")
+
+    src = GreenhouseJobSource("acme", "Acme Inc", _http(handler))
+    result = src.health_check()
+
+    assert result.healthy is False
+    assert "sk-liveSECRET1234567890" not in result.detail
+    assert "***REDACTED***" in result.detail
+
+
+def test_greenhouse_health_check_preserves_ordinary_diagnostics():
+    def handler(request):
+        raise RuntimeError("connection refused")
+
+    src = GreenhouseJobSource("acme", "Acme Inc", _http(handler))
+    result = src.health_check()
+
+    assert result.detail == "connection refused"
+
+
+def test_lever_health_check_redacts_secret_in_connection_failure():
+    def handler(request):
+        raise RuntimeError("provider rejected token: refresh_token=abcDEF123xyzSECRET")
+
+    src = LeverJobSource("acme2", "Acme Analytics", _http(handler))
+    result = src.health_check()
+
+    assert result.healthy is False
+    assert "abcDEF123xyzSECRET" not in result.detail
+    assert "***REDACTED***" in result.detail
+
+
+def test_lever_health_check_preserves_ordinary_diagnostics():
+    def handler(request):
+        raise RuntimeError("DNS resolution failed")
+
+    src = LeverJobSource("acme2", "Acme Analytics", _http(handler))
+    result = src.health_check()
+
+    assert result.detail == "DNS resolution failed"

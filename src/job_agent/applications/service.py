@@ -22,6 +22,30 @@ enforced here, not left to the caller's discipline:
 * **No forbidden state jump** — every transition goes through
   `job_agent.applications.repository.transition_status`, which validates
   against `state_machine` and always writes an audit event.
+
+Phase 6A adds two things to this module, both purely additive — no
+existing function's signature or behavior changes:
+
+* **`handle_application_inspection`** — the only place
+  `job_agent.applications.rules_enforcement.evaluate_inspection`'s verdict
+  is applied to a real `Application` row, per the "provider reports, core
+  decides" boundary described in `job_agent.applications.provider`.
+* **`prepare_applications_batch` / `submit_applications_batch`** — per-item
+  failure isolation for the CLI's `applications prepare`/`applications
+  run` commands, following the exact pattern `job_agent.jobs.service.
+  scan_source` already uses for job sources: catch, log, roll back,
+  continue — one bad item can never abort the rest of the batch.
+
+Security fix (post-Phase-6A audit): every raw exception message this
+module captures (`str(exc)`) is scrubbed through `job_agent.logging.
+setup.redact_text()` before it can reach a DB column
+(`Application.error_message`), a log line, or a `BatchItemOutcome` the
+CLI prints verbatim — a credential embedded in a future provider's
+exception message (an HTTP client error, for instance) can no longer
+leak through any of those three surfaces. `details={"error": str(exc)}`
+dicts passed to `record_event()`/`transition_status()` are additionally
+redacted centrally inside `record_event()` itself, so the audit trail
+persisted to `application_events` is protected the same way.
 """
 
 from __future__ import annotations
@@ -44,20 +68,25 @@ from job_agent.applications.repository import (
     save_answer,
     transition_status,
 )
+from job_agent.applications.rules_enforcement import evaluate_inspection
 from job_agent.applications.schema import (
+    ApplicationInspection,
     ApplicationStatus,
     GeneratedAnswer,
     QuestionCategory,
     SubmissionEvidence,
 )
-from job_agent.applications.state_machine import IllegalStateTransitionError
+from job_agent.applications.state_machine import IllegalStateTransitionError, can_transition
 from job_agent.candidate.schema import CandidateProfile
 from job_agent.config.loader import AppConfig
 from job_agent.db.models import Application, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
+from job_agent.logging.setup import get_logger, log_event, redact_text
 from job_agent.matching.schema import Decision
 from job_agent.resume.extractor import extract_resume_text
+
+logger = get_logger("job_agent.applications.service")
 
 
 @dataclass
@@ -168,7 +197,9 @@ def prepare_application(
     try:
         questions = provider.get_questions(job)
     except ProviderError as exc:
-        application.error_message = str(exc)
+        # error_message is a plain DB column, not routed through
+        # record_event()'s redaction — must be scrubbed here explicitly.
+        application.error_message = redact_text(str(exc))
         transition_status(
             session,
             application,
@@ -270,7 +301,9 @@ def submit_application(
     try:
         evidence = provider.submit(job, answers)
     except ProviderError as exc:
-        application.error_message = str(exc)
+        # error_message is a plain DB column, not routed through
+        # record_event()'s redaction — must be scrubbed here explicitly.
+        application.error_message = redact_text(str(exc))
         transition_status(
             session,
             application,
@@ -365,3 +398,149 @@ def _answers_from_db(session: Session, application_id: int) -> list[GeneratedAns
         )
         for row in rows
     ]
+
+
+def handle_application_inspection(
+    session: Session,
+    config: AppConfig,
+    application: Application,
+    inspection: ApplicationInspection,
+) -> Application:
+    """Applies `rules_enforcement.evaluate_inspection`'s verdict to a real
+    Application row — the only place a provider-reported structural fact
+    (CAPTCHA/MFA/unrecognized form) is translated into a HUMAN_REQUIRED
+    transition. The provider that produced `inspection` never calls this
+    itself and has no path to; see `job_agent.applications.provider`'s
+    module docstring for why that boundary matters.
+
+    Raises `IllegalStateTransitionError` if the application isn't in a
+    state HUMAN_REQUIRED can legally be reached from (e.g. already
+    VERIFIED/SKIPPED) — this function does not silently no-op on a caller
+    error, it surfaces it exactly like every other transition in this
+    module.
+    """
+    current = ApplicationStatus(application.status)
+    verdict = evaluate_inspection(config.rules, inspection)
+
+    if not verdict.human_required:
+        record_event(
+            session,
+            application.id,
+            "INSPECTION_PASSED",
+            {"detail": inspection.detail},
+        )
+        session.commit()
+        return application
+
+    if not can_transition(current, ApplicationStatus.HUMAN_REQUIRED):
+        raise IllegalStateTransitionError(current, ApplicationStatus.HUMAN_REQUIRED)
+
+    transition_status(
+        session,
+        application,
+        ApplicationStatus.HUMAN_REQUIRED,
+        event_type=verdict.reason.upper() if verdict.reason else "INSPECTION_HUMAN_REQUIRED",
+        details={"reason": verdict.reason, "inspection_detail": inspection.detail},
+    )
+    session.commit()
+    return application
+
+
+@dataclass
+class BatchItemOutcome:
+    """Result of processing one job/application within a batch — see
+    `prepare_applications_batch`/`submit_applications_batch`. `error` is
+    set only when processing this one item raised; a set `error` means
+    `application` reflects whatever state existed before the failure
+    (possibly `None` if the row was never even reached), never a guessed
+    or partially-applied result."""
+
+    job: JobRow
+    application: Application | None
+    error: str | None = None
+
+
+def prepare_applications_batch(
+    session: Session,
+    config: AppConfig,
+    items: list[tuple[JobRow, JobMatch]],
+    candidate_id: int,
+    profile: CandidateProfile,
+    provider: ApplicationProvider,
+    llm: LLMProvider | None = None,
+) -> list[BatchItemOutcome]:
+    """Runs `discover_application` + `prepare_application` for each
+    (job, job_match) pair, isolating failures exactly like
+    `job_agent.jobs.service.scan_source` isolates one job source's
+    failure from the rest of a scan: one bad item is caught, logged, and
+    rolled back so it can never abort the remaining items — and never
+    leaves a half-flushed row from the failed item polluting the next
+    item's transaction.
+    """
+    results: list[BatchItemOutcome] = []
+    for job, job_match in items:
+        try:
+            application = discover_application(session, config, job, job_match, candidate_id)
+            if ApplicationStatus(application.status) in (
+                ApplicationStatus.MATCHED,
+                ApplicationStatus.HUMAN_REQUIRED,
+            ):
+                outcome = prepare_application(
+                    session, config, application, job, profile, provider, llm=llm
+                )
+                application = outcome.application
+            results.append(BatchItemOutcome(job=job, application=application))
+        except Exception as exc:  # noqa: BLE001 — isolate one bad item from the rest of the batch
+            session.rollback()
+            # Scrubbed once and reused for both the log line and the
+            # returned outcome, so the CLI (which prints outcome.error
+            # verbatim) and the logs are protected by the same pass —
+            # log_event() would also redact `error=` on its own, but
+            # BatchItemOutcome.error does not flow through log_event() at
+            # all, so it needs its own explicit scrub.
+            safe_error = redact_text(str(exc))
+            log_event(
+                logger,
+                component="applications.service",
+                action="prepare_applications_batch_item",
+                result="failure",
+                job_id=job.id,
+                error=safe_error,
+            )
+            results.append(BatchItemOutcome(job=job, application=None, error=safe_error))
+    return results
+
+
+def submit_applications_batch(
+    session: Session,
+    config: AppConfig,
+    items: list[tuple[Application, JobRow]],
+    provider: ApplicationProvider,
+    *,
+    human_approved: bool = False,
+) -> list[BatchItemOutcome]:
+    """Runs `submit_application` for each (application, job) pair with the
+    same per-item isolation as `prepare_applications_batch` — a single
+    application's failure never prevents the rest of the batch from being
+    attempted."""
+    results: list[BatchItemOutcome] = []
+    for application, job in items:
+        try:
+            result = submit_application(
+                session, config, application, job, provider, human_approved=human_approved
+            )
+            results.append(BatchItemOutcome(job=job, application=result))
+        except Exception as exc:  # noqa: BLE001 — isolate one bad item from the rest of the batch
+            session.rollback()
+            safe_error = redact_text(str(exc))
+            log_event(
+                logger,
+                component="applications.service",
+                action="submit_applications_batch_item",
+                result="failure",
+                job_id=job.id,
+                application_id=application.id,
+                error=safe_error,
+            )
+            results.append(BatchItemOutcome(job=job, application=None, error=safe_error))
+    return results
