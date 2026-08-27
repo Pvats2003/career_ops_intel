@@ -22,6 +22,7 @@ S = ApplicationStatus
         (S.MATCHED, S.PREPARED),
         (S.MATCHED, S.HUMAN_REQUIRED),
         (S.HUMAN_REQUIRED, S.PREPARED),
+        (S.HUMAN_REQUIRED, S.HUMAN_REQUIRED),
         (S.PREPARED, S.SUBMITTED),
         (S.SUBMITTED, S.VERIFIED),
         (S.SUBMITTED, S.FAILED),
@@ -72,6 +73,15 @@ def test_failed_is_not_terminal_because_retries_must_be_possible():
     that job again, with no way to create a fresh row either."""
     assert is_terminal(S.FAILED) is False
     assert can_transition(S.FAILED, S.MATCHED) is True
+
+
+def test_human_required_self_transition_allowed_for_idempotent_re_preparation():
+    """Re-running prepare_application on an application already stuck at
+    HUMAN_REQUIRED (the candidate hasn't answered the pending questions
+    yet) must be a safe, idempotent re-audit — not an illegal jump that
+    crashes the caller."""
+    assert can_transition(S.HUMAN_REQUIRED, S.HUMAN_REQUIRED) is True
+    validate_transition(S.HUMAN_REQUIRED, S.HUMAN_REQUIRED)  # must not raise
 
 
 def test_no_transition_is_legal_from_a_terminal_state():

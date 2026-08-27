@@ -368,6 +368,46 @@ def test_prepare_with_unanswerable_question_routes_to_human_required(
     assert saved[0].answer_text is None
 
 
+def test_reprepare_while_still_human_required_is_idempotent_not_a_crash(
+    db_session, make_config, job, candidate_row, real_profile
+):
+    """Regression for a defect caught by the Phase 5 adversarial security
+    review: re-running `applications prepare` (e.g. the candidate re-runs
+    it before actually answering the pending questions, or a scheduled
+    re-scan revisits the same job) on an application already sitting at
+    HUMAN_REQUIRED, where the freshly regenerated answers still require a
+    human, must be a safe no-op re-audit — not an unhandled
+    IllegalStateTransitionError. The CLI's `applications prepare` loop has
+    no per-job exception handling, so this previously would have aborted
+    the entire batch, not just this one job."""
+    match = _match_row(db_session, job, candidate_row, decision=Decision.APPLY)
+    application = discover_application(db_session, make_config(), job, match, candidate_row.id)
+
+    provider = _FakeProvider(questions=[_UNANSWERABLE_QUESTION])
+    prepare_application(
+        db_session, make_config(), application, job, real_profile, provider,
+        llm=NullLLMProvider(),
+    )
+    assert application.status == ApplicationStatus.HUMAN_REQUIRED.value
+    events_after_first = (
+        db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    )
+
+    # Re-run prepare again on the same still-unanswered application.
+    prepare_application(
+        db_session, make_config(), application, job, real_profile, provider,
+        llm=NullLLMProvider(),
+    )
+    assert application.status == ApplicationStatus.HUMAN_REQUIRED.value
+
+    events_after_second = (
+        db_session.query(ApplicationEvent).filter_by(application_id=application.id).all()
+    )
+    # A fresh audit event is still appended for the re-audit — this is an
+    # idempotent no-op in terms of *outcome*, not a silent skip.
+    assert len(events_after_second) == len(events_after_first) + 1
+
+
 def test_prepare_with_fabricated_llm_answer_routes_to_human_required_never_saves_fabrication(
     db_session, make_config, job, candidate_row, real_profile
 ):

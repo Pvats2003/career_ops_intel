@@ -35,7 +35,14 @@ _TERMINAL: frozenset[ApplicationStatus] = frozenset({_S.VERIFIED, _S.SKIPPED})
 _ALLOWED_TRANSITIONS: dict[ApplicationStatus, frozenset[ApplicationStatus]] = {
     _S.DISCOVERED: frozenset({_S.MATCHED, _S.HUMAN_REQUIRED, _S.SKIPPED, _S.FAILED}),
     _S.MATCHED: frozenset({_S.PREPARED, _S.HUMAN_REQUIRED, _S.SKIPPED, _S.FAILED}),
-    _S.HUMAN_REQUIRED: frozenset({_S.PREPARED, _S.SKIPPED, _S.FAILED}),
+    # Includes a HUMAN_REQUIRED -> HUMAN_REQUIRED self-transition: re-running
+    # `prepare_application` on an application already stuck here (e.g. the
+    # candidate re-runs `applications prepare` before actually answering the
+    # pending questions) must be a safe, idempotent re-audited attempt, not
+    # an illegal jump — without this, that ordinary re-run crashes with
+    # IllegalStateTransitionError instead of no-op'ing with a fresh audit
+    # event (see the Phase 5 adversarial review notes in service.py).
+    _S.HUMAN_REQUIRED: frozenset({_S.PREPARED, _S.HUMAN_REQUIRED, _S.SKIPPED, _S.FAILED}),
     _S.PREPARED: frozenset({_S.SUBMITTED, _S.HUMAN_REQUIRED, _S.SKIPPED, _S.FAILED}),
     _S.SUBMITTED: frozenset({_S.VERIFIED, _S.FAILED}),
     _S.VERIFIED: frozenset(),
