@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, String, Text
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -294,19 +294,35 @@ class Resume(Base, TimestampMixin):
 
 
 class Application(Base, TimestampMixin):
+    """Current state of one candidate's application to one job.
+
+    Exactly one row per (job_id, candidate_id) — enforced at the DB level,
+    not just in application code, so a duplicate application is impossible
+    even under a bug or a concurrent retry (see `job_agent.applications.
+    repository.get_or_create_application`). Every status change on this
+    row is required to also append an immutable `ApplicationEvent` row;
+    this table holds current state, `application_events` holds history —
+    the same split already used for `jobs`/`job_matches`.
+    """
+
     __tablename__ = "applications"
     __table_args__ = (
         Index("ix_applications_status", "status"),
         Index("ix_applications_match_score", "match_score"),
+        UniqueConstraint("job_id", "candidate_id", name="uq_applications_job_candidate"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
     candidate_id: Mapped[int] = mapped_column(ForeignKey("candidate.id"), index=True)
     resume_id: Mapped[int | None] = mapped_column(ForeignKey("resumes.id"), nullable=True)
+    profile_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("candidate_profile_versions.id"), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(32), default="DISCOVERED")
     automation_level_used: Mapped[int | None] = mapped_column(nullable=True)
     match_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dry_run: Mapped[bool] = mapped_column(default=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     confirmation_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     confirmation_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -326,6 +342,8 @@ class ApplicationAnswer(Base, TimestampMixin):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     requires_human: Mapped[bool] = mapped_column(default=True)
     source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    validated: Mapped[bool] = mapped_column(default=False)
+    validation_notes: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class ApplicationEvent(Base):

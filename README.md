@@ -5,9 +5,13 @@ a truthful candidate knowledge base, and (in later phases) prepares and
 submits applications — with humans in the loop by default and every
 generated fact traceable to a source.
 
-**This repository is at the end of Phase 4 (Resume Engine).** Resume
-variant selection/tailoring, answer generation, and browser automation do
-not exist yet. Nothing in this codebase can submit a job application.
+**This repository is at the end of Phase 5 (Job Application Engine).**
+Application preparation, truthful answer generation, and the application
+state machine now exist — but only one `ApplicationProvider` is shipped
+(`ManualReviewProvider`), and its `submit()` always refuses. Resume variant
+selection/tailoring, real ATS/browser-automation integrations, and live
+submission do not exist yet. **Nothing in this codebase can submit a real
+job application.**
 
 ## Core principle
 
@@ -65,9 +69,21 @@ src/job_agent/
     versioning.py                Content hashing (profile + source files)
     repository.py                  Insert-only candidate_profile_versions persistence
     service.py                       Orchestrates extract → validate → hash → persist-or-noop
+  applications/            Job Application Engine (Phase 5)
+    schema.py                 ApplicationStatus/QuestionCategory enums, GeneratedAnswer,
+                                SubmissionEvidence, VerificationResult
+    state_machine.py           Legal-transition graph + IllegalStateTransitionError
+    provider.py                  ApplicationProvider interface + ManualReviewProvider
+    answer_bank.py                 Loads candidate/answers/*.md
+    answer_validator.py              Deterministic fabrication detector for LLM answers
+    answer_engine.py                   3-tier answer resolution (hard-block/bank/LLM)
+    rate_limits.py                       Day/hour/company/source submission caps
+    duplicates.py                          Cross-source duplicate application detection
+    repository.py                            Insert-only application_events audit trail
+    service.py                                 discover/prepare/submit/verify/retry orchestration
   cli/                     Typer CLI (main.py)
 
-prompts/                 Versioned prompt text (job_matcher.md)
+prompts/                 Versioned prompt text (job_matcher.md, answer_generator.md)
 
 alembic/                  Database migrations (source of truth for schema evolution)
 tests/unit/               pytest unit tests
@@ -351,6 +367,102 @@ There is currently exactly one resume file, so "selecting among variants"
 has nothing to select among yet — that work is deferred, not silently
 dropped; see "What remains" below.
 
+## Architecture (Phase 5 — Job Application Engine)
+
+```
+job_matches (Phase 3, APPLY/REVIEW/HUMAN_REQUIRED/SAVE/SKIP decision)
+        │
+        ▼
+discover_application()   →  applications row, exactly one per (job_id,
+                              candidate_id) — DB unique constraint backs
+                              this up even under a racing concurrent call.
+                              Checks the DB-level uniqueness AND a
+                              cross-source content-fingerprint match
+                              (job_agent.applications.duplicates) before
+                              creating anything new.
+        │
+   DISCOVERED ──▶ MATCHED / HUMAN_REQUIRED / SKIPPED   (from the match decision)
+        │
+        ▼
+prepare_application()    →  ApplicationProvider.get_questions(job)
+                              (ManualReviewProvider's representative set —
+                               no real ATS form-scraping exists yet)
+                                        │
+                              generate_answer() per question — 3 tiers,
+                              cheapest/safest first:
+                                1. hard-block (SALARY/VISA/LEGAL/DEMOGRAPHIC)
+                                   — deterministic, no LLM, always HUMAN_REQUIRED
+                                   if the underlying fact is UNKNOWN or the
+                                   category is categorically never inferred
+                                2. answer bank (candidate/answers/*.md) —
+                                   human-authored, used verbatim
+                                3. LLM draft → answer_validator.
+                                   validate_generated_answer() — deterministic
+                                   fabrication check (unknown proper nouns /
+                                   numbers not in the resume+profile) — a
+                                   rejected or unobtainable draft becomes
+                                   HUMAN_REQUIRED, never a best-effort guess
+        │
+   MATCHED/HUMAN_REQUIRED ──▶ PREPARED / HUMAN_REQUIRED / FAILED
+        │
+        ▼
+submit_application()     →  every gate must hold or it stays PREPARED with
+                              an audit event explaining why:
+                                1. config.is_submission_allowed() — dry_run
+                                   disabled AND live_mode enabled (Phase 1's
+                                   existing choke point, reused as-is)
+                                2. automation level 4, OR human_approved=True
+                                3. rate limits (day/hour/company/source) —
+                                   a hit routes to SKIPPED, never queued around
+                                4. the provider itself must succeed and return
+                                   evidence — ManualReviewProvider's submit()
+                                   always raises SubmissionRefusedError, so
+                                   real submission is structurally impossible
+                                   until a real, reviewed provider is built
+        │
+   PREPARED ──▶ SUBMITTED / FAILED
+        │
+        ▼
+verify_application()     →  only path to VERIFIED — requires the provider
+                              to return verified=True AND evidence with at
+                              least one non-blank concrete field
+                              (SubmissionEvidence.has_concrete_evidence).
+                              Inconclusive/missing/errored verification
+                              leaves the application at SUBMITTED — never
+                              silently promoted, never silently downgraded.
+   SUBMITTED ──▶ VERIFIED (only with real evidence) / stays SUBMITTED
+```
+
+`retry_application()` is the only sanctioned way out of FAILED: since
+`applications` is unique per `(job_id, candidate_id)`, a fully-terminal
+FAILED would permanently block ever applying to that job again. It moves
+the *same row* back to MATCHED (never a new one) so preparation and every
+safety gate re-run fresh — never a silent re-use of a failed attempt's
+stale answers.
+
+Every status change goes through `job_agent.applications.repository.
+transition_status()`, the single function allowed to write
+`Application.status` — it validates against the state machine's legal-
+transition graph and always appends an immutable `ApplicationEvent` row in
+the same call, so no status change can happen without a matching audit
+record, and no historical event is ever updated or deleted.
+
+**Answer generation treats job/application content as untrusted input.**
+Question text goes through the same delimiter-neutralization pattern
+Phase 3's semantic matcher uses for job postings (`answer_engine.
+normalize_delimiter`) before being embedded in an LLM prompt, and the
+system prompt explicitly instructs the model to treat the question as data,
+never as instructions. But the real defense is downstream and doesn't
+depend on the LLM behaving: `answer_validator.validate_generated_answer()`
+is a **deterministic** check (extracts proper-noun-like phrases and
+multi-digit numbers from the draft and requires each to appear in the
+candidate's actual resume/profile facts) — so even if a prompt injection
+somehow got the model to draft a fabricated answer, it still gets rejected
+before it can ever be marked `requires_human=False`. Verified empirically:
+a truthful answer using real resume facts passes with zero false positives,
+while fabricated employers/metrics are reliably caught (`tests/unit/
+test_answer_validator.py`, `test_answer_engine.py`).
+
 ## Database schema
 
 SQLite via SQLAlchemy 2.0, migrated with Alembic. 16 tables: BUILD PROMPT
@@ -365,10 +477,20 @@ Phase 1 populates `candidate`, `candidate_facts`, `skills`, `experiences`,
 `companies`, and `jobs` (via `job-agent jobs scan`). Phase 3 adds
 `job_matches` (via `job-agent jobs match`; insert-only, see above). Phase 4
 adds `candidate_profile_versions` (also via `job-agent profile parse`;
-insert-only, see above). The remaining tables (`resumes`, `applications`,
-`application_answers`, `application_events`, `notifications`) are defined
-now so schema and code evolve together, and get populated starting in
-Phase 5.
+insert-only, see above). Phase 5 populates `applications` (current state,
+one row per `(job_id, candidate_id)` — DB unique constraint enforced) and
+`application_answers` via `job-agent applications prepare`, and
+`application_events` (insert-only audit trail — see above) via every
+Phase 5 command. `resumes` and `notifications` remain defined but unused,
+for a later phase.
+
+Phase 5's migration (`92b5df3ca242`) added `applications.profile_version_id`
+(links an application to the exact profile version it was prepared
+against) and `applications.dry_run`, plus `application_answers.validated`/
+`validation_notes` (whether the LLM-drafted answer passed the fabrication
+check, and why not if it didn't) — and the `uq_applications_job_candidate`
+unique constraint that makes a duplicate application impossible at the DB
+level, not just in application code.
 
 Indexes exist on `job_fingerprint`, `company_name`, `title`, `posted_at`
 (jobs), `overall_score`/`decision` (job_matches), `status`/`match_score`
@@ -406,6 +528,14 @@ job-agent profile history   # list every candidate profile version (PASSED and F
 job-agent dry-run           # confirm submission is currently impossible
 job-agent jobs scan         # poll enabled job sources, persist new/updated jobs
 job-agent jobs match        # score every job in the DB against the candidate profile
+job-agent applications prepare  # discover + prepare an Application for every job_matches
+                                 # row without one yet; generates answers (dry-run safe,
+                                 # no submission happens here regardless of config)
+job-agent applications review   # list every application awaiting human input, with
+                                 # exactly which questions need it and why
+job-agent applications run      # attempt submission for every PREPARED application —
+                                 # with the shipped ManualReviewProvider this always
+                                 # reports what a human still needs to do; see below
 ```
 
 `profile parse` exits non-zero if the resume file can't be read, or if any
@@ -421,19 +551,27 @@ nothing enabled, `jobs scan` reports that clearly and does nothing — it
 never guesses at a board to poll.
 
 To enable semantic matching: set `ANTHROPIC_API_KEY` in `.env`. Without it,
-`jobs match` still runs (deterministic-only) and says so explicitly.
+`jobs match` still runs (deterministic-only), and answer generation in
+`applications prepare` falls back to the answer bank / `HUMAN_REQUIRED`
+instead of an LLM draft — both say so explicitly rather than silently
+degrading.
 
-Commands for later phases (`applications prepare/review/run`, `dashboard`)
-are registered in the CLI now so the interface is stable, but exit with a
-clear "not implemented yet" message — see `job_agent/cli/main.py`.
+`applications run` never actually submits anything in this phase: the only
+shipped `ApplicationProvider` (`ManualReviewProvider`) always refuses at the
+`submit()` call, regardless of `DRY_RUN`/`LIVE_MODE`/automation level — real
+ATS/browser-automation integrations are a later phase. `job-agent dashboard`
+is still registered for interface stability but exits with a clear "not
+implemented yet" message — see `job_agent/cli/main.py`.
 
 ## Testing
 
 ```bash
-pytest -q            # 165 tests: config, candidate schema/parser, db, job engine,
-                      # matching engine, resume engine
-ruff check src tests # lint — currently clean
+pytest -q            # 299 tests: config, candidate schema/parser, db, job engine,
+                      # matching engine, resume engine, job application engine
+ruff check src tests # lint — currently clean (some pre-existing long lines in
+                      # Phase 4's auto-generated Alembic migrations are exempt)
 mypy -p job_agent     # type check — currently clean
+alembic check         # no drift between models and the latest migration
 ```
 
 Tests run against the **real** `candidate/*.md`, `config/*.yaml`, and
@@ -455,7 +593,24 @@ Anthropic client, both because this sandbox can't reach those APIs anyway
 and because deterministic mocked responses are the right way to test this
 regardless (BUILD PROMPT section 35).
 
-## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4)
+Phase 5's tests (`test_applications_*.py`, `test_answer_*.py`) use fake
+`ApplicationProvider`/`LLMProvider` implementations exclusively — no test
+can make a real network call or a real submission, and several tests use a
+provider whose `submit()` raises `AssertionError` if called at all, to
+structurally prove that blocked paths (dry-run, missing approval, rate
+limit) never reach the provider. Coverage explicitly includes: duplicate
+applications (DB-level and cross-source), failed submissions, verification
+failures (inconclusive, missing evidence, provider error), provider
+timeouts, prompt-injection-containing application questions, unsupported/
+unanswerable questions, missing-resume-fact fabrication attempts,
+`HUMAN_REQUIRED` transitions (from both discovery and preparation),
+dry-run behavior, historical audit-trail preservation (event rows
+accumulate and are never overwritten), retry-from-FAILED idempotency
+(never creates a duplicate row), and the core invariant that an
+application can never reach `VERIFIED` without genuine, non-blank
+verification evidence.
+
+## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5)
 
 **Phase 1 — Foundation**
 - [x] Project structure, `pyproject.toml`, `.gitignore`, `.env.example`
@@ -519,9 +674,76 @@ regardless (BUILD PROMPT section 35).
       employer, HAS-skill, DEMONSTRATED-skill, achievement, education, certification,
       project all confirmed caught) and a paraphrase-tolerance regression guard
 
-165 passing unit tests total; clean `ruff` and `mypy`.
+**Phase 5 — Job Application Engine**
+- [x] Explicit `ApplicationStatus` state machine (DISCOVERED, MATCHED,
+      PREPARED, HUMAN_REQUIRED, SUBMITTED, VERIFIED, FAILED, SKIPPED) with a
+      single legal-transition graph (`job_agent.applications.state_machine`)
+      — every status change is validated against it and raises
+      `IllegalStateTransitionError` rather than silently allowing an unsafe
+      jump (e.g. straight to VERIFIED)
+- [x] `applications` current-state row (one per `(job_id, candidate_id)`,
+      DB unique constraint) + insert-only `application_events` audit trail
+      — the same pattern Phase 2/3 use for `jobs`/`job_matches`; no status
+      change can happen without a matching, immutable audit record
+- [x] `ApplicationProvider` plugin abstraction (`job_agent.applications.
+      provider`), mirroring Phase 2's `JobSource` pattern — the core engine
+      is written against the interface, never against one job platform.
+      The only shipped implementation, `ManualReviewProvider`, always
+      refuses at `submit()`: real external submission is structurally
+      impossible in this phase, not just policy-disabled
+- [x] Three-tier truthful answer generation (`job_agent.applications.
+      answer_engine`): hard-block categories (SALARY/VISA/LEGAL/DEMOGRAPHIC,
+      deterministic, no LLM) → human-authored answer bank
+      (`candidate/answers/*.md`) → LLM draft, validated
+- [x] Deterministic fabrication detector (`job_agent.applications.
+      answer_validator`) for LLM-drafted answers — extracts proper-noun-like
+      phrases and multi-digit numbers and requires each to appear in the
+      candidate's actual resume/profile facts; never asks a model to grade
+      its own output, since that would reintroduce the hallucination risk
+      it exists to guard against
+- [x] Prompt-injection defense for untrusted application-question text
+      (delimiter neutralization, same pattern as Phase 3's semantic matcher)
+- [x] Duplicate-application prevention: DB-level unique constraint plus
+      cross-source content-fingerprint detection (`job_agent.applications.
+      duplicates`, reusing Phase 2's fingerprinting)
+- [x] Day/hour/per-company/per-source rate limiting
+      (`job_agent.applications.rate_limits`), checked immediately before
+      any submission attempt; a limit hit routes to SKIPPED, never queued
+- [x] `submit_application()` requires `config.is_submission_allowed()`
+      (Phase 1's existing dry-run/live-mode choke point, reused as-is) AND
+      either automation level 4 or explicit human approval — either gate
+      alone is not enough
+- [x] `verify_application()` is the only path to VERIFIED, and only with
+      genuine, non-blank evidence from the provider — an inconclusive,
+      missing, or errored verification leaves the application at SUBMITTED
+      (attempted, unconfirmed) forever, never silently promoted or
+      downgraded
+- [x] `retry_application()` — the only sanctioned way out of FAILED, moving
+      the *same* row back to MATCHED so retries can never create a
+      duplicate application or silently reuse a failed attempt's stale data
+- [x] `job-agent applications prepare/review/run` CLI commands
+- [x] 134 new unit tests (state machine, schema, answer bank, answer
+      validator, answer engine, provider, repository, rate limits,
+      duplicates, and a full lifecycle integration suite) plus one
+      adversarial-review fix found and closed during testing (see below)
 
-## What remains (Phase 4 continuation + Phases 5–8)
+299 passing unit tests total; clean `ruff` and `mypy`; no drift between
+the ORM models and the latest Alembic migration (`alembic check`).
+
+**Adversarial review finding (fixed):** `discover_application()`'s
+hard-stop-match branch (`Decision.HUMAN_REQUIRED`) attempted a direct
+`DISCOVERED → HUMAN_REQUIRED` transition that the state machine's
+transition graph did not actually permit, which meant that branch would
+have thrown an unhandled `IllegalStateTransitionError` in production the
+first time a hard-stop match was discovered. Caught by the Phase 5
+integration test suite, not by manual inspection; fixed by adding
+`HUMAN_REQUIRED` to `DISCOVERED`'s allowed targets. Also hardened
+`SubmissionEvidence.has_concrete_evidence` to reject whitespace-only
+strings (`" "`) as evidence, closing a theoretical loophole a future
+provider could otherwise exploit to satisfy the VERIFIED gate without
+providing anything genuinely checkable.
+
+## What remains (Phase 4 continuation + Phase 5 continuation + Phases 6–8)
 
 Not yet built, explicitly deferred rather than silently dropped: BUILD
 PROMPT section 12/49's remaining "Resume Engine" scope — a registry of
@@ -530,9 +752,12 @@ per job, controlled resume tailoring (reordering/emphasis without
 fabrication), and PDF generation. These need more than one resume variant
 to meaningfully build against, which doesn't exist yet.
 
-Beyond that: the answer-generation engine, Playwright browser automation,
-the application state machine, the FastAPI dashboard, the scheduler,
-notifications, and live-mode submission. Also not started within "job
+Also not yet built: any real `ApplicationProvider` (Playwright browser
+automation or a real ATS integration) — Phase 5 deliberately ships only
+`ManualReviewProvider`, which always refuses to submit. Building a real
+provider, and only then enabling live-mode submission, is later-phase
+scope requiring its own explicit review. Beyond that: the FastAPI
+dashboard, the scheduler, and notifications. Also not started within "job
 sources": Workday, company career pages, and the ToS-restricted sources
 (LinkedIn, Indeed, Wellfound) — see `config/sources.yaml` notes on each.
 Each phase stops for review before the next begins.
