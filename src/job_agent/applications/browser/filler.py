@@ -96,6 +96,12 @@ class FormFiller:
             if truthy:
                 self.check_checkbox(f.field_id)
         # multiselect/file are handled by dedicated callers, not here.
+        # password never reaches this method at all in practice —
+        # AnswerPlanner.plan() excludes it from ever producing a
+        # FieldPlan — but even if one somehow did, no branch above
+        # matches input_type "password", so this would still be a no-op:
+        # there is no code path anywhere in this class that can write
+        # into a password field.
 
     @staticmethod
     def _match_option_value(f: DiscoveredField, answer_text: str | None) -> str:

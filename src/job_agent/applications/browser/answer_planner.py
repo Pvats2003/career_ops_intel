@@ -37,7 +37,11 @@ class AnswerPlanner:
         by_text = {a.question: a for a in answers}
         plans: list[FieldPlan] = []
         for f in fields:
-            if f.input_type == "file":
+            if f.input_type in ("file", "password"):
+                # Password fields are never planned for filling — no
+                # FieldPlan is ever produced for one, so FormFiller has no
+                # code path that could write into it. See inspector.py's
+                # module docstring for the full sensitive-field boundary.
                 continue
             answer = by_text.get(question_text(f))
             if answer is not None and answer.requires_human:

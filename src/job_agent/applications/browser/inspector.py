@@ -47,6 +47,13 @@ FIELD DISCOVERY — two paths, always both active:
    (a real consent checkbox going unflagged). It is not a certainty, only
    a best-effort signal alongside the exact `data-consent` marker the
    marked-fields path already provides.
+
+SENSITIVE FIELDS — `<input type="password">` is classified as its own
+`"password"` `input_type`, never folded into the generic `"text"`
+fallback. This project has no reviewed, supported mechanism for handling
+credentials (no login automation, no credential loading, no OAuth) —
+see `job_agent.applications.browser.snapshot`'s module docstring for the
+full boundary this classification exists to support.
 """
 
 from __future__ import annotations
@@ -128,7 +135,7 @@ class DiscoveredField:
     field_id: str
     label: str
     input_type: str  # "text" | "textarea" | "select" | "multiselect" |
-    # "radio" | "checkbox" | "file"
+    # "radio" | "checkbox" | "file" | "password"
     required: bool
     visible: bool
     is_consent: bool = False
@@ -359,6 +366,17 @@ class ApplicationFormInspector:
             return "checkbox"
         if tag == "input" and input_type == "file":
             return "file"
+        if tag == "input" and input_type == "password":
+            # A sensitive field, never a generic "text" one. This project
+            # has no supported, reviewed mechanism for handling
+            # credentials (see job_agent.applications.browser.snapshot's
+            # module docstring): DynamicFieldMapper/AnswerPlanner exclude
+            # this input_type from ever becoming a question or a fill
+            # plan, and BrowserApplicationProvider.inspect_application
+            # treats its presence as an unrecognized form structure so
+            # the existing stop_on_unexpected_form gate routes to
+            # HUMAN_REQUIRED before any filling is attempted.
+            return "password"
         return "text"
 
     @staticmethod

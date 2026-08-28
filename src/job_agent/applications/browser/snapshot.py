@@ -13,6 +13,24 @@ sorted, deterministic serialization) — a future stage would bind an
 bound to the answer fingerprint today, so any change to the underlying
 form's structure after approval is detected the identical way stale
 answers already are.
+
+SENSITIVE FIELDS (Phase 6D password-field fix) — this project has no
+reviewed, supported mechanism for handling credentials: no login
+automation, no credential loading, no OAuth. A discovered
+`<input type="password">` (see `inspector.py`'s `_resolve_input_type`)
+is therefore never treated as an ordinary answerable field:
+`DynamicFieldMapper`/`AnswerPlanner` exclude it from ever becoming a
+question or a fill plan, so `FormFiller` has no code path that could
+write into one. Here, at the snapshot boundary, the guarantee is
+structural rather than a redaction pass over an already-read value:
+`_current_value()` returns `PASSWORD_FIELD_REDACTED_PLACEHOLDER`
+immediately for a password field, before any DOM query is made for
+it — no real value is ever read into this process for that field, so
+there is nothing for `HumanReviewSnapshot`, its CLI rendering, or any
+downstream consumer to leak. `build_snapshot()` additionally always
+places a password field's id in `unresolved_field_ids`, regardless of
+what its caller passed in, so it can never be silently presented as a
+normal, resolved application question.
 """
 
 from __future__ import annotations
@@ -40,6 +58,16 @@ from job_agent.applications.browser.session import BrowserSession
 # surface it distinctly rather than as an ordinary unresolved field) can
 # drift out of sync with a second, private copy of the same string.
 CAPTCHA_OR_MFA_AFTER_FILL_MARKER = "__captcha_or_mfa_appeared_after_fill__"
+
+# The ONLY string a password-classified field's `SnapshotField.
+# current_value` may ever hold. This is a structural guarantee, not a
+# redaction pass over a value already read: `_current_value()` returns
+# this constant for a password field WITHOUT ever calling into the DOM
+# for it (no `.input_value()` call happens at all), so there is no
+# "real value" in memory at any point in this module for that field to
+# leak from. Public so tests and any future consumer can assert against
+# it by name instead of a literal string.
+PASSWORD_FIELD_REDACTED_PLACEHOLDER = "[sensitive — password field: never read or filled]"
 
 
 class UploadedFileRecord(BaseModel):
@@ -99,6 +127,12 @@ def compute_snapshot_fingerprint(snapshot: HumanReviewSnapshot) -> str:
 
 
 def _current_value(session: BrowserSession, f: DiscoveredField) -> str:
+    if f.input_type == "password":
+        # Structural, not a redaction pass: return BEFORE any DOM query
+        # is made for this field, so no real value is ever read into
+        # this process for a password field, let alone displayed. Every
+        # other branch below queries the live DOM; this one never does.
+        return PASSWORD_FIELD_REDACTED_PLACEHOLDER
     selector = field_selector(f.field_id)
     if f.input_type in ("text", "textarea"):
         el = session.query_all(selector)
@@ -144,6 +178,7 @@ def build_snapshot(
     consent_selections: dict[str, bool] = {}
     required_ids: list[str] = []
     optional_ids: list[str] = []
+    sensitive_ids: list[str] = []
     for f in inspection.fields:
         if not f.visible or f.input_type == "file":
             continue
@@ -159,10 +194,19 @@ def build_snapshot(
         )
         if f.is_consent:
             consent_selections[f.field_id] = value == "true"
+        if f.input_type == "password":
+            # Always unresolved, regardless of what the caller passed in
+            # for `unresolved_field_ids` — a password field is never
+            # eligible for automated filling (see inspector.py's module
+            # docstring), so this can never depend on FormFiller/
+            # AnswerPlanner having correctly excluded it upstream.
+            sensitive_ids.append(f.field_id)
         if f.required:
             required_ids.append(f.field_id)
         else:
             optional_ids.append(f.field_id)
+
+    all_unresolved = tuple(dict.fromkeys((*unresolved_field_ids, *sensitive_ids)))
 
     return HumanReviewSnapshot(
         job_id=job_id,
@@ -174,6 +218,6 @@ def build_snapshot(
         consent_selections=consent_selections,
         required_field_ids=tuple(required_ids),
         optional_field_ids=tuple(optional_ids),
-        unresolved_field_ids=unresolved_field_ids,
+        unresolved_field_ids=all_unresolved,
         captured_at=datetime.now(UTC),
     )

@@ -38,6 +38,13 @@ class DynamicFieldMapper:
         for f in visible_fields(snapshot):
             if f.input_type == "file":
                 continue  # file uploads are handled by FileUploadHandler, not answered as text
+            if f.input_type == "password":
+                # Never turned into a question: this project has no
+                # reviewed mechanism for supplying credentials, and asking
+                # the answer engine to answer one risks it inventing a
+                # plausible-looking value. See inspector.py's module
+                # docstring for the full sensitive-field boundary.
+                continue
             text = question_text(f)
             questions.append(
                 ApplicationQuestion(
