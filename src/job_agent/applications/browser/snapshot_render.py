@@ -20,6 +20,13 @@ module still deliberately reads only the documented `HumanReviewSnapshot`
 fields, never anything else a caller might be tempted to pass in (e.g. a
 live `BrowserSession`), so it can never accidentally surface browser/
 session internals a human reviewing this output has no reason to see.
+
+A password field's `current_value` is always `job_agent.applications.
+browser.snapshot.PASSWORD_FIELD_REDACTED_PLACEHOLDER` (never a real
+value — see that module's docstring), and this renderer never puts it
+in the "proposed value" table at all: `build_snapshot()` always marks a
+password field unresolved, so it only ever appears in the "needs your
+input" list below, which shows only its label, never `current_value`.
 """
 
 from __future__ import annotations
@@ -116,7 +123,13 @@ def render_snapshot(snapshot: HumanReviewSnapshot, console: Console) -> None:
         for fid in sections.unresolved_field_ids:
             field = by_id.get(fid)
             label = field.label if field else fid
-            console.print(f"  [yellow]?[/yellow] {fid} — {label}")
+            if field is not None and field.field_type == "password":
+                console.print(
+                    f"  [yellow]?[/yellow] {fid} — {label} "
+                    "[red](sensitive — password field, not supported for automated filling)[/red]"
+                )
+            else:
+                console.print(f"  [yellow]?[/yellow] {fid} — {label}")
 
     if sections.consent_selections:
         console.print("\n[bold]Consent selections (as currently observed on the page):[/bold]")

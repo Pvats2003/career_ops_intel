@@ -244,15 +244,33 @@ class BrowserApplicationProvider(ApplicationProvider):
             session.load()
             snap = ApplicationFormInspector().inspect(session)
         visible = [f for f in snap.fields if f.visible]
+        # A visible password field makes this "an unrecognized form
+        # structure" in the same sense CAPTCHA/MFA does: this provider
+        # has no reviewed, supported way to handle it (no credential
+        # loading, no login automation — see snapshot.py's module
+        # docstring). Reusing structure_recognized/stop_on_unexpected_form
+        # routes it through the EXISTING, unmodified
+        # rules_enforcement.evaluate_inspection() hard-stop rather than
+        # adding a new gate or schema field for it.
+        has_password_field = any(f.input_type == "password" for f in visible)
         structure_recognized = (
-            bool(visible) and not snap.captcha_detected and not snap.mfa_detected
+            bool(visible)
+            and not snap.captcha_detected
+            and not snap.mfa_detected
+            and not has_password_field
         )
+        detail = f"inspected {len(visible)} visible field(s) on the live DOM"
+        if has_password_field:
+            detail += (
+                "; a password field was found and is not supported for automated "
+                "filling — human review required"
+            )
         return ApplicationInspection(
             structure_recognized=structure_recognized,
             captcha_detected=snap.captcha_detected,
             mfa_detected=snap.mfa_detected,
             consent_required=bool(snap.consent_fields),
-            detail=f"inspected {len(visible)} visible field(s) on the live DOM",
+            detail=detail,
         )
 
     def retrieve_application_questions(
