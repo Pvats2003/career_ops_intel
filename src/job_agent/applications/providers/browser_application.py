@@ -65,6 +65,7 @@ from job_agent.applications.browser.filler import FormFiller
 from job_agent.applications.browser.inspector import ApplicationFormInspector
 from job_agent.applications.browser.session import BrowserSession
 from job_agent.applications.browser.snapshot import (
+    CAPTCHA_OR_MFA_AFTER_FILL_MARKER,
     HumanReviewSnapshot,
     UploadedFileRecord,
     build_snapshot,
@@ -85,8 +86,6 @@ from job_agent.db.models import Job as JobRow
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser
-
-_CAPTCHA_APPEARED_AFTER_FILL_MARKER = "__captcha_or_mfa_appeared_after_fill__"
 
 # Representative fallback, mirroring every other provider's own — used
 # only when no local target URL is registered for a job at all (so
@@ -260,7 +259,7 @@ class BrowserApplicationProvider(ApplicationProvider):
             # about — never re-attempt to satisfy it, just surface it.
             post_fill_inspection = ApplicationFormInspector().inspect(session)
             if post_fill_inspection.captcha_detected or post_fill_inspection.mfa_detected:
-                unresolved.append(_CAPTCHA_APPEARED_AFTER_FILL_MARKER)
+                unresolved.append(CAPTCHA_OR_MFA_AFTER_FILL_MARKER)
 
             snapshot = build_snapshot(
                 session,

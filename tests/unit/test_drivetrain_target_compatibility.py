@@ -298,8 +298,13 @@ def test_filling_with_synthetic_values_never_touches_the_submit_button(site_serv
 # Zero-diff is proven at the report level (git diff against origin/main
 # touches only new files); these are the static, in-repo confirmations.
 # ==========================================================================
-def test_cli_still_has_no_reference_to_this_target_or_browser_provider():
+def test_cli_still_has_no_reference_to_this_specific_target():
+    """No file/command in the CLI hardcodes the Drivetrain target
+    specifically — Phase 6D Stage 2's `applications browser-preview`
+    command (added after this test was first written) is fully generic,
+    taking any --url the operator supplies; it legitimately does
+    reference BrowserApplicationProvider (see test_cli_browser_preview.py),
+    which is a separate, narrower invariant checked in
+    test_browser_provider.py against `applications_run` specifically."""
     source = Path("src/job_agent/cli/main.py").read_text()
     assert "drivetrain" not in source.lower()
-    assert "BrowserApplicationProvider" not in source
-    assert "provider = ManualReviewProvider()" in source

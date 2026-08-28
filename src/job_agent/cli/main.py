@@ -31,9 +31,15 @@ from job_agent.applications.allowlist import (
     create_allowlist_entry,
     revoke_allowlist_entry,
 )
+from job_agent.applications.answer_bank import load_answer_bank
+from job_agent.applications.answer_engine import generate_answer
 from job_agent.applications.approvals import compute_answer_fingerprint, create_approval
+from job_agent.applications.browser.snapshot_render import render_snapshot
+from job_agent.applications.errors import ProviderError
 from job_agent.applications.provider import ManualReviewProvider
+from job_agent.applications.providers.browser_application import BrowserApplicationProvider
 from job_agent.applications.repository import get_answers, get_latest_event
+from job_agent.applications.rules_enforcement import evaluate_inspection
 from job_agent.applications.schema import ApplicationStatus
 from job_agent.applications.service import (
     answers_from_db,
@@ -55,6 +61,7 @@ from job_agent.llm.provider import NullLLMProvider, build_llm_provider
 from job_agent.logging.setup import configure_logging, get_logger, log_event, redact_text
 from job_agent.matching.service import run_matching
 from job_agent.resume.errors import ResumeExtractionError
+from job_agent.resume.extractor import extract_resume_text
 from job_agent.resume.repository import list_versions
 from job_agent.resume.service import create_profile_version
 
@@ -626,6 +633,126 @@ def applications_review() -> None:
                 console.print(f"  [yellow]?[/yellow] {answer.question_text}")
                 for note in answer.validation_notes or []:
                     console.print(f"      {note}")
+
+
+@applications_app.command("browser-preview")
+def applications_browser_preview(
+    application_id: int = typer.Argument(..., help="Application id to preview."),
+    url: str = typer.Option(
+        ...,
+        "--url",
+        help="Exact application-form URL to load — must match this application's job's "
+        "own application_url exactly, so nothing is ever contacted based on unstated "
+        "database content alone.",
+    ),
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Actually launch a browser and contact --url; without this, reports what "
+        "would happen and makes no network call.",
+    ),
+) -> None:
+    """Build and render a HumanReviewSnapshot for ONE application (Phase 6D
+    Stage 2) — discovers the real form via BrowserApplicationProvider,
+    generates truthful answers through the existing, unmodified
+    answer_engine pipeline, fills them into the live DOM, and shows a
+    human exactly what was filled, what still needs their input, and any
+    safety condition. Never transmits or submits anything —
+    BrowserApplicationProvider.submit() remains structurally incapable of
+    that regardless.
+
+    CAPTCHA/MFA/consent-required facts are routed through the same,
+    unmodified rules_enforcement.evaluate_inspection() every other
+    inspecting provider uses; a HUMAN_REQUIRED verdict stops this command
+    before a single field is filled. This is a read-only preview — it
+    writes nothing to the database and does not compete with
+    `applications prepare` for ownership of an application's status.
+    """
+    if not confirm:
+        console.print(
+            "[yellow]No action taken.[/yellow] Pass --confirm to actually contact "
+            f"{url} and build a preview for application {application_id}."
+        )
+        raise typer.Exit(code=0)
+
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        if application is None:
+            console.print(f"[red]No application with id {application_id}.[/red]")
+            raise typer.Exit(code=1)
+        job = session.get(JobRow, application.job_id)
+        if job is None:
+            console.print(f"[red]Application {application_id} has no matching job row.[/red]")
+            raise typer.Exit(code=1)
+        if url != job.application_url:
+            console.print(
+                "[red]--url does not match this job's own application_url.[/red]\n"
+                f"  --url:                {url}\n"
+                f"  job.application_url:  {job.application_url}\n"
+                "Pass the exact URL the job itself already carries — never a different one."
+            )
+            raise typer.Exit(code=1)
+
+        try:
+            profile = parse_candidate_profile(cfg)
+        except CandidateParseError as exc:
+            console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
+            raise typer.Exit(code=1) from exc
+
+        resume_path = cfg.env.candidate_dir / "resume_master.docx"
+        try:
+            resume_text = extract_resume_text(resume_path)
+        except ResumeExtractionError as exc:
+            console.print(f"[red]Failed to extract resume text:[/red] {redact_text(str(exc))}")
+            raise typer.Exit(code=1) from exc
+        answer_bank = load_answer_bank(cfg.env.candidate_dir / "answers")
+        llm = build_llm_provider(cfg)
+
+        from playwright.sync_api import sync_playwright
+
+        snapshot = None
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                provider = BrowserApplicationProvider(
+                    {job.id: url}, browser=browser, resume_path=resume_path,
+                )
+                target = provider.discover_application(job)
+                if not target.reachable:
+                    console.print(f"[red]Could not reach target:[/red] {target.detail}")
+                    raise typer.Exit(code=1)
+
+                inspection = provider.inspect_application(job, target)
+                verdict = evaluate_inspection(cfg.rules, inspection)
+                if verdict.human_required:
+                    console.print(
+                        f"[yellow]Human review required before filling:[/yellow] "
+                        f"{verdict.reason} — nothing was filled."
+                    )
+                    raise typer.Exit(code=0)
+
+                questions = provider.get_questions(job)
+                answers = [
+                    generate_answer(q, profile, resume_text, answer_bank, llm)
+                    for q in questions
+                ]
+                provider.fill_application(job, target, answers)
+                snapshot = provider.get_snapshot(job.id)
+            except ProviderError as exc:
+                console.print(f"[red]Provider error:[/red] {redact_text(str(exc))}")
+                raise typer.Exit(code=1) from exc
+            finally:
+                browser.close()
+
+    if snapshot is None:
+        console.print("[red]No snapshot was produced.[/red]")
+        raise typer.Exit(code=1)
+    render_snapshot(snapshot, console)
 
 
 @applications_app.command("run")

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from job_agent.applications.browser.inspector import field_selector
 from job_agent.applications.browser.session import BrowserSession
 
 
@@ -14,4 +15,4 @@ class FileUploadHandler:
     def attach_resume(self, session: BrowserSession, field_id: str, resume_path: Path) -> None:
         if not resume_path.exists():
             raise FileNotFoundError(f"resume file not found: {resume_path}")
-        session.set_input_files(f'[data-field="{field_id}"]', resume_path)
+        session.set_input_files(field_selector(field_id), resume_path)

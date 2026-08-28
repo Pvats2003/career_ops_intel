@@ -67,6 +67,32 @@ _MFA_SELECTORS = (
     "#mfa-challenge",
     ".mfa-challenge",
 )
+
+
+def field_selector(field_id: str) -> str:
+    """The DOM selector for a field previously discovered with this
+    `field_id` — usable by any caller that needs to act on a field
+    (`FormFiller`, `FileUploadHandler`), not just inspect it.
+
+    `DiscoveredField.field_id` is produced by one of two mechanisms
+    (`_discover_marked_fields`'s `data-field` attribute, or
+    `_discover_generic_fields`'s `id`/`name` attribute) but the resulting
+    dataclass carries no record of which one — so this selector matches
+    all three possible attribute bindings for the same id string. In
+    practice a real field only ever satisfies one of them; a comma-
+    separated CSS selector list is exactly the right tool for "whichever
+    of these actually exists," not a guess at which mechanism applies.
+    """
+    return f'[data-field="{field_id}"], [id="{field_id}"], [name="{field_id}"]'
+
+
+def radio_option_selector(field_id: str, value: str) -> str:
+    """Same idea as `field_selector`, narrowed to one specific radio
+    option's `value` — marked radios share `data-field`; generic radios
+    are grouped by `name` (see `_discover_generic_fields`)."""
+    return (
+        f'[data-field="{field_id}"][value="{value}"], [name="{field_id}"][value="{value}"]'
+    )
 _FIELD_SELECTOR = "[data-field]"
 
 # Native form controls a generic-path query should consider — hidden/

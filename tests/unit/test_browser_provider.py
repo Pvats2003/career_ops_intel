@@ -584,11 +584,19 @@ def test_browser_application_module_never_imports_credential_or_network_client()
 
 
 def test_cli_applications_run_still_hardcodes_manual_review_provider_not_browser():
+    """`applications run` specifically must stay unreachable by
+    BrowserApplicationProvider — checked against that one function's own
+    source, not the whole file, since Phase 6D Stage 2 legitimately added
+    a separate, explicit, --confirm-gated `applications browser-preview`
+    command elsewhere in this module that does reference it (see
+    test_cli_browser_preview.py)."""
+    import inspect
+
     from job_agent.cli import main as cli_main
 
-    source = Path(cli_main.__file__).read_text()
-    assert "BrowserApplicationProvider" not in source
-    assert "provider = ManualReviewProvider()" in source
+    run_source = inspect.getsource(cli_main.applications_run)
+    assert "BrowserApplicationProvider" not in run_source
+    assert "provider = ManualReviewProvider()" in run_source
 
 
 # ==========================================================================
