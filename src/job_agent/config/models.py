@@ -221,13 +221,40 @@ class RealStructuredATSProviderConfig(StrictModel):
     credential_env_var: str = "JOB_AGENT_REAL_STRUCTURED_ATS_CREDENTIAL"
 
 
+# --------------------------------------------------------------------------
+# Browser-automation provider selection (Phase 6D). Mirrors
+# `StructuredATSProviderConfig`'s exact "enabled: false" opt-in pattern.
+# `BrowserApplicationProvider` has no local-simulation mode — it always
+# inspects a live DOM — so `target_urls_path` is NOT simulated form data
+# like the other two providers' fixtures; it is a curated ALLOWLIST of
+# approved `application_url` values. A job whose `application_url` isn't
+# on this list is never handed to the provider at all. Selecting this
+# provider also requires a live `playwright.sync_api.Browser` to be
+# passed to `build_application_provider(..., browser=...)` explicitly —
+# no caller in this repository does that yet, so enabling this provider
+# today fails clearly and safely rather than silently doing anything.
+# No shipped config in this repository sets `provider` to this value.
+# --------------------------------------------------------------------------
+class BrowserApplicationProviderConfig(StrictModel):
+    enabled: bool = False
+    # Relative to the repo root; points at a LOCAL fixture file only — see
+    # config/fixtures/browser_application_targets.example.yaml. Never a
+    # URL fetched over the network; only ever read from disk.
+    target_urls_path: str = "config/fixtures/browser_application_targets.example.yaml"
+
+
 class ApplicationProviderConfig(StrictModel):
-    provider: Literal["manual_review", "structured_ats", "real_structured_ats"] = "manual_review"
+    provider: Literal[
+        "manual_review", "structured_ats", "real_structured_ats", "browser_application"
+    ] = "manual_review"
     structured_ats: StructuredATSProviderConfig = Field(
         default_factory=StructuredATSProviderConfig
     )
     real_structured_ats: RealStructuredATSProviderConfig = Field(
         default_factory=RealStructuredATSProviderConfig
+    )
+    browser_application: BrowserApplicationProviderConfig = Field(
+        default_factory=BrowserApplicationProviderConfig
     )
 
 

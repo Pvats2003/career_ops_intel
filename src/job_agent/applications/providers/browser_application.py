@@ -58,6 +58,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
 from job_agent.applications.browser.answer_planner import AnswerPlanner
 from job_agent.applications.browser.field_mapper import DynamicFieldMapper
 from job_agent.applications.browser.file_upload import FileUploadHandler
@@ -101,6 +104,49 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+class _BrowserApplicationTargetsFile(BaseModel):
+    """One local fixture file (see `load_browser_application_targets`) —
+    a flat list of approved `application_url` strings. Unlike
+    `structured_ats`/`real_structured_ats`'s fixture files, this one
+    carries no simulated form data: `BrowserApplicationProvider` has no
+    local-simulation mode, it always inspects a live DOM, so this file's
+    only job is to be a curated allowlist of targets a human has already
+    approved for browser inspection."""
+
+    model_config = ConfigDict(frozen=True)
+
+    target_urls: tuple[str, ...] = Field(default_factory=tuple)
+
+
+def load_browser_application_targets(path: Path) -> tuple[str, ...]:
+    """Reads a LOCAL fixture YAML file and returns the approved
+    `application_url` allowlist. A single local file read —
+    `yaml.safe_load` — and nothing else; no network call. Mirrors
+    `job_agent.applications.providers.real_structured_ats.
+    load_real_fixture_forms`'s exact failure modes: a missing file raises
+    `FileNotFoundError` (never a silent empty allowlist that would route
+    every job to HUMAN_REQUIRED for a confusing reason), and a duplicate
+    `application_url` raises `ValueError` (never a silent last-wins pick,
+    which would be meaningless here anyway since entries carry no other
+    data — but keeping the check makes a copy-paste mistake in the
+    fixture file loud instead of silently redundant).
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"browser_application target file not found: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh) or {}
+    parsed = _BrowserApplicationTargetsFile.model_validate(raw)
+
+    seen: set[str] = set()
+    for url in parsed.target_urls:
+        if url in seen:
+            raise ValueError(
+                f"browser_application target file has a duplicate application_url: {url!r}"
+            )
+        seen.add(url)
+    return parsed.target_urls
 
 
 class BrowserApplicationProvider(ApplicationProvider):
