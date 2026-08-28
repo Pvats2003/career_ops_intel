@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<!--
+  Phase 6D Stage 2 — LOCAL SYNTHETIC form mirroring ONLY the fields a
+  human observed and reported on the real Drivetrain "Business Analyst -
+  Customer Platform" Lever posting
+  (https://jobs.lever.co/drivetrain/7c194c7d-4bbf-41cc-9dea-e0db2d2b2032/apply)
+  via a manual browser inspection — never fetched by this repository's
+  own code. Not a copy of Lever's real markup (which is unknown), and NOT
+  usable as evidence that the real page's fields would actually be
+  discovered by ApplicationFormInspector — see that module's own
+  docstring: field discovery here depends on the data-field/data-label/
+  data-required markers this fixture provides, which is a Stage 1 scope
+  limitation, not something a real, arbitrary third-party form would
+  supply. This fixture exists only to prove what the rest of the
+  pipeline (planning/filling/snapshotting/answer-generation) would do
+  ONCE a field set shaped like this one is discovered.
+
+  Fields mirror exactly what was reported observed, nothing added:
+    - Resume/CV (file upload — NOT reported as marked required)
+    - Full name (required)
+    - Email (required)
+    - Phone (required)
+    - Current location (required)
+    - Current company (required)
+    - LinkedIn URL (required)
+  No CAPTCHA/MFA/consent markers are present — none were reported
+  observed. No cover-letter or custom screening question is present —
+  none were reported observed.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synthetic Test — Drivetrain Business Analyst (observed-field mirror)</title>
+</head>
+<body>
+  <h1>Drivetrain — Business Analyst - Customer Platform (synthetic mirror)</h1>
+
+  <form id="application-form" onsubmit="return false;">
+    <label for="resume">Resume/CV</label>
+    <input type="file" data-field="resume" data-label="Resume/CV" id="resume">
+
+    <label for="full_name">Full name</label>
+    <input type="text" data-field="full_name" data-label="Full name" id="full_name" required>
+
+    <label for="email">Email</label>
+    <input type="email" data-field="email" data-label="Email" id="email" required>
+
+    <label for="phone">Phone</label>
+    <input type="tel" data-field="phone" data-label="Phone" id="phone" required>
+
+    <label for="current_location">Current location</label>
+    <input type="text" data-field="current_location" data-label="Current location"
+           id="current_location" required>
+
+    <label for="current_company">Current company</label>
+    <input type="text" data-field="current_company" data-label="Current company"
+           id="current_company" required>
+
+    <label for="linkedin_url">LinkedIn URL</label>
+    <input type="url" data-field="linkedin_url" data-label="LinkedIn URL"
+           id="linkedin_url" required>
+
+    <button type="submit" id="real-submit-button">SUBMIT APPLICATION</button>
+  </form>
+
+  <!--
+    This page never submits anywhere — onsubmit="return false" plus the
+    fact that no code in src/ ever selects or clicks
+    #real-submit-button. See BrowserApplicationProvider.submit(), which
+    never even opens a browser session.
+  -->
+</body>
+</html>
