@@ -1,0 +1,3 @@
+This is a dummy resume fixture used only by tests/unit/test_browser_provider.py
+to exercise FileUploadHandler.attach_resume() against the local synthetic
+application form. It is not a real resume and contains no personal data.
