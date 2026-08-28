@@ -21,7 +21,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from job_agent.applications.browser.answer_planner import FieldPlan
-from job_agent.applications.browser.inspector import ApplicationFormInspector, DiscoveredField
+from job_agent.applications.browser.inspector import (
+    ApplicationFormInspector,
+    DiscoveredField,
+    field_selector,
+    radio_option_selector,
+)
 from job_agent.applications.browser.session import BrowserSession
 
 
@@ -38,16 +43,16 @@ class FormFiller:
         self._inspector = ApplicationFormInspector()
 
     def fill_text_field(self, field_id: str, value: str) -> None:
-        self._session.fill_text(f'[data-field="{field_id}"]', value)
+        self._session.fill_text(field_selector(field_id), value)
 
     def select_dropdown(self, field_id: str, value: str) -> None:
-        self._session.select_option(f'[data-field="{field_id}"]', value)
+        self._session.select_option(field_selector(field_id), value)
 
     def select_radio(self, field_id: str, value: str) -> None:
-        self._session.check(f'[data-field="{field_id}"][value="{value}"]')
+        self._session.check(radio_option_selector(field_id, value))
 
     def check_checkbox(self, field_id: str) -> None:
-        self._session.check(f'[data-field="{field_id}"]')
+        self._session.check(field_selector(field_id))
 
     def reveal_conditional_section(self, trigger_field_id: str) -> None:
         """Some conditional sections in the synthetic fixture are

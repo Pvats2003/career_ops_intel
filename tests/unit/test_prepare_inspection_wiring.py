@@ -596,19 +596,46 @@ class TestNoRealNetworkSubmission:
         assert provider.submit_calls == 0
 
     def test_inspection_wiring_module_imports_nothing_network_capable(self):
+        """Walks every REAL (runtime-executed) import in service.py. An
+        import nested inside `if TYPE_CHECKING:` is deliberately excluded:
+        `typing.TYPE_CHECKING` is always False at runtime, so Python never
+        executes that block — it grants no live capability, only a name
+        for static type checkers (mirroring the exact TYPE_CHECKING-only
+        `Browser` import job_agent.applications.providers.
+        browser_application already uses safely). Excluding it here tests
+        the real property this test is named for (service.py cannot make
+        a live network call), rather than a stricter, coincidental one
+        (service.py's source text never mentions playwright at all)."""
         import ast
         import inspect
 
         import job_agent.applications.service as service_module
 
         tree = ast.parse(inspect.getsource(service_module))
+
+        def _is_type_checking_guard(node: ast.If) -> bool:
+            test = node.test
+            if isinstance(test, ast.Name):
+                return test.id == "TYPE_CHECKING"
+            return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+
         imported: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module)
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    imported.add(alias.name)
+
+        def _collect(nodes: list[ast.stmt]) -> None:
+            for node in nodes:
+                if isinstance(node, ast.If) and _is_type_checking_guard(node):
+                    continue
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module)
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imported.add(alias.name)
+                for field_name in ("body", "orelse", "finalbody"):
+                    child = getattr(node, field_name, None)
+                    if child:
+                        _collect(child)
+
+        _collect(tree.body)
         forbidden = ("httpx", "requests", "urllib", "socket", "playwright", "selenium")
         for module_name in imported:
             for bad in forbidden:

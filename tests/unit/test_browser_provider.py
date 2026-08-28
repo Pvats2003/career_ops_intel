@@ -13,9 +13,6 @@ image without it), so this file never falls back to downloading a browser.
 
 from __future__ import annotations
 
-import functools
-import http.server
-import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -47,13 +44,11 @@ from job_agent.llm.provider import NullLLMProvider
 from job_agent.matching.repository import save_job_match
 from job_agent.matching.schema import Decision, JobMatchResult
 
-playwright_sync_api = pytest.importorskip("playwright.sync_api")
-sync_playwright = playwright_sync_api.sync_playwright
+pytest.importorskip("playwright.sync_api")
 
 FIXTURE_DIR = (
     Path(__file__).resolve().parents[1] / "fixtures" / "browser_provider"
 )
-SITE_DIR = FIXTURE_DIR / "site"
 DUMMY_RESUME = FIXTURE_DIR / "dummy_resume.txt"
 CHROMIUM_EXECUTABLE = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
 
@@ -90,45 +85,12 @@ from job_agent.applications.providers.browser_application import (  # noqa: E402
 
 
 # --------------------------------------------------------------------------
-# Local HTTP server fixtures — 127.0.0.1 only, OS-assigned ports. Two
-# separate servers bound to two different ports (both serving the same
-# fixture directory) give genuinely different origins for domain-drift
-# testing, since origin = scheme + host + port.
+# `site_server`, `other_origin_server`, and `browser` are shared, session-
+# scoped fixtures defined in tests/conftest.py — centralized there because
+# Playwright's sync API only supports one active `sync_playwright()` context
+# per process, so a second test module defining its own `browser` fixture
+# would conflict with this one. See conftest.py for the full rationale.
 # --------------------------------------------------------------------------
-def _start_server(directory: Path) -> tuple[http.server.ThreadingHTTPServer, str]:
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    port = httpd.server_address[1]
-    return httpd, f"http://127.0.0.1:{port}"
-
-
-@pytest.fixture(scope="session")
-def site_server():
-    httpd, base_url = _start_server(SITE_DIR)
-    yield base_url
-    httpd.shutdown()
-    httpd.server_close()
-
-
-@pytest.fixture(scope="session")
-def other_origin_server():
-    httpd, base_url = _start_server(SITE_DIR)
-    yield base_url
-    httpd.shutdown()
-    httpd.server_close()
-
-
-@pytest.fixture(scope="session")
-def browser():
-    pw = sync_playwright().start()
-    b = pw.chromium.launch(headless=True, executable_path=CHROMIUM_EXECUTABLE)
-    yield b
-    b.close()
-    pw.stop()
-
-
 def _site_url(
     base_url: str, *, scenario: str | None = None, drift_target: str | None = None
 ) -> str:
@@ -622,11 +584,19 @@ def test_browser_application_module_never_imports_credential_or_network_client()
 
 
 def test_cli_applications_run_still_hardcodes_manual_review_provider_not_browser():
+    """`applications run` specifically must stay unreachable by
+    BrowserApplicationProvider — checked against that one function's own
+    source, not the whole file, since Phase 6D Stage 2 legitimately added
+    a separate, explicit, --confirm-gated `applications browser-preview`
+    command elsewhere in this module that does reference it (see
+    test_cli_browser_preview.py)."""
+    import inspect
+
     from job_agent.cli import main as cli_main
 
-    source = Path(cli_main.__file__).read_text()
-    assert "BrowserApplicationProvider" not in source
-    assert "provider = ManualReviewProvider()" in source
+    run_source = inspect.getsource(cli_main.applications_run)
+    assert "BrowserApplicationProvider" not in run_source
+    assert "provider = ManualReviewProvider()" in run_source
 
 
 # ==========================================================================

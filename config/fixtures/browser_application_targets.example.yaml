@@ -1,0 +1,33 @@
+# =============================================================================
+# browser_application_targets.example.yaml — LOCAL allowlist of approved
+# targets for BrowserApplicationProvider (Phase 6D)
+# =============================================================================
+# This file is NEVER fetched from a network and NEVER represents a real ATS
+# platform, a real employer, or a real job posting — "example.test" domains
+# only. Unlike structured_ats_forms.example.yaml / real_structured_ats_
+# forms.example.yaml, this file carries NO simulated form data:
+# BrowserApplicationProvider has no local-simulation mode, it always
+# inspects a live DOM, so this file's only job is to be a curated
+# allowlist of `application_url` values a human has already approved for
+# browser inspection. A job whose `application_url` is not listed here is
+# never handed to the provider at all.
+#
+# `job_agent.applications.providers.browser_application.
+# load_browser_application_targets()` is the ONLY reader of this file. It
+# is disabled by default — see config/automation.yaml's
+# `application_provider` section — and is not consulted at all unless
+# `application_provider.provider` is explicitly set to
+# "browser_application" AND `application_provider.browser_application.
+# enabled` is explicitly set to true. No shipped config does either.
+#
+# This file alone can never cause a real browser session:
+# `job_agent.applications.service.build_application_provider` additionally
+# requires an explicit, caller-owned `playwright.sync_api.Browser` to be
+# passed in (`browser=...`) — no caller in this repository does that yet
+# — and BrowserApplicationProvider.submit() unconditionally refuses
+# regardless of any of this (submission is structurally unavailable in
+# this phase; see that module's docstring).
+# =============================================================================
+
+target_urls:
+  - "https://careers.example.test/acme/staff-engineer/apply"

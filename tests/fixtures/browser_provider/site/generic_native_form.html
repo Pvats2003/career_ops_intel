@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<!--
+  Phase 6D Stage 2 — LOCAL SYNTHETIC form with NO data-field/data-label/
+  data-required markers anywhere. Ordinary, conventional HTML: native
+  <label for>, native required, native input types — exactly the shape
+  ApplicationFormInspector's generic discovery path (Path 2) is meant to
+  handle, since no real third-party site would ever carry this project's
+  own synthetic-fixture attribute convention.
+
+  Deliberately exercises every label-resolution fallback:
+    - full_name:    <label for> matching by id           -> label match
+    - bio:          wrapped inside its own <label>        -> closest-label
+    - newsletter:   <label> wraps a checkbox, no for/id   -> closest-label
+    - nickname:     only a placeholder, no matching label -> placeholder
+    - mystery:      neither id nor name                   -> must be skipped
+    - country:      native <select>                       -> select options
+    - contact_pref: native radio group via shared name     -> radio grouping
+    - consent:      checkbox whose label mentions          -> consent heuristic
+                    "Terms" and "Privacy Policy"
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synthetic Test — Conventional Native HTML Form</title>
+</head>
+<body>
+  <h1>Generic Native-HTML Form (no synthetic markers)</h1>
+
+  <form id="application-form" onsubmit="return false;">
+    <label for="full_name">Full name</label>
+    <input type="text" id="full_name" name="full_name" required>
+
+    <label>
+      Short bio
+      <textarea id="bio" name="bio"></textarea>
+    </label>
+
+    <label>
+      <input type="checkbox" id="newsletter" name="newsletter">
+      Sign me up for the newsletter
+    </label>
+
+    <input type="text" id="nickname" name="nickname" placeholder="Preferred nickname">
+
+    <!-- No id, no name — must be discovered by neither path, never invented. -->
+    <input type="text" placeholder="Ignore me, I have no identity">
+
+    <label for="country">Country</label>
+    <select id="country" name="country" required>
+      <option value="">-- select --</option>
+      <option value="us">United States</option>
+      <option value="ca">Canada</option>
+    </select>
+
+    <fieldset>
+      <legend>How should we contact you?</legend>
+      <label for="contact_pref_email">
+        <input type="radio" id="contact_pref_email" name="contact_pref" value="email" required>
+        Email
+      </label>
+      <label for="contact_pref_phone">
+        <input type="radio" id="contact_pref_phone" name="contact_pref" value="phone" required>
+        Phone
+      </label>
+    </fieldset>
+
+    <label>
+      <input type="checkbox" id="consent" name="consent" required>
+      I agree to the Terms of Service and Privacy Policy
+    </label>
+
+    <button type="submit" id="real-submit-button">Submit Application</button>
+  </form>
+</body>
+</html>

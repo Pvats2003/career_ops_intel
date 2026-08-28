@@ -22,8 +22,24 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from job_agent.applications.browser.inspector import ApplicationFormInspector, DiscoveredField
+from job_agent.applications.browser.inspector import (
+    ApplicationFormInspector,
+    DiscoveredField,
+    field_selector,
+)
 from job_agent.applications.browser.session import BrowserSession
+
+# A special sentinel that may appear inside HumanReviewSnapshot.
+# unresolved_field_ids (never as a real field_id — field ids come from
+# DOM attributes, never from this literal) — set by
+# BrowserApplicationProvider.fill_application() when a CAPTCHA/MFA
+# challenge appears only AFTER filling began (never present at the
+# original inspect_application() call that gated entry to filling in the
+# first place). Public and defined here, once, so nothing importing it
+# (the provider that sets it, the CLI renderer that must recognize and
+# surface it distinctly rather than as an ordinary unresolved field) can
+# drift out of sync with a second, private copy of the same string.
+CAPTCHA_OR_MFA_AFTER_FILL_MARKER = "__captcha_or_mfa_appeared_after_fill__"
 
 
 class UploadedFileRecord(BaseModel):
@@ -83,7 +99,7 @@ def compute_snapshot_fingerprint(snapshot: HumanReviewSnapshot) -> str:
 
 
 def _current_value(session: BrowserSession, f: DiscoveredField) -> str:
-    selector = f'[data-field="{f.field_id}"]'
+    selector = field_selector(f.field_id)
     if f.input_type in ("text", "textarea"):
         el = session.query_all(selector)
         return el[0].input_value() if el else ""
@@ -95,7 +111,9 @@ def _current_value(session: BrowserSession, f: DiscoveredField) -> str:
             "e => Array.from(e.selectedOptions).map(o => o.textContent).join(', ')"
         )
     if f.input_type == "radio":
-        checked = session.query_all(f'input[type="radio"][data-field="{f.field_id}"]:checked')
+        checked = session.query_all(
+            f'input[type="radio"]:checked:is([data-field="{f.field_id}"], [name="{f.field_id}"])'
+        )
         return checked[0].get_attribute("value") or "" if checked else ""
     if f.input_type == "checkbox":
         el = session.query_all(selector)

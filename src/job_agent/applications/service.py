@@ -91,6 +91,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
@@ -105,6 +106,10 @@ from job_agent.applications.approvals import (
 from job_agent.applications.duplicates import find_cross_source_duplicate_application
 from job_agent.applications.errors import ProviderError, SubmissionOutcomeUnknownError
 from job_agent.applications.provider import ApplicationProvider, ManualReviewProvider
+from job_agent.applications.providers.browser_application import (
+    BrowserApplicationProvider,
+    load_browser_application_targets,
+)
 from job_agent.applications.providers.real_structured_ats import (
     RealATSSubmissionConfig,
     RealStructuredATSProvider,
@@ -142,6 +147,9 @@ from job_agent.logging.setup import get_logger, log_event, redact_text
 from job_agent.matching.schema import Decision
 from job_agent.resume.extractor import extract_resume_text
 
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser
+
 logger = get_logger("job_agent.applications.service")
 
 
@@ -152,7 +160,10 @@ class PreparationOutcome:
 
 
 def build_application_provider(
-    config: AppConfig, jobs: list[JobRow] | None = None
+    config: AppConfig,
+    jobs: list[JobRow] | None = None,
+    *,
+    browser: Browser | None = None,
 ) -> ApplicationProvider:
     """Resolves which `ApplicationProvider` `applications prepare` should
     use for a batch, driven entirely by `config.automation.
@@ -187,6 +198,20 @@ def build_application_provider(
     during this phase — no shipped config or `.env` sets it). No shipped
     `config/automation.yaml` selects this provider.
 
+    `BrowserApplicationProvider` (Phase 6D) is constructed only when BOTH
+    `provider: "browser_application"` AND `application_provider.
+    browser_application.enabled: true` are set — the identical two-switch
+    pattern — plus a THIRD independent gate: a live `browser` argument is
+    REQUIRED. No caller in this repository passes one today, so selecting
+    this provider without also changing a caller to supply a `Browser`
+    raises `ValueError` here, cleanly, rather than silently constructing
+    anything or falling back to another provider. `jobs` is additionally
+    cross-referenced against a LOCAL fixture allowlist
+    (`load_browser_application_targets`, no network I/O) of approved
+    `application_url` values — a job whose URL isn't on that list is never
+    handed to the provider, exactly like the other two providers' fixture
+    matching. No shipped `config/automation.yaml` selects this provider.
+
     This function decides nothing about application eligibility,
     submission, or safety — it only chooses which honest adapter answers
     `get_questions`/`discover_application`/`inspect_application`/`submit`/
@@ -194,6 +219,29 @@ def build_application_provider(
     unchanged by this choice.
     """
     provider_cfg = config.automation.application_provider
+
+    if provider_cfg.provider == "browser_application" and provider_cfg.browser_application.enabled:
+        browser_cfg = provider_cfg.browser_application
+        target_urls_path = REPO_ROOT / browser_cfg.target_urls_path
+        allowed_urls = set(load_browser_application_targets(target_urls_path))
+        if browser is None:
+            raise ValueError(
+                "application_provider.provider is 'browser_application' and enabled, but "
+                "no live browser was supplied to build_application_provider(browser=...). "
+                "BrowserApplicationProvider requires an explicit, caller-owned "
+                "playwright.sync_api.Browser instance — it can never launch one itself."
+            )
+        target_urls: dict[int, str] = {}
+        for job in jobs or []:
+            if job.application_url is None:
+                continue
+            if job.application_url in allowed_urls:
+                target_urls[job.id] = job.application_url
+        return BrowserApplicationProvider(
+            target_urls,
+            browser=browser,
+            resume_path=config.env.candidate_dir / "resume_master.docx",
+        )
 
     if provider_cfg.provider == "real_structured_ats" and provider_cfg.real_structured_ats.enabled:
         real_cfg = provider_cfg.real_structured_ats
