@@ -932,10 +932,32 @@ of which are implemented and none of which should be assumed from Phase
 - **Phase 6C** — controlled real-world execution: enabling live-mode for
   the 6B provider against a small, explicitly-approved allowlist of real
   postings, automation level capped low, human approval required per
-  submission.
-- **Phase 6D** — multi-provider scaling: `BrowserFormProvider`/
+  submission. **Status: Stage 1 only.** What has actually shipped so far
+  (`RealStructuredATSProvider`, the credential/allowlist/approval gating,
+  the CLI's approve/submit/verify commands) is build-and-test
+  infrastructure exercised only against a local synthetic target — no
+  real posting, real credential, or real submission has occurred under
+  this phase. The "controlled real-world execution" objective described
+  above remains unmet until a real target is actually selected and
+  approved for a live Stage 2.
+- **Phase 6D — Browser-Automation Application Provider** — a new provider
+  foundation, analogous in role to Phase 6B (first real provider
+  integration) but for a browser-driven application mechanism instead of
+  a structured-ATS API. **Status: Stage 1 only (Prepare + Human Submit).**
+  `BrowserApplicationProvider` can inspect a live DOM (fields/CAPTCHA/
+  MFA/consent), fill already-generated answers, and produce a
+  `HumanReviewSnapshot` for a human to review and submit manually —
+  `submit()` unconditionally refuses, so automated submission is
+  structurally unavailable in this stage. Exercised only against a local
+  synthetic HTML fixture the test suite serves itself; no real ATS,
+  credential, posting, or submission is touched. A later Stage 2 (real
+  target wiring) is not implemented and not scoped by this stage.
+- **Phase 6E** — multi-provider scaling: `BrowserFormProvider`/
   `CompanyCareerPortalProvider` families, queueing, concurrency, provider
-  health monitoring at scale.
+  health monitoring at scale, building on a working Phase 6C live
+  execution and Phase 6D browser provider. (Previously numbered "Phase
+  6D" before that name was reassigned to the browser-provider foundation
+  phase above — renumbered here to avoid the collision, no scope change.)
 
 Beyond that: the FastAPI dashboard, the scheduler, and notifications. Also
 not started within "job sources": Workday, company career pages, and the
