@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!--
+  Phase 6D Stage 1 — LOCAL SYNTHETIC "other origin" page. Exists only so
+  tests/unit/test_browser_provider.py can prove BrowserSession raises
+  DomainDriftDetectedError the instant navigation leaves the bound origin.
+  Served locally by the test suite's own second HTTP server on a
+  different port than index.html (a different port is a different origin
+  under the browser's same-origin rules) — never a real external host.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synthetic Test — Other Origin</title>
+</head>
+<body>
+  <h1>This is a different origin than the application form.</h1>
+  <p>If a BrowserSession ever observes itself here, that is domain drift.</p>
+</body>
+</html>

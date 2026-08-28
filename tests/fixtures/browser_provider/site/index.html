@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<!--
+  Phase 6D Stage 1 — LOCAL SYNTHETIC application form. Not a real ATS, not
+  a real employer, not a real posting. Served only by this repository's
+  own test suite on 127.0.0.1 — see tests/unit/test_browser_provider.py.
+
+  No external resource is ever loaded (no CDN script, no external font,
+  no analytics, nothing) — the whole page is self-contained inline
+  HTML/CSS/JS so a browser session against it can never make a real
+  network call, and every CAPTCHA/MFA marker below is a structural
+  placeholder (a class/id/data-attribute), never a real, live challenge.
+
+  Scenario switches (all client-side, via ?scenario=... in the URL):
+    normal   (default) — no CAPTCHA, no MFA
+    captcha  — shows the CAPTCHA placeholder
+    mfa      — shows the MFA placeholder
+
+  Domain-drift testing: pass ?drift_target=<url of the test suite's other
+  local origin> and the #drift-trigger link's href is set to it via JS
+  below (never hardcoded — the target port is only known at test time).
+  Clicking it navigates this session off its bound origin, which
+  BrowserSession must detect and hard-stop on.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synthetic Test Employer — Apply</title>
+</head>
+<body>
+  <h1>Synthetic Test Employer — Staff Engineer</h1>
+
+  <a id="drift-trigger" href="#" style="display:none;">(test-only) leave this origin</a>
+
+  <div id="g-recaptcha" class="g-recaptcha" data-sitekey="fake-test-sitekey-not-real"
+       style="display:none;">CAPTCHA PLACEHOLDER — never a real challenge</div>
+
+  <div id="mfa-challenge" data-mfa="true" style="display:none;">
+    <label for="otp_code">Verification code</label>
+    <input type="text" data-field="otp_code" data-label="Enter verification code" id="otp_code">
+  </div>
+
+  <form id="application-form" onsubmit="return false;">
+    <label for="full_name">Full name</label>
+    <input type="text" data-field="full_name" data-label="Full name" id="full_name" required>
+
+    <label for="email">Email</label>
+    <input type="email" data-field="email" data-label="Email address" id="email" required>
+
+    <label for="cover_letter">Why do you want to work here?</label>
+    <textarea data-field="cover_letter" data-label="Why do you want to work here?" id="cover_letter"></textarea>
+
+    <label for="salary_expectation">What is your current or expected salary?</label>
+    <input type="text" data-field="salary_expectation"
+           data-label="What is your current or expected salary?" id="salary_expectation" required>
+
+    <label for="country">Country</label>
+    <select data-field="country" data-label="Country" id="country" required>
+      <option value="">-- select --</option>
+      <option value="us">United States</option>
+      <option value="ca">Canada</option>
+      <option value="uk">United Kingdom</option>
+    </select>
+
+    <label for="skills">Skills (select all that apply)</label>
+    <select data-field="skills" data-label="Skills" id="skills" multiple>
+      <option value="python">Python</option>
+      <option value="sql">SQL</option>
+      <option value="js">JavaScript</option>
+    </select>
+
+    <fieldset>
+      <legend>Are you willing to relocate?</legend>
+      <label>
+        <input type="radio" name="relocate" data-field="relocate" value="yes"
+               data-option-label="Yes" data-label="Are you willing to relocate?" required>
+        Yes
+      </label>
+      <label>
+        <input type="radio" name="relocate" data-field="relocate" value="no"
+               data-option-label="No" data-label="Are you willing to relocate?" required>
+        No
+      </label>
+    </fieldset>
+
+    <div id="which_locations_wrapper" style="display:none;">
+      <label for="which_locations">Which locations would you consider?</label>
+      <input type="text" data-field="which_locations"
+             data-label="Which locations would you consider?" id="which_locations">
+    </div>
+
+    <label>
+      <input type="checkbox" data-field="willing_travel" data-label="Willing to travel"
+             id="willing_travel">
+      I am willing to travel for this role
+    </label>
+
+    <button type="button" data-reveals="certifications">Add certifications (optional)</button>
+    <div id="certifications_wrapper" style="display:none;">
+      <label for="certifications">Certifications</label>
+      <textarea data-field="certifications" data-label="List any relevant certifications"
+                id="certifications"></textarea>
+    </div>
+
+    <label for="resume">Resume</label>
+    <input type="file" data-field="resume" data-label="Resume" id="resume" required>
+
+    <label>
+      <input type="checkbox" data-field="consent" data-label="Consent to data processing"
+             data-consent="true" id="consent" required>
+      I consent to this synthetic test site processing my application data
+    </label>
+
+    <button type="submit" id="real-submit-button">Submit Application</button>
+  </form>
+
+  <button type="button" id="simulate-form-change">(test-only) simulate form change</button>
+
+  <script>
+    // ---- scenario toggles (captcha / mfa) ----
+    var params = new URLSearchParams(window.location.search);
+    var scenario = params.get('scenario') || 'normal';
+    if (scenario === 'captcha') {
+      document.getElementById('g-recaptcha').style.display = 'block';
+    }
+    if (scenario === 'mfa') {
+      document.getElementById('mfa-challenge').style.display = 'block';
+    }
+
+    // ---- domain-drift trigger (test-only) ----
+    var driftTarget = params.get('drift_target');
+    if (driftTarget) {
+      var driftLink = document.getElementById('drift-trigger');
+      driftLink.href = driftTarget;
+      driftLink.style.display = 'inline';
+    }
+
+    // ---- conditional reveal: relocate -> which_locations ----
+    var relocateRadios = document.querySelectorAll('input[name="relocate"]');
+    relocateRadios.forEach(function (radio) {
+      radio.addEventListener('change', function () {
+        var wrapper = document.getElementById('which_locations_wrapper');
+        wrapper.style.display = (radio.value === 'yes' && radio.checked) ? 'block' : wrapper.style.display;
+        if (radio.value === 'no' && radio.checked) {
+          document.getElementById('which_locations_wrapper').style.display = 'none';
+        }
+      });
+    });
+
+    // ---- conditional reveal: certifications toggle button ----
+    document.querySelector('[data-reveals="certifications"]').addEventListener('click', function () {
+      document.getElementById('certifications_wrapper').style.display = 'block';
+    });
+
+    // ---- test-only: simulate the form structure changing after approval ----
+    document.getElementById('simulate-form-change').addEventListener('click', function () {
+      var input = document.createElement('input');
+      input.type = 'text';
+      input.setAttribute('data-field', 'emergency_contact');
+      input.setAttribute('data-label', 'Emergency contact name');
+      input.setAttribute('data-required', 'true');
+      input.id = 'emergency_contact';
+      document.getElementById('application-form').appendChild(input);
+    });
+
+    // This page never submits anywhere — the button exists only so a
+    // real form's structure is realistically represented; Stage 1 never
+    // clicks it (see BrowserApplicationProvider.submit(), which never
+    // even opens a browser session).
+  </script>
+</body>
+</html>
