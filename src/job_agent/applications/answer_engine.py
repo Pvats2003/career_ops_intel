@@ -2,7 +2,7 @@
 responsible for every rule in the Phase 5 spec's "AI-generated application
 answers" section.
 
-Three-tier resolution, cheapest/safest first:
+Four-tier resolution, cheapest/safest first:
 
 1. **Hard-block categories** (SALARY, VISA, LEGAL, DEMOGRAPHIC) — checked
    before anything else, using only real CandidateProfile facts (never an
@@ -10,13 +10,30 @@ Three-tier resolution, cheapest/safest first:
    per config/preferences.yaml) or the category is categorically not
    something this system may infer (LEGAL/DEMOGRAPHIC), the answer is
    `None` with `requires_human=True`. No exceptions, no LLM override.
-2. **Answer bank** (candidate/answers/*.md) — human-authored, already
+2. **Trusted candidate identity/contact fact** (Phase 6D) — a narrow,
+   explicit set of question labels ("Full name", "Email", "Phone",
+   "Current location", "LinkedIn URL" and a small number of unambiguous
+   synonyms — see `_TRUSTED_IDENTITY_FACT_KEYWORDS`) resolve directly and
+   deterministically from `CandidateProfile`'s existing, already-reviewed
+   `Fact[str]` fields (`identity_name`, `contact_email`, `contact_phone`,
+   `identity_current_location`, `contact_linkedin`) — never through the
+   LLM, never through the answer bank, and only when the underlying Fact
+   is both `verified` and not `is_unknown`. This tier is checked BEFORE
+   the answer bank so a verified profile fact can never be silently
+   shadowed by a stale or approximate bank entry. Deliberately excludes
+   bare "name"/"location" as trigger keywords: both are too ambiguous in
+   real ATS forms ("Company name", "Job location", "Relocate to which
+   location") to safely auto-attach the candidate's own identity to.
+   `current_company` has no such mapping — there is no dedicated trusted
+   fact for it yet, so it always falls through to the tiers below (and,
+   for these specific labels, to `requires_human=True`).
+3. **Answer bank** (candidate/answers/*.md) — human-authored, already
    truthful, already reviewed. Used verbatim when the question matches a
    known slug; if that entry itself says `requires_human: true` (e.g.
    why_this_company.md — a template "why this company" answer would be a
    lie about genuine interest), that's honored too.
-3. **LLM draft, then validated** — only for questions that reach neither
-   of the above. Uses the existing `LLMProvider` abstraction (no new LLM
+4. **LLM draft, then validated** — only for questions that reach none of
+   the above. Uses the existing `LLMProvider` abstraction (no new LLM
    plumbing), the same untrusted-content-delimiting pattern as Phase 3's
    semantic matcher, and `job_agent.applications.answer_validator` to
    reject any draft that references something not in the candidate's
@@ -39,7 +56,7 @@ from job_agent.applications.schema import (
     GeneratedAnswer,
     QuestionCategory,
 )
-from job_agent.candidate.schema import CandidateProfile
+from job_agent.candidate.schema import CandidateProfile, Fact
 from job_agent.llm.errors import LLMOutputValidationError, LLMUnavailableError
 from job_agent.llm.provider import LLMProvider
 from job_agent.logging.setup import redact_text
@@ -89,6 +106,40 @@ _CATEGORY_KEYWORDS: dict[QuestionCategory, tuple[str, ...]] = {
     QuestionCategory.CONTACT: ("phone number", "email address", "linkedin url"),
     QuestionCategory.PERSONAL: ("full legal name", "date of birth", "home address"),
 }
+
+
+# Phase 6D — deterministic mapping from a question's LABEL text to one of
+# CandidateProfile's existing, already-reviewed trusted Fact[str] fields.
+# Matching is exact, narrow keyword matching via the same `contains_keyword`
+# whole-token-phrase check `_CATEGORY_KEYWORDS`/`match_slug` already use —
+# never fuzzy, never a partial/substring guess. Deliberately does NOT
+# include bare "name" or bare "location": both are too ambiguous on real
+# ATS forms ("Company name", "Reference name", "Job location", "Relocate
+# to which location") to safely auto-attach the candidate's own identity
+# to. `current_company` has no entry here on purpose — there is no
+# dedicated trusted fact for it (see candidate/schema.py); it always
+# falls through to answer bank / LLM / HUMAN_REQUIRED like any other
+# unmapped question.
+_TRUSTED_IDENTITY_FACT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("identity_name", ("full name",)),
+    ("contact_email", ("email address", "email")),
+    ("contact_phone", ("phone number", "phone")),
+    ("identity_current_location", ("current location",)),
+    ("contact_linkedin", ("linkedin url", "linkedin")),
+)
+
+
+def _resolve_trusted_identity_fact(
+    question_text: str, profile: CandidateProfile
+) -> tuple[str, Fact[str]] | None:
+    """Returns `(attribute_name, fact)` for the first trusted identity/
+    contact fact whose keyword(s) match this question's label, or `None`
+    if no mapping applies. Never invoked for questions the LLM should
+    handle — this function makes no LLM call and never will."""
+    for attr_name, keywords in _TRUSTED_IDENTITY_FACT_KEYWORDS:
+        if any(contains_keyword(question_text, kw) for kw in keywords):
+            return attr_name, getattr(profile, attr_name)
+    return None
 
 
 def classify_question(text: str) -> QuestionCategory:
@@ -194,6 +245,33 @@ def generate_answer(
             requires_human=True,
             validated=True,
             validation_notes=(_hard_block_reason(category, profile),),
+        )
+
+    trusted = _resolve_trusted_identity_fact(question.text, profile)
+    if trusted is not None:
+        attr_name, fact = trusted
+        if fact.verified and not fact.is_unknown:
+            return GeneratedAnswer(
+                question=question.text,
+                category=category,
+                answer=fact.value,
+                confidence=fact.confidence,
+                source=f"candidate_fact:{attr_name}",
+                requires_human=False,
+                validated=True,
+                validation_notes=(),
+            )
+        return GeneratedAnswer(
+            question=question.text,
+            category=category,
+            answer=None,
+            confidence=0.0,
+            source=f"candidate_fact_unverified:{attr_name}",
+            requires_human=True,
+            validated=True,
+            validation_notes=(
+                f"{attr_name} is not a verified candidate fact — never guessed",
+            ),
         )
 
     slug = match_slug(question.text)
