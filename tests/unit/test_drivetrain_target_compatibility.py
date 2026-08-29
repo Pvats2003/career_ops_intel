@@ -34,7 +34,7 @@ from job_agent.applications.browser.filler import FormFiller
 from job_agent.applications.browser.inspector import ApplicationFormInspector
 from job_agent.applications.browser.session import BrowserSession
 from job_agent.applications.browser.snapshot import build_snapshot
-from job_agent.applications.browser.snapshot_render import snapshot_sections
+from job_agent.applications.browser.snapshot_render import render_snapshot, snapshot_sections
 from job_agent.applications.providers.browser_application import BrowserApplicationProvider
 from job_agent.applications.rules_enforcement import evaluate_inspection
 from job_agent.applications.schema import QuestionCategory
@@ -490,3 +490,113 @@ def test_full_provider_pipeline_produces_a_correct_non_fabricating_snapshot(
     sections = snapshot_sections(snapshot)
     assert {f.field_id for f in sections.proposed_fields} == set(field_id_to_synthetic_key)
     assert set(sections.unresolved_field_ids) == {"current_company"}
+
+
+# ==========================================================================
+# Phase 6D checkpoint — the complete local, end-to-end
+# "prepare application -> HumanReviewSnapshot -> human-readable review
+# output" demonstration this checkpoint exists to prove. Reuses exactly
+# the same synthetic profile/fixture as the test above; adds what that
+# test does not yet cover: explicit per-field trusted-fact PROVENANCE
+# (the `GeneratedAnswer.source` string — the strongest existing
+# provenance guarantee; `SnapshotField` itself carries no source
+# metadata, and this checkpoint does not add any, per instruction), a
+# full `render_snapshot()` pass (not just the structured
+# `snapshot_sections()` data), and explicit no-password/no-upload proof.
+# ==========================================================================
+def test_local_end_to_end_prepare_to_human_review_snapshot_demonstration(
+    site_server, browser, real_config
+):
+    """CandidateProfile -> trusted candidate facts -> answer resolution ->
+    BrowserApplicationProvider -> synthetic application form -> prepared
+    HumanReviewSnapshot -> human-readable review output, entirely local.
+    Uses ONLY the synthetic `_synthetic_identity_profile()` -- never
+    real_profile, never candidate/profile.md, never resume_master.docx."""
+    url = _native_fixture_url(site_server)
+    profile = _synthetic_identity_profile()
+    job = _DrivetrainFakeJob()
+
+    trusted_mapping = {
+        "Full name": ("identity_name", "full_name"),
+        "Email": ("contact_email", "email"),
+        "Phone": ("contact_phone", "phone"),
+        "Current location": ("identity_current_location", "current_location"),
+        "LinkedIn URL": ("contact_linkedin", "linkedin_url"),
+    }
+
+    # 1-2: discover_application() / inspect_application()
+    provider = BrowserApplicationProvider({job.id: url}, browser=browser)  # no resume_path
+    target = provider.discover_application(job)
+    assert target.reachable is True
+    inspection = provider.inspect_application(job, target)
+    assert inspection.structure_recognized is True
+    assert inspection.captcha_detected is False
+    assert inspection.mfa_detected is False
+
+    # 3: evaluate_inspection() -- structure is fine, no hard-stop gate trips
+    verdict = evaluate_inspection(real_config.rules, inspection)
+    assert verdict.human_required is False
+
+    # 4: get_questions()
+    questions = provider.get_questions(job)
+    assert len(questions) == 6  # resume (file) excluded
+
+    # 5: generate answers using the actual answer-resolution stack --
+    # NullLLMProvider proves the LLM is never invoked to manufacture
+    # missing identity/contact data, and an empty answer bank proves
+    # nothing is sourced from there either.
+    answers = {
+        a.question: a
+        for a in (generate_answer(q, profile, "", [], NullLLMProvider()) for q in questions)
+    }
+
+    for label, (attr_name, synthetic_key) in trusted_mapping.items():
+        answer = answers[label]
+        assert answer.answer == SYNTHETIC_VALUES[synthetic_key], label
+        assert answer.requires_human is False, label
+        # Provenance: the strongest existing guarantee is GeneratedAnswer.
+        # source -- SnapshotField carries no source metadata today, and
+        # this checkpoint deliberately does not add any (no genuine
+        # correctness gap requires it; see module-level note above).
+        assert answer.source == f"candidate_fact:{attr_name}", label
+        assert not answer.source.startswith("llm"), label
+        assert not answer.source.startswith("answer_bank"), label
+
+    current_company_answer = answers["Current company"]
+    assert current_company_answer.answer is None
+    assert current_company_answer.requires_human is True
+    assert not current_company_answer.source.startswith("candidate_fact")
+
+    # 6: fill_application() -- only the five trusted fields are ever typed
+    state = provider.fill_application(job, target, list(answers.values()))
+    assert state.answer_count == 5
+
+    # 7: get_snapshot()
+    snapshot = provider.get_snapshot(job.id)
+    assert snapshot is not None
+    assert snapshot.uploaded_files == ()  # Resume/CV: never uploaded, HUMAN_REQUIRED by omission
+    assert all(f.field_type != "password" for f in snapshot.fields)  # no password anywhere
+    assert set(snapshot.unresolved_field_ids) == {"current_company"}
+    for _attr_name, synthetic_key in trusted_mapping.values():
+        field = next(f for f in snapshot.fields if f.field_id == synthetic_key)
+        assert field.current_value == SYNTHETIC_VALUES[synthetic_key]
+    current_company_field = next(f for f in snapshot.fields if f.field_id == "current_company")
+    assert current_company_field.current_value == ""  # never inferred, never fabricated
+
+    # 8: render the HumanReviewSnapshot using the existing rendering path
+    import io
+
+    from rich.console import Console
+
+    buf = io.StringIO()
+    render_snapshot(snapshot, Console(file=buf, width=200))
+    rendered = buf.getvalue()
+
+    assert "Drivetrain" in rendered
+    assert "Business Analyst - Customer Platform" in rendered
+    assert "Needs your input" in rendered
+    for _attr_name, synthetic_key in trusted_mapping.values():
+        assert SYNTHETIC_VALUES[synthetic_key] in rendered  # proposed for fill
+    assert SYNTHETIC_VALUES["current_company"] not in rendered  # never inferred/typed
+    assert "current_company" in rendered  # disclosed as needing human input, never hidden
+    assert "structurally unavailable" in rendered  # submission remains impossible
