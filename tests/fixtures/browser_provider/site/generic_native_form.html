@@ -17,6 +17,18 @@
     - contact_pref: native radio group via shared name     -> radio grouping
     - consent:      checkbox whose label mentions          -> consent heuristic
                     "Terms" and "Privacy Policy"
+
+  Adversarial additions (Career Ops real-target-readiness checkpoint):
+    - tracking_id: type="hidden" -- must NEVER appear in discovered fields
+      at all (structurally excluded by the generic-path selector itself,
+      see inspector.py's _GENERIC_INPUT_EXCLUDED_TYPES). A hidden input is
+      not a "question"; surfacing it would risk exposing or overwriting
+      internal state a real ATS embeds in the page (CSRF tokens, session
+      markers, etc).
+    - start_date:  type="date" -- an input type the inspector has no
+      dedicated branch for. Must be discovered safely as generic "text"
+      (never crash, never silently dropped, never misclassified as
+      something more sensitive than it is).
 -->
 <html lang="en">
 <head>
@@ -27,8 +39,13 @@
   <h1>Generic Native-HTML Form (no synthetic markers)</h1>
 
   <form id="application-form" onsubmit="return false;">
+    <input type="hidden" id="tracking_id" name="tracking_id" value="synthetic-tracking-value">
+
     <label for="full_name">Full name</label>
     <input type="text" id="full_name" name="full_name" required>
+
+    <label for="start_date">Preferred start date</label>
+    <input type="date" id="start_date" name="start_date">
 
     <label>
       Short bio

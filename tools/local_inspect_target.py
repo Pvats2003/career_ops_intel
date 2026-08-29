@@ -28,13 +28,24 @@ WHAT THIS SCRIPT NEVER DOES:
     imported or constructed) -- this script only asks "what does this
     FORM look like", never "what would I put into it"
 
-PRIVACY: this script never reads a form field's current DOM value. The
-inspector classes it uses (DiscoveredField / ApplicationQuestion) don't
-carry a "current value" field at all -- only labels, types, and required
-flags, which describe the FORM, not any candidate's data. As a defensive
-extra (in case a browser autofills something), each text-shaped field is
-checked only for whether it is EMPTY or NON-EMPTY -- the actual value,
-if any, is never read into this script or printed anywhere.
+PRIVACY: this script NEVER calls `.input_value()` or any other API that
+would read a form field's current DOM value -- not even to check
+empty-vs-non-empty. The inspector classes it uses (DiscoveredField /
+ApplicationQuestion) don't carry a "current value" field at all -- only
+labels, types, and required flags, which describe the FORM, not any
+candidate's data.
+
+KNOWN, ACCEPTED LIMITATIONS (reported honestly rather than hidden):
+  - It cannot positively detect a plain (non-OAuth) login form beyond
+    what a password-field or external-auth-link count already implies.
+  - It cannot explicitly flag "unsupported custom widget" -- a JS-driven
+    control the DOM inspector doesn't recognize simply won't appear in
+    the discovered-fields list at all. Compare the discovered list
+    against what you actually see on the page; a visible field that
+    never appears in the report is the signal.
+  - It cannot detect a multi-step wizard that reveals new fields only
+    after a click, because it never clicks anything -- it reports only
+    what is present in the DOM after one page load.
 
 USAGE (run from a clone of this repository, on a machine with real
 network access):
@@ -154,27 +165,16 @@ def main() -> int:
             print(f"field_count: {len(inspection.fields)}")
 
             print("\n=== DISCOVERED FIELDS ===")
-            header = (
-                f"{'field_id':<24} {'type':<12} {'required':<9} "
-                f"{'visible':<8} {'empty?':<8} label"
-            )
+            # No field value is ever read here, not even to check
+            # empty-vs-non-empty -- only field structure (id/type/
+            # required/visible/label), which describes the FORM, not any
+            # candidate's data. `.input_value()` is never called.
+            header = f"{'field_id':<24} {'type':<12} {'required':<9} {'visible':<8} label"
             print(header)
             for f in inspection.fields:
-                empty_marker = "-"
-                if f.visible and f.input_type in ("text", "textarea"):
-                    try:
-                        from job_agent.applications.browser.inspector import field_selector
-
-                        el = session.query_all(field_selector(f.field_id))
-                        if el:
-                            # Presence-only check -- the actual value is
-                            # never read into a variable that gets printed.
-                            empty_marker = "empty" if not el[0].input_value() else "NON-EMPTY"
-                    except Exception:  # noqa: BLE001
-                        empty_marker = "?"
                 print(
                     f"{f.field_id:<24} {f.input_type:<12} {str(f.required):<9} "
-                    f"{str(f.visible):<8} {empty_marker:<8} {f.label}"
+                    f"{str(f.visible):<8} {f.label}"
                 )
                 if f.options:
                     for opt in f.options:
@@ -185,9 +185,8 @@ def main() -> int:
                 print(f"- [{q.category}] required={q.required}: {q.text}")
 
             print(
-                "\nNOTE: no field value was read or printed above beyond an "
-                "empty/non-empty presence check. No candidate data of any "
-                "kind was used by this script."
+                "\nNOTE: no field value was read from the DOM at any point above. "
+                "No candidate data of any kind was used by this script."
             )
             return 0
         finally:
