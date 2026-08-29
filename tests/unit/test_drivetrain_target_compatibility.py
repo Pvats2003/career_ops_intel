@@ -230,9 +230,21 @@ def test_remaining_five_fields_do_not_match_any_known_keyword_category(site_serv
 # ANTHROPIC_API_KEY-stripping fixture), proving nothing is ever
 # fabricated and everything unanswerable fails closed to HUMAN_REQUIRED.
 # ==========================================================================
-def test_answer_engine_never_fabricates_and_fails_closed_for_all_six_fields(
+def test_answer_engine_resolves_five_trusted_fields_and_fails_closed_for_current_company(
     site_server, browser, real_config, real_profile
 ):
+    """Phase 6D trusted-identity-fact update: five of these six labels
+    ("Full name", "Email", "Phone", "Current location", "LinkedIn URL")
+    now match `answer_engine._TRUSTED_IDENTITY_FACT_KEYWORDS` and resolve
+    deterministically from the real, already-verified `CandidateProfile`
+    facts — never from the LLM (NullLLMProvider is passed and must never
+    be reached for these five; if it ever were, this test would still
+    pass by construction since we never assert anything about `source`
+    beginning with "llm", only that it begins with "candidate_fact").
+    "Current company" has no trusted-fact mapping and MUST still fail
+    closed exactly as before. No literal candidate value is ever written
+    into this file — every comparison is against the SAME real_profile
+    fixture's own live attribute, never a hardcoded copy."""
     with BrowserSession(_fixture_url(site_server), browser=browser) as session:
         session.load()
         snap = ApplicationFormInspector().inspect(session)
@@ -242,17 +254,29 @@ def test_answer_engine_never_fabricates_and_fails_closed_for_all_six_fields(
     resume_text = extract_resume_text(real_config.env.candidate_dir / "resume_master.docx")
     bank = load_answer_bank(real_config.env.candidate_dir / "answers")
 
+    trusted_mapping = {
+        "Full name": "identity_name",
+        "Email": "contact_email",
+        "Phone": "contact_phone",
+        "Current location": "identity_current_location",
+        "LinkedIn URL": "contact_linkedin",
+    }
+
     for question in questions:
         answer = generate_answer(question, real_profile, resume_text, bank, NullLLMProvider())
-        # No LLM is configured (NullLLMProvider always raises
-        # LLMUnavailableError, exactly like this project's real shipped
-        # state with no ANTHROPIC_API_KEY set) and no answer_bank entry
-        # exists for any of these contact-identity fields (checked:
-        # candidate/answers/*.md covers only narrative/behavioral
-        # questions) — so every one of these six MUST fail closed.
-        assert answer.answer is None, question.text
-        assert answer.requires_human is True, question.text
-        assert answer.source == "llm_unavailable", question.text
+        attr_name = trusted_mapping.get(question.text)
+        if attr_name is not None:
+            expected_fact = getattr(real_profile, attr_name)
+            assert answer.answer == expected_fact.value, question.text
+            assert answer.requires_human is False, question.text
+            assert answer.source == f"candidate_fact:{attr_name}", question.text
+        else:
+            # "Current company" -- no trusted fact exists for it; must
+            # still fail closed exactly as every field used to.
+            assert question.text == "Current company", question.text
+            assert answer.answer is None, question.text
+            assert answer.requires_human is True, question.text
+            assert answer.source == "llm_unavailable", question.text
 
 
 # ==========================================================================
@@ -368,13 +392,25 @@ def test_full_provider_pipeline_produces_a_correct_non_fabricating_snapshot(
     answers = [
         generate_answer(q, real_profile, resume_text, bank, NullLLMProvider()) for q in questions
     ]
-    # Every individual CONTENT answer must still fail closed -- structural
-    # recognition of the form is independent of whether any of its
-    # questions can be truthfully answered.
-    assert all(a.answer is None and a.requires_human for a in answers)
+    # Phase 6D: five of these six now resolve deterministically from the
+    # real, verified CandidateProfile facts -- never from the LLM/answer
+    # bank. "Current company" has no trusted-fact mapping and must still
+    # fail closed exactly as every field used to before this checkpoint.
+    field_id_to_attr = {
+        "full_name": "identity_name",
+        "email": "contact_email",
+        "phone": "contact_phone",
+        "current_location": "identity_current_location",
+        "linkedin_url": "contact_linkedin",
+    }
+    resolved_answers = [a for a in answers if not a.requires_human]
+    unresolved_answers = [a for a in answers if a.requires_human]
+    assert len(resolved_answers) == 5
+    assert len(unresolved_answers) == 1
+    assert unresolved_answers[0].question == "Current company"
 
     state = provider.fill_application(job, target, answers)
-    assert state.answer_count == 0  # nothing was ever typed into the DOM
+    assert state.answer_count == 5  # the five trusted fields were typed; current_company was not
 
     snapshot = provider.get_snapshot(job.id)
     assert snapshot is not None
@@ -387,14 +423,21 @@ def test_full_provider_pipeline_produces_a_correct_non_fabricating_snapshot(
     assert {f.field_id for f in snapshot.fields} == expected_field_ids
     assert set(snapshot.required_field_ids) == expected_field_ids
     assert snapshot.optional_field_ids == ()
-    assert set(snapshot.unresolved_field_ids) == expected_field_ids
+    assert set(snapshot.unresolved_field_ids) == {"current_company"}
 
     for field in snapshot.fields:
-        assert field.current_value == ""  # never filled, never fabricated
         assert field.required is True
+        attr_name = field_id_to_attr.get(field.field_id)
+        if attr_name is not None:
+            # Compared dynamically against real_profile's own live value --
+            # never a hardcoded literal copy of the candidate's real data.
+            assert field.current_value == getattr(real_profile, attr_name).value
+        else:
+            assert field.field_id == "current_company"
+            assert field.current_value == ""  # never filled, never fabricated
 
-    # Rendering never shows a "proposed value" for any of these -- every
-    # one landed in the unresolved list, not the proposed-fields table.
+    # Rendering: the five resolved fields appear as proposed values; only
+    # current_company lands in the unresolved list.
     sections = snapshot_sections(snapshot)
-    assert sections.proposed_fields == ()
-    assert set(sections.unresolved_field_ids) == expected_field_ids
+    assert {f.field_id for f in sections.proposed_fields} == set(field_id_to_attr)
+    assert set(sections.unresolved_field_ids) == {"current_company"}
