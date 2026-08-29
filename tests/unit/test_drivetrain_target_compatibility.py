@@ -5,12 +5,11 @@ using a local synthetic fixture that mirrors ONLY the fields a human
 manually observed and reported on that real page. This file never makes
 a real network call, never contacts jobs.lever.co, and never uses real
 personal data — every value filled into the DOM is an obvious synthetic
-placeholder. Answer-generation truthfulness checks (test class below)
-deliberately use the REAL, committed candidate profile as INPUT (the
-same as every other test in this repo that imports `real_profile` from
-conftest.py) — this only proves what the answer engine WOULD produce for
-this candidate against this exact field set; nothing is ever filled into
-a form or transmitted anywhere from those checks.
+placeholder. Answer-generation tests use `_synthetic_identity_profile()`
+(a fully synthetic `CandidateProfile` built from `SYNTHETIC_VALUES`
+below) — never the repository's real `candidate/profile.md` data or the
+`real_profile` fixture — precisely so a test failure here can never print
+real personal information into pytest output.
 
 IMPORTANT SCOPE NOTE (see the full written report): `ApplicationFormInspector`
 only discovers fields via the `data-field`/`data-label`/`data-required`
@@ -28,7 +27,6 @@ from pathlib import Path
 
 import pytest
 
-from job_agent.applications.answer_bank import load_answer_bank
 from job_agent.applications.answer_engine import classify_question, generate_answer
 from job_agent.applications.browser.answer_planner import AnswerPlanner
 from job_agent.applications.browser.field_mapper import DynamicFieldMapper, question_text
@@ -40,8 +38,16 @@ from job_agent.applications.browser.snapshot_render import snapshot_sections
 from job_agent.applications.providers.browser_application import BrowserApplicationProvider
 from job_agent.applications.rules_enforcement import evaluate_inspection
 from job_agent.applications.schema import QuestionCategory
+from job_agent.candidate.schema import (
+    CandidateProfile,
+    Fact,
+    LocationPreferences,
+    SalaryPreferences,
+    TargetRoles,
+    VisaInformation,
+    WorkPreferences,
+)
 from job_agent.llm.provider import NullLLMProvider
-from job_agent.resume.extractor import extract_resume_text
 
 pytest.importorskip("playwright.sync_api")
 
@@ -78,6 +84,48 @@ SYNTHETIC_VALUES = {
     "current_company": "Test Company Inc.",
     "linkedin_url": "https://linkedin.com/in/testcandidate",
 }
+
+
+def _fact(value: str) -> Fact[str]:
+    return Fact[str](
+        value=value, source="test_synthetic_profile", confidence=1.0, verified=True
+    )
+
+
+def _synthetic_identity_profile() -> CandidateProfile:
+    """A fully synthetic CandidateProfile carrying only the obvious
+    placeholder values already in SYNTHETIC_VALUES above -- built to
+    prove the trusted-identity-fact resolver's behavior against THIS
+    exact target's field labels without ever touching the repository's
+    real candidate/profile.md data. A test failure against this profile
+    can only ever print "Test Candidate"/"test.candidate@example.
+    invalid"/etc. into pytest output, never a real name, email, phone,
+    location, or LinkedIn URL."""
+    unknown_pref = Fact.unknown(source="test_synthetic_profile")
+    return CandidateProfile(
+        identity_name=_fact(SYNTHETIC_VALUES["full_name"]),
+        identity_current_location=_fact(SYNTHETIC_VALUES["current_location"]),
+        contact_email=_fact(SYNTHETIC_VALUES["email"]),
+        contact_phone=_fact(SYNTHETIC_VALUES["phone"]),
+        contact_linkedin=_fact(SYNTHETIC_VALUES["linkedin_url"]),
+        target_roles=TargetRoles(),
+        work_preferences=WorkPreferences(
+            remote=unknown_pref, willing_to_relocate=unknown_pref, notice_period=unknown_pref
+        ),
+        location_preferences=LocationPreferences(
+            current_location=_fact(SYNTHETIC_VALUES["current_location"]),
+            open_to_countries=unknown_pref,
+        ),
+        salary_preferences=SalaryPreferences(
+            currency=unknown_pref, minimum_annual=unknown_pref,
+            target_annual=unknown_pref, negotiable=unknown_pref,
+        ),
+        visa_information=VisaInformation(
+            nationality=unknown_pref, requires_sponsorship_us=unknown_pref,
+            requires_sponsorship_uk=unknown_pref, requires_sponsorship_eu=unknown_pref,
+            requires_sponsorship_other=unknown_pref,
+        ),
+    )
 
 
 def _fixture_url(site_server: str) -> str:
@@ -225,49 +273,49 @@ def test_remaining_five_fields_do_not_match_any_known_keyword_category(site_serv
 
 
 # ==========================================================================
-# 9-10: answer-generation pipeline — real candidate profile as input,
-# NullLLMProvider (no network call, matches conftest.py's autouse
-# ANTHROPIC_API_KEY-stripping fixture), proving nothing is ever
-# fabricated and everything unanswerable fails closed to HUMAN_REQUIRED.
+# 9-10: answer-generation pipeline — a fully SYNTHETIC candidate profile
+# as input (never real_profile/real candidate data — see
+# _synthetic_identity_profile()), NullLLMProvider (no network call,
+# matches conftest.py's autouse ANTHROPIC_API_KEY-stripping fixture).
+# Proves the five trusted identity/contact labels resolve deterministically
+# and "Current company" still fails closed to HUMAN_REQUIRED, without ever
+# touching real candidate/profile.md data or being able to print real PII
+# into pytest output on failure.
 # ==========================================================================
 def test_answer_engine_resolves_five_trusted_fields_and_fails_closed_for_current_company(
-    site_server, browser, real_config, real_profile
+    site_server, browser
 ):
     """Phase 6D trusted-identity-fact update: five of these six labels
     ("Full name", "Email", "Phone", "Current location", "LinkedIn URL")
     now match `answer_engine._TRUSTED_IDENTITY_FACT_KEYWORDS` and resolve
-    deterministically from the real, already-verified `CandidateProfile`
-    facts — never from the LLM (NullLLMProvider is passed and must never
-    be reached for these five; if it ever were, this test would still
-    pass by construction since we never assert anything about `source`
-    beginning with "llm", only that it begins with "candidate_fact").
-    "Current company" has no trusted-fact mapping and MUST still fail
-    closed exactly as before. No literal candidate value is ever written
-    into this file — every comparison is against the SAME real_profile
-    fixture's own live attribute, never a hardcoded copy."""
+    deterministically from a CandidateProfile's Fact[str] fields — never
+    from the LLM (NullLLMProvider is passed and must never be reached for
+    these five). "Current company" has no trusted-fact mapping and MUST
+    still fail closed exactly as before. Every expected value compared
+    below is one of the obvious SYNTHETIC_VALUES placeholders already
+    defined at the top of this file — never real candidate data — so a
+    failure here can only ever print a synthetic value."""
     with BrowserSession(_fixture_url(site_server), browser=browser) as session:
         session.load()
         snap = ApplicationFormInspector().inspect(session)
     questions = DynamicFieldMapper().to_questions(snap)
     assert len(questions) == 6
 
-    resume_text = extract_resume_text(real_config.env.candidate_dir / "resume_master.docx")
-    bank = load_answer_bank(real_config.env.candidate_dir / "answers")
-
+    profile = _synthetic_identity_profile()
     trusted_mapping = {
-        "Full name": "identity_name",
-        "Email": "contact_email",
-        "Phone": "contact_phone",
-        "Current location": "identity_current_location",
-        "LinkedIn URL": "contact_linkedin",
+        "Full name": ("identity_name", "full_name"),
+        "Email": ("contact_email", "email"),
+        "Phone": ("contact_phone", "phone"),
+        "Current location": ("identity_current_location", "current_location"),
+        "LinkedIn URL": ("contact_linkedin", "linkedin_url"),
     }
 
     for question in questions:
-        answer = generate_answer(question, real_profile, resume_text, bank, NullLLMProvider())
-        attr_name = trusted_mapping.get(question.text)
-        if attr_name is not None:
-            expected_fact = getattr(real_profile, attr_name)
-            assert answer.answer == expected_fact.value, question.text
+        answer = generate_answer(question, profile, "", [], NullLLMProvider())
+        mapping = trusted_mapping.get(question.text)
+        if mapping is not None:
+            attr_name, synthetic_key = mapping
+            assert answer.answer == SYNTHETIC_VALUES[synthetic_key], question.text
             assert answer.requires_human is False, question.text
             assert answer.source == f"candidate_fact:{attr_name}", question.text
         else:
@@ -365,11 +413,13 @@ def test_cli_still_has_no_reference_to_this_specific_target():
 # though the fixture has a file input, no upload is ever attempted.
 # ==========================================================================
 def test_full_provider_pipeline_produces_a_correct_non_fabricating_snapshot(
-    site_server, browser, real_config, real_profile
+    site_server, browser, real_config
 ):
+    """Uses a fully SYNTHETIC CandidateProfile (_synthetic_identity_profile())
+    -- never real_profile/real candidate data. `real_config` is used only
+    for `.rules` (config/rules.yaml's safety flags, not candidate data)."""
     url = _native_fixture_url(site_server)
-    resume_text = extract_resume_text(real_config.env.candidate_dir / "resume_master.docx")
-    bank = load_answer_bank(real_config.env.candidate_dir / "answers")
+    profile = _synthetic_identity_profile()
     job = _DrivetrainFakeJob()
 
     provider = BrowserApplicationProvider({job.id: url}, browser=browser)  # no resume_path
@@ -389,19 +439,18 @@ def test_full_provider_pipeline_produces_a_correct_non_fabricating_snapshot(
     questions = provider.get_questions(job)
     assert len(questions) == 6  # resume (file) excluded, exactly the 6 text/URL fields
 
-    answers = [
-        generate_answer(q, real_profile, resume_text, bank, NullLLMProvider()) for q in questions
-    ]
+    answers = [generate_answer(q, profile, "", [], NullLLMProvider()) for q in questions]
     # Phase 6D: five of these six now resolve deterministically from the
-    # real, verified CandidateProfile facts -- never from the LLM/answer
-    # bank. "Current company" has no trusted-fact mapping and must still
-    # fail closed exactly as every field used to before this checkpoint.
-    field_id_to_attr = {
-        "full_name": "identity_name",
-        "email": "contact_email",
-        "phone": "contact_phone",
-        "current_location": "identity_current_location",
-        "linkedin_url": "contact_linkedin",
+    # synthetic, verified CandidateProfile facts -- never from the LLM/
+    # answer bank. "Current company" has no trusted-fact mapping and must
+    # still fail closed exactly as every field used to before this
+    # checkpoint.
+    field_id_to_synthetic_key = {
+        "full_name": "full_name",
+        "email": "email",
+        "phone": "phone",
+        "current_location": "current_location",
+        "linkedin_url": "linkedin_url",
     }
     resolved_answers = [a for a in answers if not a.requires_human]
     unresolved_answers = [a for a in answers if a.requires_human]
@@ -427,11 +476,11 @@ def test_full_provider_pipeline_produces_a_correct_non_fabricating_snapshot(
 
     for field in snapshot.fields:
         assert field.required is True
-        attr_name = field_id_to_attr.get(field.field_id)
-        if attr_name is not None:
-            # Compared dynamically against real_profile's own live value --
-            # never a hardcoded literal copy of the candidate's real data.
-            assert field.current_value == getattr(real_profile, attr_name).value
+        synthetic_key = field_id_to_synthetic_key.get(field.field_id)
+        if synthetic_key is not None:
+            # Compared against the same obvious SYNTHETIC_VALUES constant
+            # used to build the profile -- never real candidate data.
+            assert field.current_value == SYNTHETIC_VALUES[synthetic_key]
         else:
             assert field.field_id == "current_company"
             assert field.current_value == ""  # never filled, never fabricated
@@ -439,5 +488,5 @@ def test_full_provider_pipeline_produces_a_correct_non_fabricating_snapshot(
     # Rendering: the five resolved fields appear as proposed values; only
     # current_company lands in the unresolved list.
     sections = snapshot_sections(snapshot)
-    assert {f.field_id for f in sections.proposed_fields} == set(field_id_to_attr)
+    assert {f.field_id for f in sections.proposed_fields} == set(field_id_to_synthetic_key)
     assert set(sections.unresolved_field_ids) == {"current_company"}
