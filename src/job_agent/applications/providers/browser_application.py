@@ -298,6 +298,16 @@ class BrowserApplicationProvider(ApplicationProvider):
             filler = FormFiller(session)
             fill_result = filler.apply_plan(plans)
 
+            # Provenance pass-through for the review snapshot -- the SAME
+            # GeneratedAnswer.source the answer engine already computed
+            # (e.g. "candidate_fact:contact_email"), never recomputed or
+            # guessed here.
+            answer_sources = {
+                plan.field.field_id: plan.answer.source
+                for plan in plans
+                if plan.answer is not None
+            }
+
             uploaded_files: tuple[UploadedFileRecord, ...] = ()
             resume_field = next((f for f in visible if f.input_type == "file"), None)
             if resume_field is not None and self._resume_path is not None:
@@ -332,6 +342,7 @@ class BrowserApplicationProvider(ApplicationProvider):
                 title=job.title,
                 uploaded_files=uploaded_files,
                 unresolved_field_ids=tuple(unresolved),
+                answer_sources=answer_sources,
             )
             self._last_snapshot[job.id] = snapshot
 
