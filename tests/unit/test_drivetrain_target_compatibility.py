@@ -36,6 +36,9 @@ from job_agent.applications.browser.filler import FormFiller
 from job_agent.applications.browser.inspector import ApplicationFormInspector
 from job_agent.applications.browser.session import BrowserSession
 from job_agent.applications.browser.snapshot import build_snapshot
+from job_agent.applications.browser.snapshot_render import snapshot_sections
+from job_agent.applications.providers.browser_application import BrowserApplicationProvider
+from job_agent.applications.rules_enforcement import evaluate_inspection
 from job_agent.applications.schema import QuestionCategory
 from job_agent.llm.provider import NullLLMProvider
 from job_agent.resume.extractor import extract_resume_text
@@ -43,6 +46,7 @@ from job_agent.resume.extractor import extract_resume_text
 pytest.importorskip("playwright.sync_api")
 
 FIXTURE_FILE = "drivetrain_business_analyst.html"
+NATIVE_FIXTURE_FILE = "drivetrain_business_analyst_native.html"
 CHROMIUM_EXECUTABLE = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
 
 pytestmark = pytest.mark.skipif(
@@ -78,6 +82,21 @@ SYNTHETIC_VALUES = {
 
 def _fixture_url(site_server: str) -> str:
     return f"{site_server}/{FIXTURE_FILE}"
+
+
+def _native_fixture_url(site_server: str) -> str:
+    return f"{site_server}/{NATIVE_FIXTURE_FILE}"
+
+
+class _DrivetrainFakeJob:
+    """Stands in for the real Job row. `company_name`/`title` are
+    genuinely-established facts (the human-provided screenshots of the
+    real posting), never invented; `id`/`application_url` never leave
+    this local process."""
+
+    id = 1
+    company_name = "Drivetrain"
+    title = "Business Analyst - Customer Platform"
 
 
 # ==========================================================================
@@ -308,3 +327,74 @@ def test_cli_still_has_no_reference_to_this_specific_target():
     test_browser_provider.py against `applications_run` specifically."""
     source = Path("src/job_agent/cli/main.py").read_text()
     assert "drivetrain" not in source.lower()
+
+
+# ==========================================================================
+# 14: full BrowserApplicationProvider pipeline against the native-HTML
+# mirror -- the "next checkpoint" review snapshot for this target. Proves
+# the ENTIRE, real, merged production path (discover -> inspect ->
+# evaluate_inspection -> get_questions -> generate_answer -> fill ->
+# get_snapshot) produces a correct, complete, non-fabricating
+# HumanReviewSnapshot for this exact screenshot-derived field set,
+# against the LOCAL fixture only -- jobs.lever.co is never contacted.
+# The provider is deliberately constructed WITHOUT a resume_path, so even
+# though the fixture has a file input, no upload is ever attempted.
+# ==========================================================================
+def test_full_provider_pipeline_produces_a_correct_non_fabricating_snapshot(
+    site_server, browser, real_config, real_profile
+):
+    url = _native_fixture_url(site_server)
+    resume_text = extract_resume_text(real_config.env.candidate_dir / "resume_master.docx")
+    bank = load_answer_bank(real_config.env.candidate_dir / "answers")
+    job = _DrivetrainFakeJob()
+
+    provider = BrowserApplicationProvider({job.id: url}, browser=browser)  # no resume_path
+
+    target = provider.discover_application(job)
+    assert target.reachable is True
+
+    inspection = provider.inspect_application(job, target)
+    assert inspection.structure_recognized is True
+    assert inspection.captcha_detected is False
+    assert inspection.mfa_detected is False
+    assert inspection.consent_required is False
+
+    verdict = evaluate_inspection(real_config.rules, inspection)
+    assert verdict.human_required is False  # the FORM STRUCTURE is fine
+
+    questions = provider.get_questions(job)
+    assert len(questions) == 6  # resume (file) excluded, exactly the 6 text/URL fields
+
+    answers = [
+        generate_answer(q, real_profile, resume_text, bank, NullLLMProvider()) for q in questions
+    ]
+    # Every individual CONTENT answer must still fail closed -- structural
+    # recognition of the form is independent of whether any of its
+    # questions can be truthfully answered.
+    assert all(a.answer is None and a.requires_human for a in answers)
+
+    state = provider.fill_application(job, target, answers)
+    assert state.answer_count == 0  # nothing was ever typed into the DOM
+
+    snapshot = provider.get_snapshot(job.id)
+    assert snapshot is not None
+    assert snapshot.company_name == "Drivetrain"
+    assert snapshot.title == "Business Analyst - Customer Platform"
+    assert snapshot.application_url == url  # honest: the LOCAL fixture, never the real URL
+    assert snapshot.uploaded_files == ()  # resume never attached/uploaded
+
+    expected_field_ids = set(EXPECTED_REQUIRED)
+    assert {f.field_id for f in snapshot.fields} == expected_field_ids
+    assert set(snapshot.required_field_ids) == expected_field_ids
+    assert snapshot.optional_field_ids == ()
+    assert set(snapshot.unresolved_field_ids) == expected_field_ids
+
+    for field in snapshot.fields:
+        assert field.current_value == ""  # never filled, never fabricated
+        assert field.required is True
+
+    # Rendering never shows a "proposed value" for any of these -- every
+    # one landed in the unresolved list, not the proposed-fields table.
+    sections = snapshot_sections(snapshot)
+    assert sections.proposed_fields == ()
+    assert set(sections.unresolved_field_ids) == expected_field_ids
