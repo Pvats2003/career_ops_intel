@@ -39,11 +39,13 @@ def _snapshot(
     uploaded_files: tuple[UploadedFileRecord, ...] = (),
     consent_selections: dict[str, bool] | None = None,
     unresolved_field_ids: tuple[str, ...] = (),
+    unattached_optional_files: tuple[SnapshotField, ...] = (),
 ) -> HumanReviewSnapshot:
     return HumanReviewSnapshot(
         job_id=job_id, company_name=company_name, title=title,
         application_url=application_url, fields=fields, uploaded_files=uploaded_files,
         consent_selections=consent_selections or {}, unresolved_field_ids=unresolved_field_ids,
+        unattached_optional_files=unattached_optional_files,
         captured_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
@@ -149,6 +151,21 @@ def test_render_separates_unresolved_fields_under_their_own_heading():
     assert "current_company" in text
 
 
+def test_render_shows_reason_for_an_unresolved_field_with_a_known_source():
+    """An unresolved field whose GeneratedAnswer.source survived into the
+    snapshot (e.g. "no_trusted_fact:current_company") shows a
+    human-readable reason next to it, not just a bare "?" -- a reviewer
+    should be able to tell WHY a field needs their input, not just THAT
+    it does."""
+    field = SnapshotField(
+        field_id="current_company", label="Current company", field_type="text",
+        required=True, current_value="", source="no_trusted_fact:current_company",
+    )
+    snap = _snapshot(fields=(field,), unresolved_field_ids=("current_company",))
+    text = _rendered_text(snap)
+    assert "Human decision required" in text
+
+
 def test_render_shows_captcha_safety_warning_prominently():
     snap = _snapshot(unresolved_field_ids=(CAPTCHA_OR_MFA_AFTER_FILL_MARKER,))
     text = _rendered_text(snap)
@@ -175,6 +192,44 @@ def test_render_shows_uploaded_file_hash_not_raw_content():
     text = _rendered_text(snap)
     assert "resume.pdf" in text
     assert "a" * 64 in text
+
+
+def test_optional_unattached_file_never_counted_as_unresolved():
+    """An optional, unattached file field (e.g. an optional resume) must
+    be visible to a reviewer, but it is NOT a blocking condition -- it
+    must never appear in unresolved_field_ids/proposed_fields, which are
+    reserved for fields that actually need a decision."""
+    resume_field = SnapshotField(
+        field_id="resume", label="Resume/CV", field_type="file",
+        required=False, current_value="",
+    )
+    snap = _snapshot(unattached_optional_files=(resume_field,))
+    sections = snapshot_sections(snap)
+    assert sections.unattached_optional_files == (resume_field,)
+    assert sections.unresolved_field_ids == ()
+    assert sections.proposed_fields == ()
+
+
+def test_render_shows_optional_unattached_file_explicitly():
+    resume_field = SnapshotField(
+        field_id="resume", label="Resume/CV", field_type="file",
+        required=False, current_value="",
+    )
+    snap = _snapshot(unattached_optional_files=(resume_field,))
+    text = _rendered_text(snap)
+    assert "Optional, not attached" in text
+    assert "Resume/CV" in text
+    assert "optional — not attached" in text
+
+
+def test_fingerprint_changes_when_unattached_optional_files_change():
+    resume_field = SnapshotField(
+        field_id="resume", label="Resume/CV", field_type="file",
+        required=False, current_value="",
+    )
+    without = _snapshot()
+    with_resume = _snapshot(unattached_optional_files=(resume_field,))
+    assert compute_snapshot_fingerprint(without) != compute_snapshot_fingerprint(with_resume)
 
 
 def test_render_never_fabricates_never_claims_submission_happened():

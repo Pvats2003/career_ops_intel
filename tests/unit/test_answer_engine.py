@@ -9,6 +9,16 @@ from job_agent.applications.answer_engine import (
     normalize_delimiter,
 )
 from job_agent.applications.schema import ApplicationQuestion, QuestionCategory
+from job_agent.candidate.schema import (
+    CandidateProfile,
+    ExperienceEntry,
+    Fact,
+    LocationPreferences,
+    SalaryPreferences,
+    TargetRoles,
+    VisaInformation,
+    WorkPreferences,
+)
 from job_agent.llm.errors import LLMOutputValidationError, LLMUnavailableError
 from job_agent.llm.provider import LLMCallMetadata, LLMProvider, NullLLMProvider
 from job_agent.resume.extractor import extract_resume_text
@@ -106,6 +116,83 @@ def test_no_bank_match_no_llm_requires_human(real_profile, resume_text, bank):
     answer = generate_answer(question, real_profile, resume_text, bank, NullLLMProvider())
     assert answer.requires_human is True
     assert answer.source == "llm_unavailable"
+
+
+# ==========================================================================
+# Real-target-readiness checkpoint: "current company" has no trusted
+# CandidateProfile fact, so without a dedicated guard it would fall
+# through to the LLM tier -- whose CANDIDATE_FACTS payload includes past
+# `experience` entries with a `company` field. An LLM asked "what is your
+# current company?" could plausibly (and wrongly) infer one from
+# experience[0]/end_date/ordering. These tests use a fully synthetic
+# CandidateProfile with a synthetic "current" experience entry (never
+# real_profile/real candidate data) and an LLM stub that raises if ever
+# called at all, proving the guard fires before the LLM is reached --
+# not merely that the LLM's own answer happens to get rejected.
+# ==========================================================================
+class _ExplodingLLM(LLMProvider):
+    def complete_json(self, **kwargs):
+        raise AssertionError(
+            "must never call the LLM for a current-company/employer question"
+        )
+
+
+def _synthetic_profile_with_current_experience() -> CandidateProfile:
+    """A fully synthetic profile whose most recent, still-ongoing
+    experience entry is exactly the shape an LLM (or a naive ordering/
+    end_date heuristic) would use to infer a "current company" --
+    deliberately constructed as the adversarial case, never real data."""
+    unknown = Fact.unknown(source="test_synthetic_profile")
+    return CandidateProfile(
+        identity_name=Fact[str](
+            value="Test Candidate", source="test_synthetic_profile",
+            confidence=1.0, verified=True,
+        ),
+        identity_current_location=unknown,
+        contact_email=unknown,
+        contact_phone=unknown,
+        contact_linkedin=unknown,
+        experience=(
+            ExperienceEntry(
+                title="Senior Analyst",
+                company="Synthetic Current Employer Inc.",
+                start_date="2022-01",
+                end_date="Present",
+                source="test_synthetic_profile",
+            ),
+        ),
+        target_roles=TargetRoles(),
+        work_preferences=WorkPreferences(
+            remote=unknown, willing_to_relocate=unknown, notice_period=unknown,
+        ),
+        location_preferences=LocationPreferences(
+            current_location=unknown, open_to_countries=unknown,
+        ),
+        salary_preferences=SalaryPreferences(
+            currency=unknown, minimum_annual=unknown,
+            target_annual=unknown, negotiable=unknown,
+        ),
+        visa_information=VisaInformation(
+            nationality=unknown, requires_sponsorship_us=unknown,
+            requires_sponsorship_uk=unknown, requires_sponsorship_eu=unknown,
+            requires_sponsorship_other=unknown,
+        ),
+    )
+
+
+@pytest.mark.parametrize("phrasing", ["Current company", "Current employer"])
+def test_current_company_question_never_reaches_llm_even_with_matching_experience(phrasing):
+    profile = _synthetic_profile_with_current_experience()
+    question = ApplicationQuestion(text=phrasing, category=QuestionCategory.CUSTOM)
+    # bank=[] -- an empty answer bank proves this isn't sourced from there
+    # either; _ExplodingLLM proves the LLM tier is never reached at all.
+    answer = generate_answer(question, profile, "", [], _ExplodingLLM())
+    assert answer.answer is None
+    assert answer.requires_human is True
+    assert answer.source == "no_trusted_fact:current_company"
+    # Never the synthetic "current" employer name, even though it is
+    # sitting right there in the profile's experience[0].
+    assert answer.answer != "Synthetic Current Employer Inc."
 
 
 class _TruthfulLLM(LLMProvider):

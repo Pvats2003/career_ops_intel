@@ -27,6 +27,21 @@ Four-tier resolution, cheapest/safest first:
    `current_company` has no such mapping — there is no dedicated trusted
    fact for it yet, so it always falls through to the tiers below (and,
    for these specific labels, to `requires_human=True`).
+
+   A narrow, deterministic guard sits right after this tier: "current
+   company"/"current employer"-shaped questions fail closed to
+   `requires_human=True` unconditionally, before the answer bank or the
+   LLM is ever consulted (see `_NO_TRUSTED_FACT_HUMAN_REQUIRED_KEYWORDS`).
+   This is not the trusted-fact resolver above — there is still no
+   `CandidateProfile.current_company` fact — it exists because the LLM
+   tier's `CANDIDATE_FACTS` payload includes past `experience` entries
+   with a `company` field, so without this guard an LLM asked "what is
+   your current company?" could plausibly infer one from `experience[0]`,
+   employment dates, or ordering. That would not be fabrication in the
+   "invented employer" sense (the company name would be real), but it is
+   still an inference this system has no basis to make, so it is blocked
+   the same way the hard-block categories are: unconditionally, never by
+   relying on the LLM's own judgment to decline.
 3. **Answer bank** (candidate/answers/*.md) — human-authored, already
    truthful, already reviewed. Used verbatim when the question matches a
    known slug; if that entry itself says `requires_human: true` (e.g.
@@ -126,6 +141,19 @@ _TRUSTED_IDENTITY_FACT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("contact_phone", ("phone number", "phone")),
     ("identity_current_location", ("current location",)),
     ("contact_linkedin", ("linkedin url", "linkedin")),
+)
+
+# Phase 6D real-target checkpoint. Deliberately NOT a trusted fact (there
+# is no CandidateProfile.current_company): a question matching one of
+# these phrases fails closed to requires_human=True unconditionally,
+# skipping the answer bank AND the LLM tier entirely. Without this, the
+# LLM tier's CANDIDATE_FACTS payload (which includes past `experience`
+# entries with a `company` field) could let an LLM plausibly-but-wrongly
+# infer a "current" company from experience[0], employment dates, or
+# ordering. Narrow, exact-phrase matching only — same reasoning as
+# excluding bare "name"/"location" from the trusted-fact keywords above.
+_NO_TRUSTED_FACT_HUMAN_REQUIRED_KEYWORDS: tuple[str, ...] = (
+    "current company", "current employer",
 )
 
 
@@ -271,6 +299,24 @@ def generate_answer(
             validated=True,
             validation_notes=(
                 f"{attr_name} is not a verified candidate fact — never guessed",
+            ),
+        )
+
+    if any(
+        contains_keyword(question.text, kw)
+        for kw in _NO_TRUSTED_FACT_HUMAN_REQUIRED_KEYWORDS
+    ):
+        return GeneratedAnswer(
+            question=question.text,
+            category=category,
+            answer=None,
+            confidence=0.0,
+            source="no_trusted_fact:current_company",
+            requires_human=True,
+            validated=True,
+            validation_notes=(
+                "no trusted candidate fact exists for current company/employer — "
+                "never inferred from experience, employment dates, or job ordering",
             ),
         )
 

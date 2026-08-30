@@ -62,7 +62,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from job_agent.applications.browser.answer_planner import AnswerPlanner
-from job_agent.applications.browser.field_mapper import DynamicFieldMapper
+from job_agent.applications.browser.field_mapper import DynamicFieldMapper, question_text
 from job_agent.applications.browser.file_upload import FileUploadHandler
 from job_agent.applications.browser.filler import FormFiller
 from job_agent.applications.browser.inspector import ApplicationFormInspector
@@ -301,11 +301,19 @@ class BrowserApplicationProvider(ApplicationProvider):
             # Provenance pass-through for the review snapshot -- the SAME
             # GeneratedAnswer.source the answer engine already computed
             # (e.g. "candidate_fact:contact_email"), never recomputed or
-            # guessed here.
+            # guessed here. Matched against the ORIGINAL `answers` list
+            # (not `plans`) so a field AnswerPlanner declined to fill
+            # because its answer requires human input (e.g. "Current
+            # company") still carries its source into the snapshot --
+            # AnswerPlanner nulls FieldPlan.answer for those on purpose
+            # (see its module docstring), but that is a fill-eligibility
+            # decision, not a reason to also hide from a human reviewer
+            # WHY the field was left unresolved.
+            answers_by_question_text = {a.question: a for a in answers}
             answer_sources = {
-                plan.field.field_id: plan.answer.source
-                for plan in plans
-                if plan.answer is not None
+                f.field_id: answers_by_question_text[question_text(f)].source
+                for f in visible
+                if question_text(f) in answers_by_question_text
             }
 
             uploaded_files: tuple[UploadedFileRecord, ...] = ()

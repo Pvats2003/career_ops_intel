@@ -56,6 +56,7 @@ class SnapshotSections:
     safety_warning: str | None
     consent_selections: tuple[tuple[str, bool], ...]
     fingerprint: str
+    unattached_optional_files: tuple[SnapshotField, ...]
 
 
 def _source_label(source: str) -> str:
@@ -70,7 +71,7 @@ def _source_label(source: str) -> str:
         return "[green]✓ Answer bank[/green]"
     if source.startswith("llm:"):
         return "[cyan]✓ LLM-generated (validated)[/cyan]"
-    if source.startswith("hard_block:"):
+    if source.startswith("hard_block:") or source.startswith("no_trusted_fact:"):
         return "[yellow]? Human decision required[/yellow]"
     if not source:
         return "[dim](n/a)[/dim]"
@@ -105,6 +106,7 @@ def snapshot_sections(snapshot: HumanReviewSnapshot) -> SnapshotSections:
         safety_warning=safety_warning,
         consent_selections=consent,
         fingerprint=compute_snapshot_fingerprint(snapshot),
+        unattached_optional_files=snapshot.unattached_optional_files,
     )
 
 
@@ -149,6 +151,9 @@ def render_snapshot(snapshot: HumanReviewSnapshot, console: Console) -> None:
                     f"  [yellow]?[/yellow] {fid} — {label} "
                     "[red](sensitive — password field, not supported for automated filling)[/red]"
                 )
+            elif field is not None and field.source:
+                reason = _source_label(field.source)
+                console.print(f"  [yellow]?[/yellow] {fid} — {label} ({reason})")
             else:
                 console.print(f"  [yellow]?[/yellow] {fid} — {label}")
 
@@ -157,6 +162,11 @@ def render_snapshot(snapshot: HumanReviewSnapshot, console: Console) -> None:
         for field_id, selected in sections.consent_selections:
             state = "[green]checked[/green]" if selected else "[red]NOT checked[/red]"
             console.print(f"  {field_id}: {state}")
+
+    if sections.unattached_optional_files:
+        console.print("\n[dim bold]Optional, not attached:[/dim bold]")
+        for f in sections.unattached_optional_files:
+            console.print(f"  {f.field_id} — {f.label} [dim](optional — not attached)[/dim]")
 
     if snapshot.uploaded_files:
         console.print("\n[bold]Uploaded files:[/bold]")

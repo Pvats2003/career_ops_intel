@@ -319,12 +319,17 @@ def test_answer_engine_resolves_five_trusted_fields_and_fails_closed_for_current
             assert answer.requires_human is False, question.text
             assert answer.source == f"candidate_fact:{attr_name}", question.text
         else:
-            # "Current company" -- no trusted fact exists for it; must
-            # still fail closed exactly as every field used to.
+            # "Current company" -- no trusted fact exists for it, and (as
+            # of the real-target-readiness checkpoint) it is never even
+            # forwarded to the LLM/answer-bank tiers: a deterministic
+            # guard in answer_engine fails it closed unconditionally, so
+            # its source is "no_trusted_fact:current_company", never
+            # "llm_unavailable" (which would only appear if the LLM tier
+            # had actually been reached).
             assert question.text == "Current company", question.text
             assert answer.answer is None, question.text
             assert answer.requires_human is True, question.text
-            assert answer.source == "llm_unavailable", question.text
+            assert answer.source == "no_trusted_fact:current_company", question.text
 
 
 # ==========================================================================
@@ -566,6 +571,12 @@ def test_local_end_to_end_prepare_to_human_review_snapshot_demonstration(
     assert current_company_answer.answer is None
     assert current_company_answer.requires_human is True
     assert not current_company_answer.source.startswith("candidate_fact")
+    # Real-target-readiness checkpoint: deterministically fails closed
+    # BEFORE the LLM tier -- never "llm_unavailable"/"llm:<model>", which
+    # would mean the LLM (with full access to `experience` company names)
+    # had actually been asked and could have plausibly-but-wrongly
+    # inferred a "current" employer from experience[0]/ordering/dates.
+    assert current_company_answer.source == "no_trusted_fact:current_company"
 
     # 6: fill_application() -- only the five trusted fields are ever typed
     state = provider.fill_application(job, target, list(answers.values()))
@@ -586,7 +597,11 @@ def test_local_end_to_end_prepare_to_human_review_snapshot_demonstration(
         assert field.source == f"candidate_fact:{attr_name}"
     current_company_field = next(f for f in snapshot.fields if f.field_id == "current_company")
     assert current_company_field.current_value == ""  # never inferred, never fabricated
-    assert current_company_field.source == ""  # no answer was ever associated with it
+    # Real-target-readiness checkpoint: the field's source now flows into
+    # the snapshot even though no VALUE was ever typed (AnswerPlanner
+    # still never fills it), so a human reviewer can see WHY it's
+    # unresolved, not just THAT it's unresolved.
+    assert current_company_field.source == "no_trusted_fact:current_company"
 
     # 8: render the HumanReviewSnapshot using the existing rendering path
     import io
@@ -607,3 +622,10 @@ def test_local_end_to_end_prepare_to_human_review_snapshot_demonstration(
     assert "structurally unavailable" in rendered  # submission remains impossible
     # Every proposed value now carries explicit, human-readable provenance.
     assert rendered.count("Trusted candidate fact") == 5
+    # "Current company" is disclosed as needing human input WITH a reason,
+    # never just a bare "?" with no explanation.
+    assert "Human decision required" in rendered
+    # Resume/CV: optional and never uploaded -- disclosed explicitly as
+    # such, not silently omitted from the review output entirely.
+    assert "Optional, not attached" in rendered
+    assert "resume" in rendered.lower()
