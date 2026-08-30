@@ -115,6 +115,16 @@ class HumanReviewSnapshot(BaseModel):
     required_field_ids: tuple[str, ...] = Field(default_factory=tuple)
     optional_field_ids: tuple[str, ...] = Field(default_factory=tuple)
     unresolved_field_ids: tuple[str, ...] = Field(default_factory=tuple)
+    # A visible, OPTIONAL file-type field (e.g. an optional resume upload)
+    # that was never attached -- disclosed explicitly rather than silently
+    # omitted, so a human reviewer can see "this field exists and nothing
+    # was attached to it" instead of the field simply not appearing
+    # anywhere. Deliberately separate from `fields`/`unresolved_field_ids`:
+    # an optional field left empty is not a blocking condition (unlike a
+    # REQUIRED field with no answer), so it must never be counted toward
+    # "needs your input". A REQUIRED, unattached file field is NOT covered
+    # by this list -- see build_snapshot()'s docstring.
+    unattached_optional_files: tuple[SnapshotField, ...] = Field(default_factory=tuple)
     captured_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -132,6 +142,9 @@ def compute_snapshot_fingerprint(snapshot: HumanReviewSnapshot) -> str:
     )
     parts += sorted(f"consent:{k}={v}" for k, v in snapshot.consent_selections.items())
     parts += sorted(f"unresolved:{fid}" for fid in snapshot.unresolved_field_ids)
+    parts += sorted(
+        f"unattached_optional_file:{f.field_id}" for f in snapshot.unattached_optional_files
+    )
     digest_input = "|".join(parts)
     return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
 
@@ -188,18 +201,40 @@ def build_snapshot(
     already computed -- this function does not invent, infer, or alter
     any of it. A field with no entry (never filled, or the caller passed
     none) gets an empty `source`; that is the honest, non-fabricating
-    default, never a guessed label."""
+    default, never a guessed label.
+
+    A visible, OPTIONAL file-type field with nothing in `uploaded_files`
+    is reported in `unattached_optional_files` rather than silently
+    dropped -- see that field's docstring. A REQUIRED, unattached file
+    field is still dropped exactly as before this addition (a known,
+    reported limitation, not a silent gap this function claims to have
+    fixed -- see the module's callers for the current honest handling)."""
     inspector = ApplicationFormInspector()
     inspection = inspector.inspect(session)
     sources: Mapping[str, str] = answer_sources or {}
+    uploaded_field_ids = {u.field_id for u in uploaded_files}
 
     fields: list[SnapshotField] = []
+    unattached_optional_files: list[SnapshotField] = []
     consent_selections: dict[str, bool] = {}
     required_ids: list[str] = []
     optional_ids: list[str] = []
     sensitive_ids: list[str] = []
     for f in inspection.fields:
-        if not f.visible or f.input_type == "file":
+        if not f.visible:
+            continue
+        if f.input_type == "file":
+            if not f.required and f.field_id not in uploaded_field_ids:
+                unattached_optional_files.append(
+                    SnapshotField(
+                        field_id=f.field_id,
+                        label=f.label,
+                        field_type=f.input_type,
+                        required=f.required,
+                        current_value="",
+                        source="",
+                    )
+                )
             continue
         value = _current_value(session, f)
         fields.append(
@@ -239,5 +274,6 @@ def build_snapshot(
         required_field_ids=tuple(required_ids),
         optional_field_ids=tuple(optional_ids),
         unresolved_field_ids=all_unresolved,
+        unattached_optional_files=tuple(unattached_optional_files),
         captured_at=datetime.now(UTC),
     )
