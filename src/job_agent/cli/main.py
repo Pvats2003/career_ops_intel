@@ -36,9 +36,17 @@ from job_agent.applications.answer_engine import generate_answer
 from job_agent.applications.approvals import compute_answer_fingerprint, create_approval
 from job_agent.applications.browser.snapshot_render import render_snapshot
 from job_agent.applications.errors import ProviderError
+from job_agent.applications.human_input import (
+    HUMAN_INPUT_SOURCE_PREFIX,
+    apply_human_input_overrides,
+)
 from job_agent.applications.provider import ManualReviewProvider
 from job_agent.applications.providers.browser_application import BrowserApplicationProvider
-from job_agent.applications.repository import get_answers, get_latest_event
+from job_agent.applications.repository import (
+    get_answers,
+    get_latest_event,
+    get_or_create_application,
+)
 from job_agent.applications.rules_enforcement import evaluate_inspection
 from job_agent.applications.schema import ApplicationStatus
 from job_agent.applications.service import (
@@ -56,6 +64,9 @@ from job_agent.db.models import Application, ApplicationAllowlistEntry, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
+from job_agent.jobs.repository import get_or_create_job_source, upsert_job
+from job_agent.jobs.schema import FreshnessStatus
+from job_agent.jobs.schema import Job as JobTargetSchema
 from job_agent.jobs.service import run_scan
 from job_agent.llm.provider import NullLLMProvider, build_llm_provider
 from job_agent.logging.setup import configure_logging, get_logger, log_event, redact_text
@@ -635,6 +646,83 @@ def applications_review() -> None:
                     console.print(f"      {note}")
 
 
+@applications_app.command("target-add")
+def applications_target_add(
+    url: str = typer.Option(
+        ..., "--url", help="Exact application-form URL for this one target. Stored exactly "
+        "as given -- never crawled, never fetched, no network call is made.",
+    ),
+    company: str = typer.Option(..., "--company", help="Company name (display only)."),
+    title: str = typer.Option(..., "--title", help="Job title (display only)."),
+    location: str = typer.Option(
+        "", "--location", help="Optional location (display only)."
+    ),
+) -> None:
+    """Register exactly ONE explicit job target for local preparation --
+    the minimum Job + Application metadata `applications browser-preview`
+    needs, so a real target URL can be used without hand-constructing
+    database rows. Makes NO network call and discovers NO other jobs:
+    reuses the existing job-persistence path (`jobs.repository.
+    upsert_job`) under a dedicated, disabled "manual" JobSource, so this
+    can never be picked up by `jobs scan` -- that command builds its
+    adapters entirely from config.sources, never from JobSource DB rows.
+
+    Writes ONLY local metadata: no inspection, no form filling, no resume
+    upload, no approval, no allowlist entry, and no submission of any
+    kind. Run `applications browser-preview <application id> --url
+    <url> --confirm` next to actually inspect and prepare against it.
+    """
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    try:
+        profile = parse_candidate_profile(cfg)
+    except CandidateParseError as exc:
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
+        raise typer.Exit(code=1) from exc
+
+    # source_job_id=url (not an auto-incrementing counter or a random
+    # id): this is the SAME (source_id, source_job_id) identity key
+    # upsert_job already uses for dedup, so registering the identical
+    # --url twice updates the existing row rather than creating a
+    # duplicate, with no new logic required here.
+    manual_job = JobTargetSchema(
+        source="manual",
+        source_job_id=url,
+        company=company,
+        title=title,
+        location=location or None,
+        application_url=url,
+    )
+
+    with session_factory() as session:
+        candidate_id = save_candidate_profile(session, profile)
+        source_row = get_or_create_job_source(
+            session, name="manual", kind="manual", enabled=False
+        )
+        job_row, job_created = upsert_job(
+            session, manual_job, source_row=source_row,
+            freshness_status=FreshnessStatus.UNKNOWN_POST_DATE,
+        )
+        application, app_created = get_or_create_application(
+            session, job_row.id, candidate_id, dry_run=cfg.dry_run,
+        )
+        session.commit()
+        job_id = job_row.id
+        application_id = application.id
+
+    console.print(
+        f"[green]Target registered.[/green] job id {job_id} "
+        f"({'new' if job_created else 'existing, updated'}), application id {application_id} "
+        f"({'new' if app_created else 'existing'}).\n"
+        f"  Company: {company}\n  Title: {title}\n  URL: {url}\n\n"
+        "Next:\n"
+        f'  job-agent applications browser-preview {application_id} --url "{url}" --confirm'
+    )
+
+
 @applications_app.command("browser-preview")
 def applications_browser_preview(
     application_id: int = typer.Argument(..., help="Application id to preview."),
@@ -650,6 +738,19 @@ def applications_browser_preview(
         "--confirm",
         help="Actually launch a browser and contact --url; without this, reports what "
         "would happen and makes no network call.",
+    ),
+    # The standard typer repeatable-option pattern; ruff's built-in typer
+    # exemption for B008 doesn't cover a list[...]-typed default.
+    answer: list[str] | None = typer.Option(  # noqa: B008
+        None,
+        "--answer",
+        help='Human-supplied answer for a question that is CURRENTLY unresolved, as '
+        '"<question text>=<value>" (e.g. "Current company=Instawork"). May be repeated. '
+        "Applied only to a question the answer engine already left requires_human=True — "
+        "a question already resolved from a trusted fact, the answer bank, or the LLM is "
+        "never overridden. Never written to CandidateProfile, never sent to the LLM (this "
+        "runs after every answer has already been generated), and shown in the review "
+        'output with "Source: Human input", always distinguishable from a trusted fact.',
     ),
 ) -> None:
     """Build and render a HumanReviewSnapshot for ONE application (Phase 6D
@@ -668,6 +769,15 @@ def applications_browser_preview(
     writes nothing to the database and does not compete with
     `applications prepare` for ownership of an application's status.
     """
+    human_input_overrides: dict[str, str] = {}
+    for entry in answer or []:
+        if "=" not in entry:
+            console.print(
+                f'[red]--answer must be "<question text>=<value>", got:[/red] {entry!r}'
+            )
+            raise typer.Exit(code=1)
+        question_label, _, value = entry.partition("=")
+        human_input_overrides[question_label] = value
     if not confirm:
         console.print(
             "[yellow]No action taken.[/yellow] Pass --confirm to actually contact "
@@ -719,9 +829,18 @@ def applications_browser_preview(
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             try:
-                provider = BrowserApplicationProvider(
-                    {job.id: url}, browser=browser, resume_path=resume_path,
-                )
+                # Real-target-readiness checkpoint: resume_path is
+                # DELIBERATELY never passed here. Passing it would make
+                # BrowserApplicationProvider.fill_application() attach the
+                # resume automatically the instant a file field is
+                # visible -- with no check for whether that field is even
+                # required. `resume_text` above is still extracted and
+                # used for LLM answer validation (checking a claim
+                # against the resume's actual content), which is
+                # unrelated to file upload. Attaching a resume is a
+                # separate, explicit action a human takes later, not an
+                # automatic side effect of previewing an application.
+                provider = BrowserApplicationProvider({job.id: url}, browser=browser)
                 target = provider.discover_application(job)
                 if not target.reachable:
                     console.print(f"[red]Could not reach target:[/red] {target.detail}")
@@ -741,6 +860,16 @@ def applications_browser_preview(
                     generate_answer(q, profile, resume_text, answer_bank, llm)
                     for q in questions
                 ]
+                answers = apply_human_input_overrides(answers, human_input_overrides)
+                applied_labels = {
+                    a.question for a in answers if a.source.startswith(HUMAN_INPUT_SOURCE_PREFIX)
+                }
+                for label in set(human_input_overrides) - applied_labels:
+                    console.print(
+                        f"[yellow]--answer {label!r} was not applied[/yellow] — either no "
+                        "question on this form has that exact text, or it was already "
+                        "resolved (a trusted fact/answer-bank/LLM answer is never overridden)."
+                    )
                 provider.fill_application(job, target, answers)
                 snapshot = provider.get_snapshot(job.id)
             except ProviderError as exc:

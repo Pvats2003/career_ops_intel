@@ -166,6 +166,45 @@ def test_render_shows_reason_for_an_unresolved_field_with_a_known_source():
     assert "Human decision required" in text
 
 
+def test_render_shows_human_input_label_distinct_from_trusted_fact():
+    """A human-supplied override (source starts with "human_input:") must
+    render with its own distinct label -- never conflated with a trusted
+    CandidateProfile fact, even though both appear as resolved/proposed
+    values in the same table."""
+    trusted = SnapshotField(
+        field_id="email", label="Email", field_type="text", required=True,
+        current_value="test@example.invalid", source="candidate_fact:contact_email",
+    )
+    human = SnapshotField(
+        field_id="current_company", label="Current company", field_type="text",
+        required=True, current_value="Instawork", source="human_input:Current company",
+    )
+    snap = _snapshot(fields=(trusted, human))
+    text = _rendered_text(snap)
+    assert "Trusted candidate fact" in text
+    assert "Human input" in text
+    # Never shown as a trusted fact just because it sits in the same table.
+    assert "candidate_fact:" not in text  # raw source strings are never printed verbatim
+
+
+def test_a_field_resolved_by_answer_engine_but_still_unfilled_is_labeled_unsupported():
+    """A field can carry a "resolved-looking" source (e.g.
+    candidate_fact:/human_input:) and STILL end up unresolved, when
+    AnswerPlanner vetoes it for a reason unrelated to the answer itself
+    (currently: multiselect, which FormFiller has no fill branch for).
+    That must never be shown with the same badge a genuinely resolved
+    field gets -- it is UNSUPPORTED, not a trusted fact sitting right
+    there unfilled."""
+    field = SnapshotField(
+        field_id="skills", label="Skills", field_type="multiselect", required=True,
+        current_value="", source="candidate_fact:some_fact",
+    )
+    snap = _snapshot(fields=(field,), unresolved_field_ids=("skills",))
+    text = _rendered_text(snap)
+    assert "Unsupported" in text
+    assert "Trusted candidate fact" not in text
+
+
 def test_render_shows_captcha_safety_warning_prominently():
     snap = _snapshot(unresolved_field_ids=(CAPTCHA_OR_MFA_AFTER_FILL_MARKER,))
     text = _rendered_text(snap)

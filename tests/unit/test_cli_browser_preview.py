@@ -348,6 +348,117 @@ def test_happy_path_renders_snapshot_five_trusted_fields_resolved_current_compan
     # field id silently disappears from the rendered output.
     assert "current_company" in result.output
     assert "structurally unavailable" in result.output
+    # Real-target-readiness checkpoint: the resume must never be
+    # auto-attached just because resume_master.docx happens to exist in
+    # the candidate dir -- it is disclosed as optional and unattached,
+    # not silently uploaded.
+    assert "Uploaded files" not in result.output
+    assert "Optional, not attached" in result.output
+    # Real-target-readiness checkpoint: unresolved "Current company" is
+    # disclosed WITH a reason, not just a bare unexplained "?".
+    assert "Human decision required" in result.output
+
+
+# ==========================================================================
+# Real-target-readiness checkpoint: --answer lets a human resolve a
+# CURRENTLY unresolved question (e.g. "Current company") at review time,
+# without ever touching CandidateProfile or the LLM, and always
+# distinguishable in the output from a trusted candidate fact.
+# ==========================================================================
+def test_answer_override_resolves_current_company_and_is_labeled_human_input(
+    tmp_path, monkeypatch, real_config, patched_sync_playwright, site_server
+):
+    db_path = _configure_env(tmp_path, monkeypatch, real_config)
+    url = _drivetrain_native_url(site_server)
+    application_id, _ = _seed_application(
+        db_path, _synthetic_identity_profile(), application_url=url,
+        fingerprint="human-input-override",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "applications", "browser-preview", str(application_id),
+            "--url", url, "--confirm", "--answer", "Current company=Instawork",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Instawork" in result.output
+    assert "Human input" in result.output
+    # The five trusted fields are STILL trusted facts -- an unrelated
+    # override never changes how they resolved.
+    for synthetic_value in SYNTHETIC_VALUES.values():
+        assert synthetic_value in result.output
+    assert result.output.count("Trusted candidate fact") == 5
+    # "Current company" is now fully resolved -- with it filled in,
+    # nothing on this form remains unresolved at all.
+    assert "Needs your input" not in result.output
+
+
+def test_without_answer_override_current_company_still_needs_human_input(
+    tmp_path, monkeypatch, real_config, patched_sync_playwright, site_server
+):
+    """Baseline: omitting --answer entirely leaves "Current company"
+    exactly as unresolved as before -- the override mechanism is opt-in,
+    never a default behavior change."""
+    db_path = _configure_env(tmp_path, monkeypatch, real_config)
+    url = _drivetrain_native_url(site_server)
+    application_id, _ = _seed_application(
+        db_path, _synthetic_identity_profile(), application_url=url,
+        fingerprint="no-override",
+    )
+
+    result = runner.invoke(
+        app, ["applications", "browser-preview", str(application_id), "--url", url, "--confirm"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Instawork" not in result.output
+    assert "Human input" not in result.output
+    assert "Human decision required" in result.output
+
+
+def test_answer_override_never_modifies_an_already_resolved_trusted_fact(
+    tmp_path, monkeypatch, real_config, patched_sync_playwright, site_server
+):
+    """A human cannot use --answer to silently override a field the
+    system already resolved from a trusted CandidateProfile fact."""
+    db_path = _configure_env(tmp_path, monkeypatch, real_config)
+    url = _drivetrain_native_url(site_server)
+    application_id, _ = _seed_application(
+        db_path, _synthetic_identity_profile(), application_url=url,
+        fingerprint="override-rejected",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "applications", "browser-preview", str(application_id),
+            "--url", url, "--confirm", "--answer", "Email=attacker@example.test",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "attacker@example.test" not in result.output
+    assert SYNTHETIC_VALUES["email"] in result.output
+    assert "was not applied" in result.output
+
+
+def test_malformed_answer_option_rejected_before_any_network_call(
+    tmp_path, monkeypatch, real_config, patched_sync_playwright
+):
+    _configure_env(tmp_path, monkeypatch, real_config)
+    result = runner.invoke(
+        app,
+        [
+            "applications", "browser-preview", "1",
+            "--url", "https://example.test/apply", "--confirm",
+            "--answer", "no-equals-sign-here",
+        ],
+    )
+    assert result.exit_code == 1
+    assert patched_sync_playwright == []
 
 
 def test_captcha_scenario_stops_before_filling_anything(
