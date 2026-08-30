@@ -98,11 +98,35 @@ def test_field_with_neither_id_nor_name_is_never_discovered(site_server, browser
     snap = _inspect(site_server, browser, GENERIC_FIXTURE)
     labels = {f.label for f in snap.fields}
     assert "Ignore me, I have no identity" not in labels
-    # Exactly the seven addressable fields — nothing invented, nothing lost.
+    # Exactly the nine addressable fields — nothing invented, nothing lost.
+    # "tracking_id" (type="hidden") is deliberately absent: see
+    # test_hidden_input_is_never_discovered below.
     assert {f.field_id for f in snap.fields} == {
-        "full_name", "bio", "newsletter", "nickname", "country",
-        "contact_pref", "consent",
+        "full_name", "start_date", "bio", "newsletter", "nickname",
+        "country", "contact_pref", "consent",
     }
+
+
+def test_hidden_input_is_never_discovered(site_server, browser):
+    """A type="hidden" input must never appear in discovered fields at
+    all -- not filtered out after the fact, structurally excluded by the
+    generic-path selector itself (_GENERIC_INPUT_EXCLUDED_TYPES). A real
+    ATS embeds session/CSRF state in hidden inputs; treating one as a
+    fillable "question" would be a correctness and safety bug, not a
+    convenience gap."""
+    snap = _inspect(site_server, browser, GENERIC_FIXTURE)
+    assert "tracking_id" not in {f.field_id for f in snap.fields}
+
+
+def test_unrecognized_native_input_type_falls_back_to_generic_text(site_server, browser):
+    """type="date" has no dedicated branch in _resolve_input_type -- it
+    must fall through to the generic "text" classification safely
+    (discovered, not dropped, not crashed on, not misclassified as
+    something more sensitive like "password" or "file")."""
+    snap = _inspect(site_server, browser, GENERIC_FIXTURE)
+    start_date = next(f for f in snap.fields if f.field_id == "start_date")
+    assert start_date.input_type == "text"
+    assert start_date.required is False
 
 
 def test_native_select_discovered_with_options(site_server, browser):

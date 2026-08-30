@@ -36,6 +36,7 @@ normal, resolved application question.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -86,6 +87,15 @@ class SnapshotField(BaseModel):
     field_type: str
     required: bool
     current_value: str
+    # Provenance for a RESOLVED field's current_value -- e.g.
+    # "candidate_fact:contact_email", "answer_bank:strengths",
+    # "llm:claude-...". Empty string for a field with no associated
+    # answer (never filled, or the value came from something other than
+    # the answer-resolution pipeline, e.g. a pre-existing DOM value).
+    # This is the SAME GeneratedAnswer.source string already computed
+    # by the existing, unmodified answer engine -- not a new provenance
+    # system, just carrying an existing fact through to the review layer.
+    source: str = ""
 
 
 class HumanReviewSnapshot(BaseModel):
@@ -168,11 +178,20 @@ def build_snapshot(
     title: str,
     uploaded_files: tuple[UploadedFileRecord, ...] = (),
     unresolved_field_ids: tuple[str, ...] = (),
+    answer_sources: Mapping[str, str] | None = None,
 ) -> HumanReviewSnapshot:
     """Re-inspects the live DOM (never a cached plan) and assembles the
-    final snapshot from what's actually there right now."""
+    final snapshot from what's actually there right now.
+
+    `answer_sources` (field_id -> GeneratedAnswer.source) is a plain
+    pass-through of provenance the caller's answer-resolution pipeline
+    already computed -- this function does not invent, infer, or alter
+    any of it. A field with no entry (never filled, or the caller passed
+    none) gets an empty `source`; that is the honest, non-fabricating
+    default, never a guessed label."""
     inspector = ApplicationFormInspector()
     inspection = inspector.inspect(session)
+    sources: Mapping[str, str] = answer_sources or {}
 
     fields: list[SnapshotField] = []
     consent_selections: dict[str, bool] = {}
@@ -190,6 +209,7 @@ def build_snapshot(
                 field_type=f.input_type,
                 required=f.required,
                 current_value=value,
+                source=sources.get(f.field_id, ""),
             )
         )
         if f.is_consent:

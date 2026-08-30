@@ -577,11 +577,16 @@ def test_local_end_to_end_prepare_to_human_review_snapshot_demonstration(
     assert snapshot.uploaded_files == ()  # Resume/CV: never uploaded, HUMAN_REQUIRED by omission
     assert all(f.field_type != "password" for f in snapshot.fields)  # no password anywhere
     assert set(snapshot.unresolved_field_ids) == {"current_company"}
-    for _attr_name, synthetic_key in trusted_mapping.values():
+    for attr_name, synthetic_key in trusted_mapping.values():
         field = next(f for f in snapshot.fields if f.field_id == synthetic_key)
         assert field.current_value == SYNTHETIC_VALUES[synthetic_key]
+        # Provenance now flows all the way into the snapshot itself, not
+        # just the intermediate GeneratedAnswer -- the same source
+        # string, never recomputed.
+        assert field.source == f"candidate_fact:{attr_name}"
     current_company_field = next(f for f in snapshot.fields if f.field_id == "current_company")
     assert current_company_field.current_value == ""  # never inferred, never fabricated
+    assert current_company_field.source == ""  # no answer was ever associated with it
 
     # 8: render the HumanReviewSnapshot using the existing rendering path
     import io
@@ -600,3 +605,5 @@ def test_local_end_to_end_prepare_to_human_review_snapshot_demonstration(
     assert SYNTHETIC_VALUES["current_company"] not in rendered  # never inferred/typed
     assert "current_company" in rendered  # disclosed as needing human input, never hidden
     assert "structurally unavailable" in rendered  # submission remains impossible
+    # Every proposed value now carries explicit, human-readable provenance.
+    assert rendered.count("Trusted candidate fact") == 5

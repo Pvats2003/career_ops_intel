@@ -58,6 +58,25 @@ class SnapshotSections:
     fingerprint: str
 
 
+def _source_label(source: str) -> str:
+    """Human-readable rendering of a SnapshotField's raw provenance
+    string (the same `GeneratedAnswer.source` the answer engine already
+    computed) -- a display mapping only, never a second classification
+    system. An unrecognized/empty source is shown honestly as unknown,
+    never guessed at."""
+    if source.startswith("candidate_fact:"):
+        return "[green]✓ Trusted candidate fact[/green]"
+    if source.startswith("answer_bank:"):
+        return "[green]✓ Answer bank[/green]"
+    if source.startswith("llm:"):
+        return "[cyan]✓ LLM-generated (validated)[/cyan]"
+    if source.startswith("hard_block:"):
+        return "[yellow]? Human decision required[/yellow]"
+    if not source:
+        return "[dim](n/a)[/dim]"
+    return f"[dim]{source}[/dim]"
+
+
 def snapshot_sections(snapshot: HumanReviewSnapshot) -> SnapshotSections:
     """Deterministic ordering: fields sorted by field_id (not DOM
     discovery order, which is an implementation detail of a given page
@@ -110,10 +129,12 @@ def render_snapshot(snapshot: HumanReviewSnapshot, console: Console) -> None:
     table.add_column("Type")
     table.add_column("Required")
     table.add_column("Proposed value")
+    table.add_column("Source")
     for f in sections.proposed_fields:
         table.add_row(
             f.field_id, f.label, f.field_type,
             "yes" if f.required else "no", f.current_value or "[dim](empty)[/dim]",
+            _source_label(f.source),
         )
     console.print(table)
 
