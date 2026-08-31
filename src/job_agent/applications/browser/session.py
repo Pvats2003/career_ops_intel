@@ -135,9 +135,33 @@ class BrowserSession:
         self._page.click(selector)
         self._assert_on_bound_origin()  # a click can itself trigger navigation
 
+    def click_submit_control(self, selector: str) -> None:
+        """The ONE place in this class where a real submit-shaped click
+        is an intended, named action rather than something structurally
+        excluded — used ONLY by `job_agent.applications.browser.
+        submit_control`'s deterministic, evidence-based control finder,
+        after every safety check (approval validity, fresh security
+        posture, unambiguous high-confidence control identification) has
+        already passed. Mechanically identical to `click()`; kept as a
+        separate, clearly-named method so a `grep` for "submit" finds
+        every real submit-click site in this codebase, and so this one
+        call site can never be confused with `click()`'s own
+        conditional-section-reveal purpose."""
+        self._assert_on_bound_origin()
+        self._page.click(selector)
+        self._assert_on_bound_origin()  # a submit click can itself trigger navigation
+
     def content(self) -> str:
         self._assert_on_bound_origin()
         return self._page.content()
+
+    def visible_text(self) -> str:
+        """Rendered, visible text only (never raw HTML source) — used by
+        post-submit confirmation checks so a phrase sitting inside a
+        hidden element, a `<script>` block, or an HTML comment can never
+        count as evidence."""
+        self._assert_on_bound_origin()
+        return self._page.inner_text("body")
 
     def close(self) -> None:
         self._context.close()

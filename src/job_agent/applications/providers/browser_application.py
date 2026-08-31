@@ -64,7 +64,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from job_agent.applications.browser.answer_planner import AnswerPlanner
 from job_agent.applications.browser.field_mapper import DynamicFieldMapper, question_text
 from job_agent.applications.browser.file_upload import FileUploadHandler
-from job_agent.applications.browser.filler import FormFiller
+from job_agent.applications.browser.filler import FillResult, FormFiller
 from job_agent.applications.browser.inspector import ApplicationFormInspector
 from job_agent.applications.browser.session import BrowserSession
 from job_agent.applications.browser.snapshot import (
@@ -291,68 +291,7 @@ class BrowserApplicationProvider(ApplicationProvider):
 
         with BrowserSession(target_url, browser=self._browser) as session:
             session.load()
-            inspection = ApplicationFormInspector().inspect(session)
-            visible = tuple(f for f in inspection.fields if f.visible)
-
-            plans = AnswerPlanner().plan(visible, answers)
-            filler = FormFiller(session)
-            fill_result = filler.apply_plan(plans)
-
-            # Provenance pass-through for the review snapshot -- the SAME
-            # GeneratedAnswer.source the answer engine already computed
-            # (e.g. "candidate_fact:contact_email"), never recomputed or
-            # guessed here. Matched against the ORIGINAL `answers` list
-            # (not `plans`) so a field AnswerPlanner declined to fill
-            # because its answer requires human input (e.g. "Current
-            # company") still carries its source into the snapshot --
-            # AnswerPlanner nulls FieldPlan.answer for those on purpose
-            # (see its module docstring), but that is a fill-eligibility
-            # decision, not a reason to also hide from a human reviewer
-            # WHY the field was left unresolved.
-            answers_by_question_text = {a.question: a for a in answers}
-            answer_sources = {
-                f.field_id: answers_by_question_text[question_text(f)].source
-                for f in visible
-                if question_text(f) in answers_by_question_text
-            }
-
-            uploaded_files: tuple[UploadedFileRecord, ...] = ()
-            resume_field = next((f for f in visible if f.input_type == "file"), None)
-            if resume_field is not None and self._resume_path is not None:
-                FileUploadHandler().attach_resume(
-                    session, resume_field.field_id, self._resume_path
-                )
-                uploaded_files = (
-                    UploadedFileRecord(
-                        field_id=resume_field.field_id,
-                        filename=self._resume_path.name,
-                        sha256=_sha256_file(self._resume_path),
-                    ),
-                )
-
-            unresolved = list(fill_result.unresolved_field_ids)
-            unresolved += fill_result.newly_revealed_field_ids
-
-            # Defensive re-check: if a CAPTCHA/MFA marker appeared only
-            # AFTER filling began (never present at the initial
-            # inspect_application() call that gated entry to this
-            # method), that is exactly the kind of anomaly a human must
-            # see, not something the snapshot should silently look clean
-            # about — never re-attempt to satisfy it, just surface it.
-            post_fill_inspection = ApplicationFormInspector().inspect(session)
-            if post_fill_inspection.captcha_detected or post_fill_inspection.mfa_detected:
-                unresolved.append(CAPTCHA_OR_MFA_AFTER_FILL_MARKER)
-
-            snapshot = build_snapshot(
-                session,
-                job_id=job.id,
-                company_name=job.company_name,
-                title=job.title,
-                uploaded_files=uploaded_files,
-                unresolved_field_ids=tuple(unresolved),
-                answer_sources=answer_sources,
-            )
-            self._last_snapshot[job.id] = snapshot
+            fill_result = self._fill_into_session(session, job, answers)
 
         return PreparedFormState(
             target_job_id=job.id,
@@ -360,9 +299,118 @@ class BrowserApplicationProvider(ApplicationProvider):
             provider_reference=target_url,
             detail=(
                 f"staged {len(fill_result.filled_field_ids)} field(s) locally; "
-                f"{len(unresolved)} unresolved question(s) remain. Nothing was "
-                "transmitted anywhere — a human must review the snapshot "
+                f"{len(fill_result.unresolved_field_ids)} unresolved question(s) remain. "
+                "Nothing was transmitted anywhere — a human must review the snapshot "
                 "(BrowserApplicationProvider.get_snapshot) and submit manually; "
                 "automated submission is structurally unavailable in this phase."
             ),
         )
+
+    def fill_application_keep_session_open(
+        self, job: JobRow, target: ApplicationTarget, answers: list[GeneratedAnswer]
+    ) -> tuple[PreparedFormState, BrowserSession]:
+        """Identical to `fill_application()` in every observable respect
+        EXCEPT ONE: the `BrowserSession` it fills into is returned STILL
+        OPEN instead of being closed at the end — the caller becomes
+        responsible for closing it. Used ONLY by `applications
+        browser-submit` (see `job_agent.cli.main`), which needs to act on
+        the EXACT same live DOM state it just fingerprint-verified (find
+        and click the real submit control) without a second navigation
+        that could observe a different page than what was just checked.
+        `submit()` itself is still completely unaffected by this method's
+        existence — nothing here calls it, and nothing here transmits
+        anything; it only fills fields and hands back an open page,
+        exactly like `fill_application()` does before closing it."""
+        target_url = target.provider_reference or self._target_urls.get(job.id)
+        if not target.reachable or not target_url:
+            raise SubmissionRefusedError(
+                f"job {job.id}: no reachable target; refusing to open a session."
+            )
+
+        session = BrowserSession(target_url, browser=self._browser)
+        session.load()
+        fill_result = self._fill_into_session(session, job, answers)
+
+        state = PreparedFormState(
+            target_job_id=job.id,
+            answer_count=len(fill_result.filled_field_ids),
+            provider_reference=target_url,
+            detail=(
+                f"staged {len(fill_result.filled_field_ids)} field(s) locally; "
+                f"{len(fill_result.unresolved_field_ids)} unresolved question(s) remain. "
+                "Session left open for the caller to act on directly."
+            ),
+        )
+        return state, session
+
+    def _fill_into_session(
+        self, session: BrowserSession, job: JobRow, answers: list[GeneratedAnswer]
+    ) -> FillResult:
+        """Shared core of `fill_application()`/`fill_application_keep_
+        session_open()` — inspect, plan, fill, re-inspect, build and
+        store the snapshot. Never opens or closes a session itself; the
+        caller owns that lifecycle."""
+        inspection = ApplicationFormInspector().inspect(session)
+        visible = tuple(f for f in inspection.fields if f.visible)
+
+        plans = AnswerPlanner().plan(visible, answers)
+        filler = FormFiller(session)
+        fill_result = filler.apply_plan(plans)
+
+        # Provenance pass-through for the review snapshot -- the SAME
+        # GeneratedAnswer.source the answer engine already computed
+        # (e.g. "candidate_fact:contact_email"), never recomputed or
+        # guessed here. Matched against the ORIGINAL `answers` list (not
+        # `plans`) so a field AnswerPlanner declined to fill because its
+        # answer requires human input (e.g. "Current company") still
+        # carries its source into the snapshot -- AnswerPlanner nulls
+        # FieldPlan.answer for those on purpose (see its module
+        # docstring), but that is a fill-eligibility decision, not a
+        # reason to also hide from a human reviewer WHY the field was
+        # left unresolved.
+        answers_by_question_text = {a.question: a for a in answers}
+        answer_sources = {
+            f.field_id: answers_by_question_text[question_text(f)].source
+            for f in visible
+            if question_text(f) in answers_by_question_text
+        }
+
+        uploaded_files: tuple[UploadedFileRecord, ...] = ()
+        resume_field = next((f for f in visible if f.input_type == "file"), None)
+        if resume_field is not None and self._resume_path is not None:
+            FileUploadHandler().attach_resume(
+                session, resume_field.field_id, self._resume_path
+            )
+            uploaded_files = (
+                UploadedFileRecord(
+                    field_id=resume_field.field_id,
+                    filename=self._resume_path.name,
+                    sha256=_sha256_file(self._resume_path),
+                ),
+            )
+
+        unresolved = list(fill_result.unresolved_field_ids)
+        unresolved += fill_result.newly_revealed_field_ids
+
+        # Defensive re-check: if a CAPTCHA/MFA marker appeared only AFTER
+        # filling began (never present at the initial inspect_application()
+        # call that gated entry to this method), that is exactly the kind
+        # of anomaly a human must see, not something the snapshot should
+        # silently look clean about — never re-attempt to satisfy it,
+        # just surface it.
+        post_fill_inspection = ApplicationFormInspector().inspect(session)
+        if post_fill_inspection.captcha_detected or post_fill_inspection.mfa_detected:
+            unresolved.append(CAPTCHA_OR_MFA_AFTER_FILL_MARKER)
+
+        snapshot = build_snapshot(
+            session,
+            job_id=job.id,
+            company_name=job.company_name,
+            title=job.title,
+            uploaded_files=uploaded_files,
+            unresolved_field_ids=tuple(unresolved),
+            answer_sources=answer_sources,
+        )
+        self._last_snapshot[job.id] = snapshot
+        fill_result.unresolved_field_ids = unresolved
+        return fill_result

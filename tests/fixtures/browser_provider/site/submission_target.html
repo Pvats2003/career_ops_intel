@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!--
+  Real-execution checkpoint — local synthetic E2E fixture for
+  `applications browser-submit`. Same 7-field shape as
+  drivetrain_business_analyst_native.html, but UNLIKE that fixture this
+  form's submit control is a REAL, working local navigation (GET to
+  submission_success.html on the SAME origin/server) rather than
+  `onsubmit="return false;"` — so a test can prove the full click ->
+  navigate -> confirmation-detected pipeline against a genuine (if
+  synthetic, local-only) form submission, with zero real network access.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synthetic Test — Submission Target</title>
+</head>
+<body>
+  <h1>Synthetic Co — Business Analyst (submission E2E fixture)</h1>
+
+  <form id="application-form" action="submission_success.html" method="get">
+    <label for="resume">Resume/CV</label>
+    <input type="file" id="resume" name="resume">
+
+    <label for="full_name">Full name</label>
+    <input type="text" id="full_name" name="full_name" required>
+
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" required>
+
+    <label for="phone">Phone</label>
+    <input type="tel" id="phone" name="phone" required>
+
+    <label for="current_location">Current location</label>
+    <input type="text" id="current_location" name="current_location" required>
+
+    <label for="current_company">Current company</label>
+    <input type="text" id="current_company" name="current_company" required>
+
+    <label for="linkedin_url">LinkedIn URL</label>
+    <input type="url" id="linkedin_url" name="linkedin_url" required>
+
+    <button type="submit" id="real-submit-button">Submit Application</button>
+  </form>
+</body>
+</html>
