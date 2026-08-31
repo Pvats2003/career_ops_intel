@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import shutil
 import time
+from dataclasses import dataclass
 
 import typer
 from rich.console import Console
 from rich.table import Table
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from job_agent.applications.allowlist import (
     create_allowlist_entry,
@@ -33,7 +35,16 @@ from job_agent.applications.allowlist import (
 )
 from job_agent.applications.answer_bank import load_answer_bank
 from job_agent.applications.answer_engine import generate_answer
-from job_agent.applications.approvals import compute_answer_fingerprint, create_approval
+from job_agent.applications.approvals import (
+    compute_answer_fingerprint,
+    consume_approval,
+    create_approval,
+    get_valid_approval,
+)
+from job_agent.applications.browser.snapshot import (
+    HumanReviewSnapshot,
+    compute_snapshot_fingerprint,
+)
 from job_agent.applications.browser.snapshot_render import render_snapshot
 from job_agent.applications.errors import ProviderError
 from job_agent.applications.human_input import (
@@ -46,9 +57,10 @@ from job_agent.applications.repository import (
     get_answers,
     get_latest_event,
     get_or_create_application,
+    record_event,
 )
 from job_agent.applications.rules_enforcement import evaluate_inspection
-from job_agent.applications.schema import ApplicationStatus
+from job_agent.applications.schema import ApplicationStatus, GeneratedAnswer
 from job_agent.applications.service import (
     answers_from_db,
     build_application_provider,
@@ -59,7 +71,7 @@ from job_agent.applications.service import (
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
-from job_agent.config.loader import REPO_ROOT, load_config
+from job_agent.config.loader import REPO_ROOT, AppConfig, load_config
 from job_agent.db.models import Application, ApplicationAllowlistEntry, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.db.repository import save_candidate_profile
@@ -723,6 +735,142 @@ def applications_target_add(
     )
 
 
+def _parse_answer_overrides(answer: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for entry in answer or []:
+        if "=" not in entry:
+            console.print(
+                f'[red]--answer must be "<question text>=<value>", got:[/red] {entry!r}'
+            )
+            raise typer.Exit(code=1)
+        question_label, _, value = entry.partition("=")
+        overrides[question_label] = value
+    return overrides
+
+
+@dataclass(frozen=True)
+class _BrowserPrepareResult:
+    job: JobRow
+    snapshot: HumanReviewSnapshot
+    unresolved_questions: tuple[str, ...]
+
+
+def _run_browser_preparation(
+    cfg: AppConfig,
+    session: Session,
+    application: Application,
+    url: str,
+    human_input_overrides: dict[str, str],
+) -> _BrowserPrepareResult:
+    """The ONE shared discover -> inspect -> evaluate_inspection ->
+    get_questions -> generate_answer -> apply_human_input_overrides ->
+    fill_application -> get_snapshot pipeline every `applications
+    browser-*` command uses — so "prepare" means exactly the same thing
+    everywhere it's invoked, never a second, slightly-different
+    implementation. Opens exactly ONE fresh browser session, navigates to
+    `url` exactly once, and always closes the browser before returning
+    (or raising). A CAPTCHA/MFA/consent/unrecognized-structure verdict or
+    any other stop condition raises `typer.Exit` directly (code 0 for
+    "human review needed, nothing is wrong", code 1 for a real failure)
+    rather than returning a sentinel, matching the exact codes this
+    pipeline has always used.
+
+    NEVER passes `resume_path` to `BrowserApplicationProvider` — a resume
+    is never automatically attached by any caller of this helper; see
+    each command's own docstring for why.
+    """
+    job = session.get(JobRow, application.job_id)
+    if job is None:
+        console.print(f"[red]Application {application.id} has no matching job row.[/red]")
+        raise typer.Exit(code=1)
+    if url != job.application_url:
+        console.print(
+            "[red]--url does not match this job's own application_url.[/red]\n"
+            f"  --url:                {url}\n"
+            f"  job.application_url:  {job.application_url}\n"
+            "Pass the exact URL the job itself already carries — never a different one."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        profile = parse_candidate_profile(cfg)
+    except CandidateParseError as exc:
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
+        raise typer.Exit(code=1) from exc
+
+    resume_path = cfg.env.candidate_dir / "resume_master.docx"
+    try:
+        resume_text = extract_resume_text(resume_path)
+    except ResumeExtractionError as exc:
+        console.print(f"[red]Failed to extract resume text:[/red] {redact_text(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    answer_bank = load_answer_bank(cfg.env.candidate_dir / "answers")
+    llm = build_llm_provider(cfg)
+
+    from playwright.sync_api import sync_playwright
+
+    snapshot = None
+    answers: list[GeneratedAnswer] = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        try:
+            # Real-target-readiness checkpoint: resume_path is
+            # DELIBERATELY never passed here. Passing it would make
+            # BrowserApplicationProvider.fill_application() attach the
+            # resume automatically the instant a file field is visible --
+            # with no check for whether that field is even required.
+            # `resume_text` above is still extracted and used for LLM
+            # answer validation (checking a claim against the resume's
+            # actual content), which is unrelated to file upload.
+            # Attaching a resume is a separate, explicit action a human
+            # takes later, not an automatic side effect of this pipeline.
+            provider = BrowserApplicationProvider({job.id: url}, browser=browser)
+            target = provider.discover_application(job)
+            if not target.reachable:
+                console.print(f"[red]Could not reach target:[/red] {target.detail}")
+                raise typer.Exit(code=1)
+
+            inspection = provider.inspect_application(job, target)
+            verdict = evaluate_inspection(cfg.rules, inspection)
+            if verdict.human_required:
+                console.print(
+                    f"[yellow]Human review required before filling:[/yellow] "
+                    f"{verdict.reason} — nothing was filled."
+                )
+                raise typer.Exit(code=0)
+
+            questions = provider.get_questions(job)
+            answers = [
+                generate_answer(q, profile, resume_text, answer_bank, llm)
+                for q in questions
+            ]
+            answers = apply_human_input_overrides(answers, human_input_overrides)
+            applied_labels = {
+                a.question for a in answers if a.source.startswith(HUMAN_INPUT_SOURCE_PREFIX)
+            }
+            for label in set(human_input_overrides) - applied_labels:
+                console.print(
+                    f"[yellow]--answer {label!r} was not applied[/yellow] — either no "
+                    "question on this form has that exact text, or it was already "
+                    "resolved (a trusted fact/answer-bank/LLM answer is never overridden)."
+                )
+            provider.fill_application(job, target, answers)
+            snapshot = provider.get_snapshot(job.id)
+        except ProviderError as exc:
+            console.print(f"[red]Provider error:[/red] {redact_text(str(exc))}")
+            raise typer.Exit(code=1) from exc
+        finally:
+            browser.close()
+
+    if snapshot is None:
+        console.print("[red]No snapshot was produced.[/red]")
+        raise typer.Exit(code=1)
+    unresolved_questions = tuple(a.question for a in answers if a.requires_human)
+    return _BrowserPrepareResult(
+        job=job, snapshot=snapshot, unresolved_questions=unresolved_questions
+    )
+
+
 @applications_app.command("browser-preview")
 def applications_browser_preview(
     application_id: int = typer.Argument(..., help="Application id to preview."),
@@ -767,17 +915,10 @@ def applications_browser_preview(
     inspecting provider uses; a HUMAN_REQUIRED verdict stops this command
     before a single field is filled. This is a read-only preview — it
     writes nothing to the database and does not compete with
-    `applications prepare` for ownership of an application's status.
+    `applications prepare` for ownership of an application's status, and
+    it creates no approval: pure preview, nothing is remembered.
     """
-    human_input_overrides: dict[str, str] = {}
-    for entry in answer or []:
-        if "=" not in entry:
-            console.print(
-                f'[red]--answer must be "<question text>=<value>", got:[/red] {entry!r}'
-            )
-            raise typer.Exit(code=1)
-        question_label, _, value = entry.partition("=")
-        human_input_overrides[question_label] = value
+    human_input_overrides = _parse_answer_overrides(answer)
     if not confirm:
         console.print(
             "[yellow]No action taken.[/yellow] Pass --confirm to actually contact "
@@ -795,93 +936,211 @@ def applications_browser_preview(
         if application is None:
             console.print(f"[red]No application with id {application_id}.[/red]")
             raise typer.Exit(code=1)
-        job = session.get(JobRow, application.job_id)
-        if job is None:
-            console.print(f"[red]Application {application_id} has no matching job row.[/red]")
+        result = _run_browser_preparation(cfg, session, application, url, human_input_overrides)
+
+    render_snapshot(result.snapshot, console)
+
+
+@applications_app.command("browser-approve")
+def applications_browser_approve(
+    application_id: int = typer.Argument(..., help="Application id to approve."),
+    url: str = typer.Option(
+        ..., "--url", help="Exact application-form URL — must match this application's "
+        "job's own application_url exactly.",
+    ),
+    answer: list[str] | None = typer.Option(  # noqa: B008
+        None, "--answer",
+        help='Human-supplied answer for a currently-unresolved question, as '
+        '"<question text>=<value>". May be repeated. Same semantics as '
+        "`browser-preview --answer` — see that command's help.",
+    ),
+    ttl_hours: int = typer.Option(
+        24, "--ttl-hours", help="Hours this approval stays valid before expiring unused."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the interactive confirmation prompt."
+    ),
+    confirm: bool = typer.Option(
+        False, "--confirm",
+        help="Actually launch a browser and contact --url; without this, reports what "
+        "would happen and makes no network call.",
+    ),
+) -> None:
+    """Record a human's approval to browser-fill ONE specific application,
+    bound to its EXACT current job content (`job.job_fingerprint`) and
+    EXACT current, DOM-verified prepared state
+    (`compute_snapshot_fingerprint` — field structure, proposed values,
+    uploaded files, and what's still unresolved). Reuses the existing
+    Phase 6C `ApplicationApproval` model and `job_agent.applications.
+    approvals` module completely unchanged — this is the SAME single-use,
+    fingerprint-bound approval `applications approve` already creates for
+    the structured-ATS submission pipeline, just bound to a browser
+    session's snapshot fingerprint instead of `answers_from_db()`'s.
+    `applications browser-fill` is the only command that ever consumes
+    this approval, and only if a FRESH re-inspection still matches it
+    exactly.
+
+    Every question must already be resolved (via a trusted fact, the
+    answer bank, the LLM, or --answer) before this command will approve
+    anything — exactly like `applications approve` requires for the
+    structured pipeline. Nothing is submitted; `submit()` is not called
+    by this command or by anything it triggers.
+    """
+    human_input_overrides = _parse_answer_overrides(answer)
+    if not confirm:
+        console.print(
+            "[yellow]No action taken.[/yellow] Pass --confirm to actually contact "
+            f"{url} and review application {application_id} for approval."
+        )
+        raise typer.Exit(code=0)
+
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        if application is None:
+            console.print(f"[red]No application with id {application_id}.[/red]")
             raise typer.Exit(code=1)
-        if url != job.application_url:
+        result = _run_browser_preparation(cfg, session, application, url, human_input_overrides)
+
+        if result.unresolved_questions:
             console.print(
-                "[red]--url does not match this job's own application_url.[/red]\n"
-                f"  --url:                {url}\n"
-                f"  job.application_url:  {job.application_url}\n"
-                "Pass the exact URL the job itself already carries — never a different one."
+                f"[red]Application {application_id} still has question(s) requiring human "
+                "input:[/red]"
+            )
+            for question in result.unresolved_questions:
+                console.print(f"    ? {question}")
+            console.print(
+                'Resolve them with --answer "<question text>=<value>" before approving.'
             )
             raise typer.Exit(code=1)
 
-        try:
-            profile = parse_candidate_profile(cfg)
-        except CandidateParseError as exc:
-            console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
-            raise typer.Exit(code=1) from exc
+        render_snapshot(result.snapshot, console)
+        posting_fingerprint = result.job.job_fingerprint
+        answer_fingerprint = compute_snapshot_fingerprint(result.snapshot)
+        console.print(f"\n  Job fingerprint:      {posting_fingerprint}")
+        console.print(f"  Snapshot fingerprint: {answer_fingerprint}")
 
-        resume_path = cfg.env.candidate_dir / "resume_master.docx"
-        try:
-            resume_text = extract_resume_text(resume_path)
-        except ResumeExtractionError as exc:
-            console.print(f"[red]Failed to extract resume text:[/red] {redact_text(str(exc))}")
-            raise typer.Exit(code=1) from exc
-        answer_bank = load_answer_bank(cfg.env.candidate_dir / "answers")
-        llm = build_llm_provider(cfg)
+        if not yes:
+            typer.confirm(
+                "\nApprove this EXACT prepared application for one real browser fill?",
+                abort=True,
+            )
 
-        from playwright.sync_api import sync_playwright
+        approval = create_approval(
+            session, application.id, posting_fingerprint, answer_fingerprint,
+            ttl_hours=ttl_hours,
+        )
+        session.commit()
 
-        snapshot = None
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            try:
-                # Real-target-readiness checkpoint: resume_path is
-                # DELIBERATELY never passed here. Passing it would make
-                # BrowserApplicationProvider.fill_application() attach the
-                # resume automatically the instant a file field is
-                # visible -- with no check for whether that field is even
-                # required. `resume_text` above is still extracted and
-                # used for LLM answer validation (checking a claim
-                # against the resume's actual content), which is
-                # unrelated to file upload. Attaching a resume is a
-                # separate, explicit action a human takes later, not an
-                # automatic side effect of previewing an application.
-                provider = BrowserApplicationProvider({job.id: url}, browser=browser)
-                target = provider.discover_application(job)
-                if not target.reachable:
-                    console.print(f"[red]Could not reach target:[/red] {target.detail}")
-                    raise typer.Exit(code=1)
+    console.print(
+        f"[green]Approved.[/green] approval id {approval.id}, expires at "
+        f"{approval.expires_at.isoformat()} — single-use, bound to this exact prepared state.\n"
+        "Next:\n"
+        f'  job-agent applications browser-fill {application_id} --url "{url}" --confirm'
+        + "".join(f' --answer "{k}={v}"' for k, v in human_input_overrides.items())
+    )
 
-                inspection = provider.inspect_application(job, target)
-                verdict = evaluate_inspection(cfg.rules, inspection)
-                if verdict.human_required:
-                    console.print(
-                        f"[yellow]Human review required before filling:[/yellow] "
-                        f"{verdict.reason} — nothing was filled."
-                    )
-                    raise typer.Exit(code=0)
 
-                questions = provider.get_questions(job)
-                answers = [
-                    generate_answer(q, profile, resume_text, answer_bank, llm)
-                    for q in questions
-                ]
-                answers = apply_human_input_overrides(answers, human_input_overrides)
-                applied_labels = {
-                    a.question for a in answers if a.source.startswith(HUMAN_INPUT_SOURCE_PREFIX)
-                }
-                for label in set(human_input_overrides) - applied_labels:
-                    console.print(
-                        f"[yellow]--answer {label!r} was not applied[/yellow] — either no "
-                        "question on this form has that exact text, or it was already "
-                        "resolved (a trusted fact/answer-bank/LLM answer is never overridden)."
-                    )
-                provider.fill_application(job, target, answers)
-                snapshot = provider.get_snapshot(job.id)
-            except ProviderError as exc:
-                console.print(f"[red]Provider error:[/red] {redact_text(str(exc))}")
-                raise typer.Exit(code=1) from exc
-            finally:
-                browser.close()
+@applications_app.command("browser-fill")
+def applications_browser_fill(
+    application_id: int = typer.Argument(..., help="Application id to fill."),
+    url: str = typer.Option(
+        ..., "--url", help="Exact application-form URL — must match this application's "
+        "job's own application_url exactly.",
+    ),
+    answer: list[str] | None = typer.Option(  # noqa: B008
+        None, "--answer",
+        help="The SAME --answer value(s) used at `browser-approve` time — must reproduce "
+        "the identical prepared state, or the freshly-computed snapshot fingerprint won't "
+        "match the approval and this command will refuse to proceed.",
+    ),
+    confirm: bool = typer.Option(
+        False, "--confirm",
+        help="Actually launch a browser and fill the approved fields; without this, "
+        "reports what would happen and makes no network call.",
+    ),
+) -> None:
+    """Fills the browser DOM with the approved values for ONE application
+    — the ONLY command in this codebase that fills a form on the strength
+    of a prior human approval, and it never proceeds without one.
 
-    if snapshot is None:
-        console.print("[red]No snapshot was produced.[/red]")
-        raise typer.Exit(code=1)
-    render_snapshot(snapshot, console)
+    Re-runs the FULL preparation pipeline in a FRESH browser session (a
+    new navigation, a fresh DOM read) — never reuses a cached result from
+    `browser-approve`. If the freshly re-inspected form now shows a
+    CAPTCHA/MFA/password field/unrecognized structure, this stops exactly
+    like `browser-preview` does, before typing anything. The values are
+    then filled into this throwaway, soon-to-be-closed browser session
+    (harmless on its own — nothing is transmitted to the target),  and
+    ONLY THEN is the resulting snapshot's fingerprint checked against
+    `applications browser-approve`'s stored approval — bound to this
+    exact application, this exact job content, and this exact prepared
+    state. Any drift (a different answer, a changed job posting, an
+    expired/already-consumed/revoked approval, or simply no approval at
+    all) is treated identically: refuse, explain why, and require a new
+    `browser-approve` — never silently re-approve and continue. A valid
+    approval is consumed (single-use) the moment it is accepted, so it
+    can never be replayed for a second fill.
+
+    Stops immediately after filling and recording the audit event.
+    `submit()` is never called by this command or anything it triggers —
+    BrowserApplicationProvider.submit() remains structurally incapable of
+    submitting regardless.
+    """
+    human_input_overrides = _parse_answer_overrides(answer)
+    if not confirm:
+        console.print(
+            "[yellow]No action taken.[/yellow] Pass --confirm to actually contact "
+            f"{url} and fill application {application_id} (requires a valid approval)."
+        )
+        raise typer.Exit(code=0)
+
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        if application is None:
+            console.print(f"[red]No application with id {application_id}.[/red]")
+            raise typer.Exit(code=1)
+        result = _run_browser_preparation(cfg, session, application, url, human_input_overrides)
+
+        posting_fingerprint = result.job.job_fingerprint
+        answer_fingerprint = compute_snapshot_fingerprint(result.snapshot)
+        approval = get_valid_approval(
+            session, application.id, posting_fingerprint, answer_fingerprint
+        )
+        if approval is None:
+            console.print(
+                "[red]No valid approval matches the current prepared state.[/red]\n"
+                "This means at least one of: no approval exists yet, it expired, it was "
+                "already consumed by an earlier fill, it was revoked, or the form/answers "
+                "changed since you last ran `applications browser-approve` (a different "
+                "job posting, different --answer values, or a newly-appeared form field). "
+                "Nothing was filled as approved. Run `applications browser-approve` again "
+                "to review and approve the CURRENT state, then re-run this command."
+            )
+            raise typer.Exit(code=1)
+
+        consume_approval(session, approval)
+        record_event(
+            session, application.id, "BROWSER_FILL_COMPLETED",
+            {"approval_id": approval.id, "job_id": result.job.id},
+        )
+        session.commit()
+
+    render_snapshot(result.snapshot, console)
+    console.print(
+        "\n[bold yellow]STOPPED BEFORE SUBMISSION.[/bold yellow] Nothing above was ever "
+        "transmitted anywhere. Automated submission is structurally unavailable — "
+        "BrowserApplicationProvider.submit() always refuses. Review the fields above "
+        "manually on the real site before doing anything further."
+    )
 
 
 @applications_app.command("run")
