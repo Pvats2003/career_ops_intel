@@ -135,5 +135,22 @@ class FolderWatcher:
                 for path in self._folder.iterdir():
                     if path.is_file():
                         self._enqueue(path)
+                self._prune_seen()
             except OSError as exc:
                 logger.warning("watcher.reconcile_failed", error=str(exc))
+
+    def _prune_seen(self) -> None:
+        """Drop `_seen` entries for files that no longer exist at that path.
+
+        `VideoProcessor` always moves a video out of the watch folder once
+        it reaches a terminal state, so once a path is gone it can never
+        legitimately need re-deduping — keeping it in `_seen` forever would
+        make this set grow without bound for the life of a long-running
+        session (150-200+ new entries every day). Pruned on the same
+        15-second cadence as the reconciliation sweep, so the cost is
+        folded into a pass we're already paying for.
+        """
+        with self._seen_lock:
+            stale = {p for p in self._seen if not Path(p).exists()}
+            if stale:
+                self._seen -= stale

@@ -108,6 +108,13 @@ class AppUiSettings(BaseModel):
     minimize_to_tray: bool = True
     poll_interval_seconds: float = 2.0
     log_level: str = "INFO"
+    # How long a COMPLETED/DUPLICATE job stays in the `jobs` working table
+    # before being pruned on startup. The durable audit trail (`upload_logs`,
+    # what the Logs screen searches/exports) is never touched — only the
+    # live working table, which has no reason to keep growing forever across
+    # months of 150-500 videos/day. FAILED and NEEDS_REVIEW rows are never
+    # auto-pruned; they stay until a human resolves them.
+    jobs_retention_days: int = 30
 
 
 class _YamlSettingsSource(PydanticBaseSettingsSource):
@@ -189,6 +196,41 @@ class AppSettings(BaseSettings):
         data = self.model_dump(mode="json")
         with path.open("w", encoding="utf-8") as fh:
             yaml.safe_dump(data, fh, sort_keys=False, allow_unicode=True)
+
+    def export_backup(self, destination: Path) -> None:
+        """Write the current settings to an arbitrary file (Settings ->
+        Export). Deliberately does **not** include `credentials.json` or
+        the encrypted `token.json`/`token.key` — those are re-established
+        by signing in again on whatever machine restores this backup,
+        which is both simpler and avoids ever putting a copy of Drive/
+        Sheets access next to a config file a user might casually email
+        themselves or drop in a synced folder.
+        """
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        data = self.model_dump(mode="json")
+        with destination.open("w", encoding="utf-8") as fh:
+            yaml.safe_dump(data, fh, sort_keys=False, allow_unicode=True)
+
+    @classmethod
+    def load_backup(cls, source: Path) -> AppSettings:
+        """Parse a backup file into a standalone `AppSettings` instance,
+        without touching the live config file or the currently-running
+        settings — the caller decides whether/how to apply it (see
+        `update_from`)."""
+        with source.open(encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        return cls.model_validate(data)
+
+    def update_from(self, other: AppSettings) -> None:
+        """Copy every field from `other` onto `self` in place.
+
+        Used to apply an imported backup to the settings object the running
+        app already holds a reference to (services were constructed with
+        *this* object, not a new one — replacing `self` wholesale wouldn't
+        reach them).
+        """
+        for field_name in type(self).model_fields:
+            setattr(self, field_name, getattr(other, field_name))
 
     @property
     def db_path(self) -> Path:

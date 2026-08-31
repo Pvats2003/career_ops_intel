@@ -39,13 +39,27 @@ WhatsApp folder  →  Folder Watcher  →  OCR (Device ID)  →  Google Drive  �
 - **Never blocks on a bad video** — OCR failures route to a `Needs Review`
   folder; upload failures retry, then route to `Failed`; the pipeline keeps
   processing everything else regardless.
+- **Needs Review screen** — for the videos OCR genuinely can't read, a
+  thumbnail, the raw OCR text, and its confidence, with a manual Device ID
+  entry that routes straight to upload (skipping a redundant OCR re-run).
+- **Pause/resume + one-click retry** — stop new uploads from starting
+  without losing what's already queued, and re-queue a specific failed
+  video from the Queue view.
+- **Encrypted credentials at rest** — the Google OAuth token is protected
+  with Windows DPAPI (Fernet fallback elsewhere), never written to disk in
+  plaintext; see `docs/SECURITY.md`.
 - **Modern, dark, glass-panel desktop UI** built with PySide6 — live
   dashboard (queue depth, transfer speed, ETA, OCR confidence), a
-  searchable/filterable/CSV-exportable log, and a full Settings screen.
+  searchable/filterable/CSV-exportable log with per-stage timing (OCR/
+  upload/total), desktop notifications, and a full Settings screen with
+  config export/import.
 - **SQLite-backed** job tracking and a durable audit log, with WAL mode so
-  the UI never blocks on writer threads.
+  the UI never blocks on writer threads, and automatic pruning of old
+  completed entries so the working table doesn't grow forever.
 - Clean, feature-based, dependency-injected architecture with type hints
-  throughout and a real unit + integration test suite (58 tests).
+  throughout and a real unit + integration test suite (141 tests,
+  including a concurrency stress test that drives dozens of videos through
+  the real async worker pool under induced random failures).
 
 ## Project layout
 
@@ -108,13 +122,21 @@ pytest -q
 ruff check src tests
 ```
 
-The suite (58 tests) covers Device ID OCR/regex logic, SHA-256 hashing,
-deduplication, the SQLite repositories, the async upload worker pool's
-retry/backoff behavior, Drive/Sheets clients (mocked, no network needed),
-and full `VideoProcessor` pipeline runs (happy path, low-confidence →
-Needs Review, no-match → Needs Review, duplicate skip) — all with faked
-external services so CI needs no real Google credentials, Tesseract
-binary, or WhatsApp folder.
+The suite (141 tests) covers Device ID OCR/regex logic (including boundary
+cases like `IC-1888` not matching `IC-188`), multi-variant frame
+preprocessing and rotation correction, SHA-256 hashing and dedup — including
+a concurrent-claim race test — the SQLite repositories, the async upload
+worker pool's retry/backoff behavior (with a regression test for
+retry-state persistence across the backoff window), Drive/Sheets clients
+(mocked, no network needed, including folder-cache eviction and row-index
+caching), credential encryption round-trips, spreadsheet formula-injection
+sanitization, pause/resume/retry pipeline controls, real `VideoProcessor`
+runs against corrupted/zero-byte video files, and full pipeline runs (happy
+path, low-confidence → Needs Review, no-match → Needs Review, duplicate
+skip) — plus a concurrency stress test that drives dozens of videos through
+the real async worker pool under induced random failures. All with faked
+external services so CI needs no real Google credentials, Tesseract binary,
+or WhatsApp folder.
 
 ## Building the Windows installer
 

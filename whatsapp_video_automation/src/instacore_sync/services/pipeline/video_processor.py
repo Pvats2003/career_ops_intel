@@ -12,12 +12,15 @@ instance is safe to share across worker threads — it holds no per-job state.
 
 from __future__ import annotations
 
+import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 from instacore_sync.core.config import AppSettings
 from instacore_sync.core.exceptions import (
     DriveApiError,
+    DuplicateVideoError,
     FileNotStableError,
     InstacoreSyncError,
     SheetsApiError,
@@ -34,6 +37,7 @@ from instacore_sync.services.ocr.device_id_extractor import DeviceIdExtractor
 from instacore_sync.services.pipeline.events import NullEventSink, PipelineEventSink
 from instacore_sync.services.sheets.sheets_client import SheetsClient
 from instacore_sync.utils.file_utils import move_to_folder, wait_until_stable
+from instacore_sync.utils.text_sanitize import is_valid_device_id
 
 logger = get_logger(__name__)
 
@@ -73,6 +77,9 @@ class VideoProcessor:
                 return self._finalize(job)
 
             self._upload(job, progress_callback)
+            if job.status == JobStatus.NEEDS_REVIEW:
+                return self._finalize(job)
+
             self._update_sheet(job)
 
             job.status = JobStatus.COMPLETED
@@ -91,7 +98,16 @@ class VideoProcessor:
             return self._fail(job, str(exc), route_to_failed=True)
         except Exception as exc:  # noqa: BLE001 - never let one video crash the pipeline
             logger.exception("pipeline.unexpected_error", job_id=job.job_id)
-            return self._fail(job, f"Unexpected error: {exc}", route_to_failed=True)
+            return self._fail(
+                job, f"Unexpected error: {exc}", route_to_failed=True, stack_trace=traceback.format_exc()
+            )
+        finally:
+            # Always release — a no-op if this attempt never claimed the
+            # hash (e.g. it was already a confirmed duplicate). Must run
+            # regardless of outcome so a failed/retried attempt doesn't
+            # permanently block this hash from ever being claimed again.
+            if job.file_hash_sha256:
+                self._dedup.release_claim(job.file_hash_sha256)
 
     # -- steps ---------------------------------------------------------------
 
@@ -117,13 +133,36 @@ class VideoProcessor:
             job.last_error = f"Duplicate of {duplicate.original_filename}"
             destination = Path(self._settings.processed_folder)
             job.source_path = move_to_folder(job.source_path, destination)
+            return
+
+        # No confirmed duplicate yet, but another concurrent worker may be
+        # uploading this exact content *right now* (two identical videos
+        # arriving in the same batch) — the DB record above only appears
+        # once that upload finishes. Claiming the hash closes that window;
+        # losing the claim routes this attempt through the normal
+        # retry/backoff path, by which point the DB check will usually
+        # catch it as a real duplicate.
+        if not self._dedup.claim_for_upload(file_hash):
+            raise DuplicateVideoError(file_hash, job.original_filename)
 
     def _extract_device_id(self, job: VideoJob) -> None:
+        if job.manually_confirmed and job.device_id:
+            # An operator already picked this Device ID on the Needs Review
+            # screen — re-running OCR here would just reproduce the same
+            # low-confidence guess that sent it there in the first place.
+            logger.info(
+                "pipeline.ocr_skipped_manual_override", job_id=job.job_id, device_id=job.device_id
+            )
+            return
+
         job.status = JobStatus.EXTRACTING
         self._save(job)
+        ocr_started = time.monotonic()
         extraction = self._ocr.extract(job.source_path)
+        job.ocr_duration_seconds = time.monotonic() - ocr_started
         job.ocr_confidence = extraction.confidence
         job.ocr_engine_used = extraction.engine_used
+        job.ocr_raw_text = extraction.raw_text
 
         if not extraction.succeeded or extraction.confidence < self._settings.ocr.min_confidence:
             job.device_id = extraction.device_id
@@ -140,6 +179,20 @@ class VideoProcessor:
         job.device_id = extraction.device_id
 
     def _upload(self, job: VideoJob, progress_callback) -> None:  # noqa: ANN001
+        # Defense in depth: every device_id that reaches here should already
+        # be regex-valid (the only path that sets it — OCR extraction — is
+        # itself pattern-matched), but a manual override from the Needs
+        # Review screen is free text typed by a human, and any future code
+        # path that sets device_id should not be trusted by default. A bad
+        # value here would otherwise become a garbage Drive folder name and
+        # a bad Sheet row ("incorrect IC mapping") that's tedious to clean
+        # up after the fact — cheaper to catch it before it happens.
+        if job.device_id and not is_valid_device_id(job.device_id, self._settings.ocr.device_id_pattern):
+            job.mark_needs_review(f"Device ID {job.device_id!r} does not match the expected pattern")
+            destination = Path(self._settings.needs_review_folder)
+            job.source_path = move_to_folder(job.source_path, destination)
+            return
+
         job.status = JobStatus.UPLOADING
         self._save(job)
 
@@ -161,6 +214,7 @@ class VideoProcessor:
         job.drive_file_id = result.file_id
         job.drive_link = result.web_view_link
         job.bytes_uploaded = result.bytes_uploaded
+        job.upload_duration_seconds = result.duration_seconds
 
         if job.file_hash_sha256:
             self._dedup.record_upload(
@@ -194,6 +248,7 @@ class VideoProcessor:
         *,
         route_to_failed: bool = False,
         route_to_needs_review: bool = False,
+        stack_trace: str | None = None,
     ) -> VideoJob:
         job.mark_failed(error) if route_to_failed else job.mark_needs_review(error)
         try:
@@ -206,11 +261,14 @@ class VideoProcessor:
                 job.source_path = move_to_folder(job.source_path, destination)
         except OSError:
             logger.warning("pipeline.move_on_failure_failed", job_id=job.job_id)
-        return self._finalize(job)
+        return self._finalize(job, stack_trace=stack_trace)
 
-    def _finalize(self, job: VideoJob) -> VideoJob:
+    def _finalize(self, job: VideoJob, *, stack_trace: str | None = None) -> VideoJob:
         job.completed_at = job.completed_at or datetime.now()
         self._save(job)
+        total_duration = (
+            (job.completed_at - job.started_at).total_seconds() if job.started_at else None
+        )
         entry = UploadLogEntry(
             job_id=job.job_id,
             filename=job.original_filename,
@@ -222,6 +280,10 @@ class VideoProcessor:
             drive_link=job.drive_link,
             error_message=job.last_error,
             completed_at=job.completed_at,
+            ocr_duration_seconds=job.ocr_duration_seconds,
+            upload_duration_seconds=job.upload_duration_seconds,
+            total_duration_seconds=total_duration,
+            stack_trace=stack_trace,
         )
         self._logs_repo.append(entry)
         self._events.on_log_entry(entry)

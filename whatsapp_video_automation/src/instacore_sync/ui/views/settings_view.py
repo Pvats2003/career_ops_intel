@@ -87,6 +87,19 @@ class SettingsView(QWidget):
         root.addWidget(tabs, stretch=1)
 
         footer = QHBoxLayout()
+        export_button = QPushButton("Export Settings…")
+        export_button.setToolTip("Save folders, Drive/Sheets IDs, OCR and upload settings to a file")
+        export_button.clicked.connect(self._on_export_clicked)
+        footer.addWidget(export_button)
+
+        import_button = QPushButton("Import Settings…")
+        import_button.setToolTip(
+            "Load settings from a previously exported file. Google sign-in is not included\n"
+            "and must be redone on this machine after importing."
+        )
+        import_button.clicked.connect(self._on_import_clicked)
+        footer.addWidget(import_button)
+
         footer.addStretch(1)
         save_button = QPushButton("Save Settings")
         save_button.setObjectName("PrimaryButton")
@@ -122,6 +135,17 @@ class SettingsView(QWidget):
         self._log_level_combo.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
         self._log_level_combo.setCurrentText(self._settings.app.log_level)
         form.addRow("Log level", self._log_level_combo)
+
+        self._retention_spin = QSpinBox()
+        self._retention_spin.setRange(0, 3650)
+        self._retention_spin.setSuffix(" days")
+        self._retention_spin.setSpecialValueText("Never")
+        self._retention_spin.setValue(self._settings.app.jobs_retention_days)
+        self._retention_spin.setToolTip(
+            "Completed/duplicate entries older than this are cleaned up on startup.\n"
+            "Failed and Needs Review items are never auto-removed."
+        )
+        form.addRow("Keep completed history for", self._retention_spin)
 
         return widget
 
@@ -266,6 +290,54 @@ class SettingsView(QWidget):
         form.addRow("Duplicate detection", self._dedup_check)
         return widget
 
+    # -- backup / restore ---------------------------------------------------------
+
+    def _on_export_clicked(self) -> None:
+        default_path = str(Path.home() / "instacore_sync_settings_backup.yaml")
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Export Settings", default_path, "YAML Files (*.yaml)"
+        )
+        if not path_str:
+            return
+        try:
+            self._settings.export_backup(Path(path_str))
+            QMessageBox.information(self, "Export complete", f"Settings exported to:\n{path_str}")
+        except OSError as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+
+    def _on_import_clicked(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Import Settings", str(Path.home()), "YAML Files (*.yaml)"
+        )
+        if not path_str:
+            return
+
+        try:
+            imported = AppSettings.load_backup(Path(path_str))
+        except Exception as exc:  # noqa: BLE001 - arbitrary user-selected file; report, don't crash
+            QMessageBox.critical(
+                self, "Import failed", f"Could not read that file as InstaCore Sync settings:\n{exc}"
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Import settings",
+            "This will replace your current settings (folders, Drive/Sheets IDs, OCR, and upload "
+            "options).\nGoogle sign-in is not included — you'll need to sign in again if the "
+            "account changes.\n\nContinue?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._settings.update_from(imported)
+        self._settings.save()
+        QMessageBox.information(
+            self,
+            "Import complete",
+            "Settings imported and saved. Restart InstaCore Sync for the changes to take full effect.",
+        )
+
     # -- persistence ------------------------------------------------------------
 
     def _save(self) -> None:
@@ -276,6 +348,7 @@ class SettingsView(QWidget):
         s.app.notifications_enabled = self._notifications_check.isChecked()
         s.app.minimize_to_tray = self._tray_check.isChecked()
         s.app.log_level = self._log_level_combo.currentText()
+        s.app.jobs_retention_days = self._retention_spin.value()
 
         s.watch_folder = self._watch_folder_edit.text().strip()
         s.processed_folder = self._processed_folder_edit.text().strip()

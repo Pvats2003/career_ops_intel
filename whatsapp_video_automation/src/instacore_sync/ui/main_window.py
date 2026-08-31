@@ -19,12 +19,14 @@ from instacore_sync.core.constants import APP_NAME
 from instacore_sync.core.logging_setup import get_logger
 from instacore_sync.db.repositories.jobs_repository import JobsRepository
 from instacore_sync.db.repositories.logs_repository import LogsRepository
-from instacore_sync.domain.enums import GoogleAuthStatus, OcrEngineStatus, WatcherStatus
+from instacore_sync.domain.enums import GoogleAuthStatus, JobStatus, OcrEngineStatus, WatcherStatus
+from instacore_sync.domain.models import UploadLogEntry
 from instacore_sync.services.drive.drive_auth import GoogleAuthService
 from instacore_sync.ui.theme.theme_manager import ThemeManager
 from instacore_sync.ui.viewmodels.dashboard_viewmodel import DashboardViewModel
 from instacore_sync.ui.views.dashboard_view import DashboardView
 from instacore_sync.ui.views.logs_view import LogsView
+from instacore_sync.ui.views.needs_review_view import NeedsReviewView
 from instacore_sync.ui.views.queue_view import QueueView
 from instacore_sync.ui.views.settings_view import SettingsView
 from instacore_sync.workers.pipeline_thread import PipelineThread
@@ -49,6 +51,7 @@ class MainWindow(QMainWindow):
         self._signals = signal_bus
         self._pipeline_thread = pipeline_thread
         self._theme = theme_manager
+        self._is_paused = False
 
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 800)
@@ -71,11 +74,18 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self._dashboard_vm = DashboardViewModel(signal_bus)
         self._dashboard_view = DashboardView(self._dashboard_vm, signal_bus)
-        self._queue_view = QueueView(jobs_repo, signal_bus)
+        self._queue_view = QueueView(jobs_repo, signal_bus, pipeline_thread)
+        self._needs_review_view = NeedsReviewView(jobs_repo, signal_bus, pipeline_thread, settings)
         self._logs_view = LogsView(logs_repo)
         self._settings_view = SettingsView(settings, theme_manager, self._on_theme_changed)
 
-        for view in (self._dashboard_view, self._queue_view, self._logs_view, self._settings_view):
+        for view in (
+            self._dashboard_view,
+            self._queue_view,
+            self._needs_review_view,
+            self._logs_view,
+            self._settings_view,
+        ):
             self._stack.addWidget(view)
 
         right_column.addWidget(self._stack, stretch=1)
@@ -84,6 +94,8 @@ class MainWindow(QMainWindow):
         signal_bus.watcher_status_changed.connect(self._on_watcher_status)
         signal_bus.auth_status_changed.connect(self._on_auth_status)
         signal_bus.ocr_engine_status_changed.connect(self._on_ocr_status)
+        signal_bus.pause_state_changed.connect(self._on_pause_state_changed)
+        signal_bus.log_entry_added.connect(self._on_log_entry_for_notification)
 
         self._setup_tray_icon()
         self._theme.apply(central, settings.app.theme)
@@ -112,8 +124,9 @@ class MainWindow(QMainWindow):
         nav_items = [
             ("📊  Dashboard", 0),
             ("📁  Upload Queue", 1),
-            ("🧾  Logs", 2),
-            ("⚙️  Settings", 3),
+            ("🔍  Needs Review", 2),
+            ("🧾  Logs", 3),
+            ("⚙️  Settings", 4),
         ]
         for label, index in nav_items:
             button = QPushButton(label)
@@ -145,7 +158,37 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._auth_label["container"])
         layout.addWidget(self._ocr_label["container"])
         layout.addStretch(1)
+
+        self._pause_button = QPushButton("⏸  Pause Uploads")
+        self._pause_button.setToolTip(
+            "Stop starting new uploads. Anything already in flight finishes normally."
+        )
+        self._pause_button.clicked.connect(self._on_pause_button_clicked)
+        layout.addWidget(self._pause_button)
+
         return bar
+
+    def _on_pause_button_clicked(self) -> None:
+        # The real pause state lives on the worker pool, owned by the
+        # pipeline's own asyncio thread — we don't query it synchronously
+        # from the GUI thread (that would be a cross-thread race). Instead
+        # we track our own local flag, kept authoritative by
+        # `_on_pause_state_changed`, which fires once the orchestrator has
+        # actually applied the change.
+        if self._is_paused:
+            self._pipeline_thread.resume_uploads()
+        else:
+            self._pipeline_thread.pause_uploads()
+
+    def _on_pause_state_changed(self, is_paused: bool) -> None:
+        self._is_paused = is_paused
+        if is_paused:
+            self._pause_button.setText("▶  Resume Uploads")
+            self._pause_button.setObjectName("PrimaryButton")
+        else:
+            self._pause_button.setText("⏸  Pause Uploads")
+            self._pause_button.setObjectName("")
+        self._repolish(self._pause_button)
 
     def _status_item(self, label: str) -> dict:
         container = QWidget()
@@ -207,15 +250,43 @@ class MainWindow(QMainWindow):
             style.unpolish(widget)
             style.polish(widget)
 
-    # -- tray + theme ----------------------------------------------------------
+    # -- tray + notifications + theme -------------------------------------------
 
     def _setup_tray_icon(self) -> None:
-        if not self._settings.app.minimize_to_tray or not QSystemTrayIcon.isSystemTrayAvailable():
+        # Created whenever the OS supports it, independent of
+        # `minimize_to_tray`: that setting only controls whether closing the
+        # window hides it instead of quitting — desktop notifications for
+        # failures/needs-review are a separate feature a user might want
+        # even if they don't want the app living in the tray permanently.
+        if not QSystemTrayIcon.isSystemTrayAvailable():
             self._tray = None
             return
         self._tray = QSystemTrayIcon(self)
         self._tray.setToolTip(APP_NAME)
         self._tray.show()
+
+    def _on_log_entry_for_notification(self, entry: UploadLogEntry) -> None:
+        if not self._settings.app.notifications_enabled:
+            return
+        tray = getattr(self, "_tray", None)
+        if tray is None:
+            return
+
+        if entry.status == JobStatus.FAILED:
+            tray.showMessage(
+                "Upload failed",
+                f"{entry.filename}: {entry.error_message or 'Unknown error'}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                8000,
+            )
+        elif entry.status == JobStatus.NEEDS_REVIEW:
+            tray.showMessage(
+                "Needs review",
+                f"{entry.filename}: couldn't confidently read a Device ID. "
+                "Open the Needs Review tab to resolve it.",
+                QSystemTrayIcon.MessageIcon.Information,
+                8000,
+            )
 
     def _on_theme_changed(self, theme: str) -> None:
         self._settings.app.theme = theme

@@ -27,6 +27,10 @@ def _row_to_entry(row: sqlite3.Row) -> UploadLogEntry:
         error_message=row["error_message"],
         created_at=datetime.fromisoformat(row["created_at"]),
         completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+        ocr_duration_seconds=row["ocr_duration_seconds"],
+        upload_duration_seconds=row["upload_duration_seconds"],
+        total_duration_seconds=row["total_duration_seconds"],
+        stack_trace=row["stack_trace"],
     )
 
 
@@ -44,8 +48,9 @@ class LogsRepository:
                     INSERT INTO upload_logs (
                         log_id, job_id, filename, device_id, status, ocr_confidence,
                         ocr_engine_used, file_hash_sha256, drive_link, error_message,
-                        created_at, completed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        created_at, completed_at, ocr_duration_seconds, upload_duration_seconds,
+                        total_duration_seconds, stack_trace
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         entry.log_id,
@@ -60,6 +65,10 @@ class LogsRepository:
                         entry.error_message,
                         entry.created_at.isoformat(),
                         entry.completed_at.isoformat() if entry.completed_at else None,
+                        entry.ocr_duration_seconds,
+                        entry.upload_duration_seconds,
+                        entry.total_duration_seconds,
+                        entry.stack_trace,
                     ),
                 )
         except sqlite3.Error as exc:
@@ -113,6 +122,7 @@ class LogsRepository:
                     "log_id", "job_id", "filename", "device_id", "status",
                     "ocr_confidence", "ocr_engine_used", "file_hash_sha256",
                     "drive_link", "error_message", "created_at", "completed_at",
+                    "ocr_duration_seconds", "upload_duration_seconds", "total_duration_seconds",
                 ]
             )
             for e in rows:
@@ -122,6 +132,9 @@ class LogsRepository:
                         f"{e.ocr_confidence:.3f}", e.ocr_engine_used, e.file_hash_sha256,
                         e.drive_link, e.error_message,
                         e.created_at.isoformat(), e.completed_at.isoformat() if e.completed_at else "",
+                        e.ocr_duration_seconds if e.ocr_duration_seconds is not None else "",
+                        e.upload_duration_seconds if e.upload_duration_seconds is not None else "",
+                        e.total_duration_seconds if e.total_duration_seconds is not None else "",
                     ]
                 )
         return destination

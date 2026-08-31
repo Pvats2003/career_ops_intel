@@ -34,6 +34,8 @@ def _row_to_job(row: sqlite3.Row) -> VideoJob:
         discovered_at=datetime.fromisoformat(row["discovered_at"]),
         started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
         completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+        ocr_raw_text=row["ocr_raw_text"],
+        manually_confirmed=bool(row["manually_confirmed"]),
     )
 
 
@@ -53,8 +55,8 @@ class JobsRepository:
                         file_hash_sha256, device_id, ocr_confidence, ocr_engine_used,
                         drive_file_id, drive_link, drive_folder_id, sheet_row_number,
                         attempt_count, last_error, bytes_uploaded, upload_speed_bps,
-                        discovered_at, started_at, completed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        discovered_at, started_at, completed_at, ocr_raw_text, manually_confirmed
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(job_id) DO UPDATE SET
                         source_path=excluded.source_path,
                         original_filename=excluded.original_filename,
@@ -73,7 +75,9 @@ class JobsRepository:
                         bytes_uploaded=excluded.bytes_uploaded,
                         upload_speed_bps=excluded.upload_speed_bps,
                         started_at=excluded.started_at,
-                        completed_at=excluded.completed_at
+                        completed_at=excluded.completed_at,
+                        ocr_raw_text=excluded.ocr_raw_text,
+                        manually_confirmed=excluded.manually_confirmed
                     """,
                     (
                         job.job_id,
@@ -96,6 +100,8 @@ class JobsRepository:
                         job.discovered_at.isoformat(),
                         job.started_at.isoformat() if job.started_at else None,
                         job.completed_at.isoformat() if job.completed_at else None,
+                        job.ocr_raw_text,
+                        int(job.manually_confirmed),
                     ),
                 )
         except sqlite3.Error as exc:
@@ -141,3 +147,36 @@ class JobsRepository:
     def delete(self, job_id: str) -> None:
         with self._db.write_cursor() as cur:
             cur.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+
+    def prune_terminal_jobs_older_than(self, cutoff: datetime, *, batch_limit: int = 5000) -> int:
+        """Delete COMPLETED/DUPLICATE rows discovered before `cutoff`.
+
+        Only touches the live working table — `upload_logs` (the durable,
+        searchable/exportable audit trail) is never pruned by this. FAILED
+        and NEEDS_REVIEW rows are deliberately excluded so nothing a human
+        still needs to act on ever disappears on its own. `batch_limit`
+        bounds a single call's work so pruning a very large backlog (e.g.
+        first upgrade to a version with pruning, after months of unpruned
+        growth) can't itself become a multi-second startup stall.
+        """
+        try:
+            with self._db.write_cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM jobs
+                    WHERE job_id IN (
+                        SELECT job_id FROM jobs
+                        WHERE status IN (?, ?) AND discovered_at < ?
+                        LIMIT ?
+                    )
+                    """,
+                    (
+                        JobStatus.COMPLETED.value,
+                        JobStatus.DUPLICATE.value,
+                        cutoff.isoformat(),
+                        batch_limit,
+                    ),
+                )
+                return cur.rowcount if cur.rowcount is not None else 0
+        except sqlite3.Error as exc:
+            raise RepositoryError(f"Failed to prune old jobs: {exc}") from exc

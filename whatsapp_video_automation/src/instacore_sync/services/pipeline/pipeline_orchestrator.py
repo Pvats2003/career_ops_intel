@@ -19,7 +19,7 @@ event sink to Qt signals.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from instacore_sync.core.config import AppSettings
@@ -41,6 +41,7 @@ from instacore_sync.services.upload.upload_queue import UploadQueue
 from instacore_sync.services.upload.upload_worker_pool import UploadWorkerPool
 from instacore_sync.services.watcher.folder_watcher import FolderWatcher
 from instacore_sync.utils.file_utils import is_video_file
+from instacore_sync.utils.text_sanitize import is_valid_device_id
 
 logger = get_logger(__name__)
 
@@ -80,7 +81,9 @@ class PipelineOrchestrator:
             event_sink=self._events,
         )
         self._queue = UploadQueue()
-        self._worker_pool = UploadWorkerPool(settings.uploads, self._queue, self._processor, self._events)
+        self._worker_pool = UploadWorkerPool(
+            settings.uploads, self._queue, self._processor, jobs_repo, self._events
+        )
         self._watcher: FolderWatcher | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
@@ -92,6 +95,7 @@ class PipelineOrchestrator:
         await self._probe_ocr_engines()
         await self._probe_google_auth()
         await self._requeue_incomplete_jobs()
+        await self._prune_old_jobs()
 
         self._worker_pool.start()
 
@@ -144,6 +148,93 @@ class PipelineOrchestrator:
                 job.mark_failed("Source file no longer exists after restart")
                 self._jobs_repo.upsert(job)
                 self._events.on_job_updated(job)
+
+    async def _prune_old_jobs(self) -> None:
+        """Keep the `jobs` working table from growing forever.
+
+        At 150-500 videos/day, an app left running continuously for months
+        would otherwise accumulate tens of thousands of COMPLETED rows it
+        never needs again (the durable record already lives in
+        `upload_logs`). Runs once per app start, off the hot path.
+        """
+        retention_days = self._settings.app.jobs_retention_days
+        if retention_days <= 0:
+            return  # 0/negative disables pruning entirely
+        cutoff = datetime.now() - timedelta(days=retention_days)
+        loop = asyncio.get_running_loop()
+        deleted = await loop.run_in_executor(None, self._jobs_repo.prune_terminal_jobs_older_than, cutoff)
+        if deleted:
+            logger.info("pipeline.old_jobs_pruned", count=deleted, retention_days=retention_days)
+
+    # -- manual controls (Queue view's Retry button, top bar Pause/Resume) -----
+
+    def pause_uploads(self) -> None:
+        self._worker_pool.pause()
+        self._events.on_pause_state_changed(True)
+
+    def resume_uploads(self) -> None:
+        self._worker_pool.resume()
+        self._events.on_pause_state_changed(False)
+
+    @property
+    def is_paused(self) -> bool:
+        return self._worker_pool.is_paused
+
+    def retry_job(self, job_id: str) -> bool:
+        """Re-queue a FAILED or NEEDS_REVIEW job on demand.
+
+        Returns False (and does nothing) if the job can't be found, isn't
+        in a retryable state, or its source file no longer exists on disk
+        (e.g. a user manually deleted it from the Failed/NeedsReview
+        folder) — callers should surface that to the user rather than
+        silently queuing a job that can only fail again immediately.
+        """
+        job = self._jobs_repo.get(job_id)
+        if job is None or job.status not in (JobStatus.FAILED, JobStatus.NEEDS_REVIEW):
+            return False
+        if not job.source_path.exists():
+            logger.warning("pipeline.retry_job_missing_file", job_id=job_id, path=str(job.source_path))
+            return False
+
+        job.attempt_count = 0
+        job.last_error = None
+        self._enqueue(job)
+        logger.info("pipeline.job_retried_manually", job_id=job_id, filename=job.original_filename)
+        return True
+
+    def resolve_needs_review(self, job_id: str, manual_device_id: str) -> bool:
+        """Apply an operator's manually-chosen Device ID (Needs Review
+        screen) and re-queue straight to upload, skipping OCR entirely.
+
+        Returns False without making any change if the job isn't (still) in
+        Needs Review, its file is gone, or `manual_device_id` doesn't match
+        the configured pattern — the same validation `VideoProcessor`
+        itself applies before ever creating a Drive folder, checked here
+        too so the UI can reject an obviously bad entry immediately rather
+        than silently queuing a job that will just bounce back.
+        """
+        job = self._jobs_repo.get(job_id)
+        if job is None or job.status != JobStatus.NEEDS_REVIEW:
+            return False
+        if not job.source_path.exists():
+            logger.warning("pipeline.resolve_needs_review_missing_file", job_id=job_id)
+            return False
+        if not is_valid_device_id(manual_device_id, self._settings.ocr.device_id_pattern):
+            return False
+
+        job.device_id = manual_device_id
+        job.manually_confirmed = True
+        job.ocr_confidence = 1.0
+        job.attempt_count = 0
+        job.last_error = None
+        self._enqueue(job)
+        logger.info(
+            "pipeline.needs_review_resolved_manually",
+            job_id=job_id,
+            filename=job.original_filename,
+            device_id=manual_device_id,
+        )
+        return True
 
     # -- status probing ---------------------------------------------------------
 

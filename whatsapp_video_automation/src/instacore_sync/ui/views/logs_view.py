@@ -24,6 +24,15 @@ from instacore_sync.domain.enums import JobStatus
 from instacore_sync.ui.widgets.status_badge import StatusBadge
 
 
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "–"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m {secs}s"
+
+
 class LogsView(QWidget):
     def __init__(self, logs_repo: LogsRepository, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
@@ -70,9 +79,12 @@ class LogsView(QWidget):
         filters.addWidget(export_button)
         root.addLayout(filters)
 
-        self._table = QTableWidget(0, 7)
+        self._table = QTableWidget(0, 10)
         self._table.setHorizontalHeaderLabels(
-            ["Filename", "Device ID", "Status", "OCR Confidence", "Engine", "Drive Link", "Completed At"]
+            [
+                "Filename", "Device ID", "Status", "OCR Confidence", "Engine", "Drive Link",
+                "Completed At", "OCR Time", "Upload Time", "Total Time",
+            ]
         )
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -107,6 +119,9 @@ class LogsView(QWidget):
             self._table.setItem(row, 5, QTableWidgetItem(entry.drive_link or entry.error_message or ""))
             completed = entry.completed_at.strftime("%Y-%m-%d %H:%M:%S") if entry.completed_at else "–"
             self._table.setItem(row, 6, QTableWidgetItem(completed))
+            self._table.setItem(row, 7, QTableWidgetItem(_format_duration(entry.ocr_duration_seconds)))
+            self._table.setItem(row, 8, QTableWidgetItem(_format_duration(entry.upload_duration_seconds)))
+            self._table.setItem(row, 9, QTableWidgetItem(_format_duration(entry.total_duration_seconds)))
 
     def _export_csv(self) -> None:
         default_path = str(Path.home() / "instacore_sync_logs.csv")

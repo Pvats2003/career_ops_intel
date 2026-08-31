@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from instacore_sync.db.database import Database
@@ -8,8 +9,17 @@ from instacore_sync.domain.enums import JobStatus
 from instacore_sync.domain.models import VideoJob
 
 
-def _job(name: str = "IC-188.mp4", status: JobStatus = JobStatus.DISCOVERED) -> VideoJob:
-    return VideoJob(source_path=Path(f"/tmp/{name}"), original_filename=name, status=status)
+def _job(
+    name: str = "IC-188.mp4",
+    status: JobStatus = JobStatus.DISCOVERED,
+    discovered_at: datetime | None = None,
+) -> VideoJob:
+    return VideoJob(
+        source_path=Path(f"/tmp/{name}"),
+        original_filename=name,
+        status=status,
+        discovered_at=discovered_at or datetime.now(),
+    )
 
 
 def test_upsert_and_get_roundtrip(database: Database) -> None:
@@ -71,6 +81,37 @@ def test_counts_by_status(database: Database) -> None:
     counts = repo.counts_by_status()
     assert counts[JobStatus.QUEUED] == 2
     assert counts[JobStatus.FAILED] == 1
+
+
+def test_prune_terminal_jobs_older_than_deletes_old_completed_and_duplicate(database: Database) -> None:
+    repo = JobsRepository(database)
+    old = datetime.now() - timedelta(days=60)
+    recent = datetime.now() - timedelta(hours=1)
+
+    repo.upsert(_job("old_completed.mp4", JobStatus.COMPLETED, discovered_at=old))
+    repo.upsert(_job("old_duplicate.mp4", JobStatus.DUPLICATE, discovered_at=old))
+    repo.upsert(_job("recent_completed.mp4", JobStatus.COMPLETED, discovered_at=recent))
+
+    deleted = repo.prune_terminal_jobs_older_than(datetime.now() - timedelta(days=30))
+
+    assert deleted == 2
+    remaining = {j.original_filename for j in repo.list_by_status(JobStatus.COMPLETED, JobStatus.DUPLICATE)}
+    assert remaining == {"recent_completed.mp4"}
+
+
+def test_prune_terminal_jobs_never_deletes_failed_or_needs_review(database: Database) -> None:
+    """FAILED/NEEDS_REVIEW rows need a human to act on them — pruning must
+    never make them silently disappear, no matter how old."""
+    repo = JobsRepository(database)
+    ancient = datetime.now() - timedelta(days=365)
+    repo.upsert(_job("old_failed.mp4", JobStatus.FAILED, discovered_at=ancient))
+    repo.upsert(_job("old_review.mp4", JobStatus.NEEDS_REVIEW, discovered_at=ancient))
+
+    deleted = repo.prune_terminal_jobs_older_than(datetime.now() - timedelta(days=30))
+
+    assert deleted == 0
+    statuses = {j.original_filename for j in repo.list_by_status(JobStatus.FAILED, JobStatus.NEEDS_REVIEW)}
+    assert statuses == {"old_failed.mp4", "old_review.mp4"}
 
 
 def test_find_by_hash(database: Database) -> None:

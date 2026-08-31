@@ -1,11 +1,19 @@
 # Database Schema
 
 InstaCore Sync uses a single local SQLite database (WAL journal mode) at
-`%LOCALAPPDATA%\InstacoreSync\instacore_sync.db`. The schema lives in
-`src/instacore_sync/db/migrations/0001_init.sql` and is applied
-automatically on first connection by `Database.ensure_migrated()`
+`%LOCALAPPDATA%\InstacoreSync\instacore_sync.db`. The schema is built up by
+`src/instacore_sync/db/migrations/*.sql`, applied in order and automatically
+on first connection by `Database.ensure_migrated()`
 (`src/instacore_sync/db/database.py`) — there is no separate migration
 command to run.
+
+| Migration | Adds |
+|---|---|
+| `0001_init.sql` | The initial schema: `jobs`, `uploaded_hashes`, `upload_logs`, `drive_folder_cache`, `app_state` |
+| `0002_needs_review_fields.sql` | `jobs.ocr_raw_text` and `jobs.manually_confirmed` — the Needs Review screen's detected-text display and manual-override tracking |
+| `0003_log_timing_fields.sql` | `upload_logs.ocr_duration_seconds`, `.upload_duration_seconds`, `.total_duration_seconds`, `.stack_trace` — per-stage timing and full tracebacks for unexpected failures, surfaced in the Logs screen |
+
+The tables/columns below reflect the schema after all three migrations.
 
 ## Entity-relationship overview
 

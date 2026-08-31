@@ -25,8 +25,10 @@ from instacore_sync.services.pipeline.video_processor import VideoProcessor
 class _StubOcr:
     def __init__(self, extraction: DeviceIdExtraction) -> None:
         self._extraction = extraction
+        self.call_count = 0
 
     def extract(self, video_path: Path) -> DeviceIdExtraction:
+        self.call_count += 1
         return self._extraction
 
 
@@ -156,3 +158,89 @@ def test_duplicate_video_is_skipped_without_uploading(tmp_path: Path, database: 
     processed_second = processor.process(second_job)
     assert processed_second.status == JobStatus.DUPLICATE
     assert len(drive.uploaded) == 1  # not uploaded again
+
+
+def test_pattern_invalid_device_id_is_rejected_before_drive_upload(tmp_path: Path, database: Database) -> None:
+    """Defense-in-depth: even if something upstream of `_upload` (a bad OCR
+    stub, or eventually a manual override) sets a device_id that doesn't
+    match the configured pattern, it must never reach Drive/Sheets as a
+    folder name / row value — it should route to Needs Review instead."""
+    ocr = _StubOcr(
+        DeviceIdExtraction(device_id="../../etc/passwd", confidence=0.99, engine_used=OcrEngineName.TESSERACT)
+    )
+    drive = _StubDrive()
+    sheets = _StubSheets()
+    processor = _make_processor(tmp_path, database, ocr, drive, sheets)
+
+    job = processor.process(_video_job(tmp_path))
+
+    assert job.status == JobStatus.NEEDS_REVIEW
+    assert "does not match the expected pattern" in (job.last_error or "")
+    assert len(drive.uploaded) == 0
+
+
+def test_manually_confirmed_device_id_skips_ocr_and_uploads(tmp_path: Path, database: Database) -> None:
+    """The Needs Review screen's manual override sets device_id +
+    manually_confirmed on the job before re-queuing it; VideoProcessor must
+    trust that choice rather than re-running OCR (which would just
+    reproduce the same low-confidence read that sent it to review)."""
+    ocr = _StubOcr(DeviceIdExtraction(device_id=None, confidence=0.0))  # would fail if actually called
+    drive = _StubDrive()
+    sheets = _StubSheets()
+    processor = _make_processor(tmp_path, database, ocr, drive, sheets)
+
+    job = _video_job(tmp_path)
+    job.device_id = "IC-188"
+    job.manually_confirmed = True
+
+    processed = processor.process(job)
+
+    assert processed.status == JobStatus.COMPLETED
+    assert processed.device_id == "IC-188"
+    assert ocr.call_count == 0  # OCR was never invoked
+    assert len(drive.uploaded) == 1
+    assert len(sheets.rows) == 1
+
+
+def test_successful_run_records_ocr_upload_and_total_durations(tmp_path: Path, database: Database) -> None:
+    ocr = _StubOcr(
+        DeviceIdExtraction(device_id="IC-188", confidence=0.95, engine_used=OcrEngineName.TESSERACT)
+    )
+    drive = _StubDrive()  # returns duration_seconds=0.01 for every upload
+    sheets = _StubSheets()
+    processor = _make_processor(tmp_path, database, ocr, drive, sheets)
+    logs_repo = LogsRepository(database)
+
+    job = processor.process(_video_job(tmp_path))
+
+    assert job.ocr_duration_seconds is not None and job.ocr_duration_seconds >= 0
+    assert job.upload_duration_seconds == pytest.approx(0.01)
+
+    logged = logs_repo.search(limit=10)
+    assert len(logged) == 1
+    entry = logged[0]
+    assert entry.ocr_duration_seconds is not None
+    assert entry.upload_duration_seconds == pytest.approx(0.01)
+    assert entry.total_duration_seconds is not None and entry.total_duration_seconds >= 0
+    assert entry.stack_trace is None  # no error occurred
+
+
+def test_unexpected_exception_records_stack_trace_in_log(tmp_path: Path, database: Database) -> None:
+    class _ExplodingOcr:
+        def extract(self, video_path: Path) -> DeviceIdExtraction:
+            raise RuntimeError("simulated unexpected OCR crash")
+
+    drive = _StubDrive()
+    sheets = _StubSheets()
+    processor = _make_processor(tmp_path, database, _ExplodingOcr(), drive, sheets)
+    logs_repo = LogsRepository(database)
+
+    job = processor.process(_video_job(tmp_path))
+
+    assert job.status == JobStatus.FAILED
+    logged = logs_repo.search(limit=10)
+    assert len(logged) == 1
+    entry = logged[0]
+    assert entry.stack_trace is not None
+    assert "RuntimeError" in entry.stack_trace
+    assert "simulated unexpected OCR crash" in entry.stack_trace

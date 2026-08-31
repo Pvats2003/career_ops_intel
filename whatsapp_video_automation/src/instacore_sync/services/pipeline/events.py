@@ -29,6 +29,8 @@ class PipelineEventSink(Protocol):
 
     def on_log_message(self, level: str, message: str) -> None: ...
 
+    def on_pause_state_changed(self, is_paused: bool) -> None: ...
+
 
 class NullEventSink:
     """No-op sink — used by default and in unit tests that don't care about events."""
@@ -52,4 +54,7 @@ class NullEventSink:
         pass
 
     def on_log_message(self, level: str, message: str) -> None:
+        pass
+
+    def on_pause_state_changed(self, is_paused: bool) -> None:
         pass

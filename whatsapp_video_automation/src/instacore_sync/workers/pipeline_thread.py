@@ -77,3 +77,27 @@ class PipelineThread(QThread):
             self._signals.on_stats_changed(stats)
 
         loop.call_soon_threadsafe(_compute)
+
+    def pause_uploads(self) -> None:
+        """Thread-safe: stop starting new uploads, let in-flight ones finish."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._orchestrator.pause_uploads)
+
+    def resume_uploads(self) -> None:
+        """Thread-safe: resume pulling new uploads from the queue."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._orchestrator.resume_uploads)
+
+    def retry_job(self, job_id: str) -> None:
+        """Thread-safe: re-queue a FAILED/NEEDS_REVIEW job (Queue view's Retry button)."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._orchestrator.retry_job, job_id)
+
+    def resolve_needs_review(self, job_id: str, manual_device_id: str) -> None:
+        """Thread-safe: apply a manually-chosen Device ID and queue for upload."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._orchestrator.resolve_needs_review, job_id, manual_device_id)

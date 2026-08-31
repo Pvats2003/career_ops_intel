@@ -1,13 +1,15 @@
 """Google OAuth2 (installed-app flow) for Drive + Sheets access.
 
-Credentials are cached to `token.json` (per settings) so the user only goes
-through the browser consent screen once; subsequent runs silently refresh
-the access token. See docs/GOOGLE_API_SETUP.md for how to obtain
+Credentials are cached to `token.json` (per settings), **encrypted at
+rest** (see `token_crypto.py`), so the user only goes through the browser
+consent screen once; subsequent runs silently decrypt and refresh the
+access token. See docs/GOOGLE_API_SETUP.md for how to obtain
 `credentials.json` from Google Cloud Console.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from instacore_sync.core.constants import GOOGLE_DRIVE_SCOPES
 from instacore_sync.core.exceptions import DriveAuthError
 from instacore_sync.core.logging_setup import get_logger
 from instacore_sync.domain.enums import GoogleAuthStatus
+from instacore_sync.services.drive.token_crypto import CredentialProtector
 
 logger = get_logger(__name__)
 
@@ -30,6 +33,7 @@ class GoogleAuthService:
     def __init__(self, credentials_file: Path, token_file: Path) -> None:
         self._credentials_file = credentials_file
         self._token_file = token_file
+        self._protector = CredentialProtector(token_file.with_suffix(".key"))
         self._credentials: Credentials | None = None
         self._status = GoogleAuthStatus.SIGNED_OUT
         self._lock = threading.Lock()
@@ -57,19 +61,16 @@ class GoogleAuthService:
             self._account_email = None
             if self._token_file.exists():
                 self._token_file.unlink()
+            key_file = self._protector.key_file
+            if key_file.exists():
+                key_file.unlink()
 
     def _load_or_authenticate(self) -> Credentials:
         self._status = GoogleAuthStatus.AUTHENTICATING
         creds: Credentials | None = None
 
         if self._token_file.exists():
-            try:
-                creds = Credentials.from_authorized_user_file(
-                    str(self._token_file), GOOGLE_DRIVE_SCOPES
-                )
-            except (ValueError, OSError) as exc:
-                logger.warning("drive_auth.token_load_failed", error=str(exc))
-                creds = None
+            creds = self._load_encrypted_token()
 
         if creds and creds.valid:
             self._status = GoogleAuthStatus.AUTHENTICATED
@@ -105,6 +106,22 @@ class GoogleAuthService:
         self._status = GoogleAuthStatus.AUTHENTICATED
         return creds
 
+    def _load_encrypted_token(self) -> Credentials | None:
+        try:
+            ciphertext = self._token_file.read_bytes()
+            plaintext = self._protector.decrypt(ciphertext)
+            info = json.loads(plaintext)
+            return Credentials.from_authorized_user_info(info, GOOGLE_DRIVE_SCOPES)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            logger.warning("drive_auth.token_load_failed", error=str(exc))
+            return None
+        except Exception as exc:  # noqa: BLE001 - backend-specific decrypt errors (DPAPI/Fernet)
+            logger.warning("drive_auth.token_decrypt_failed", error=str(exc))
+            return None
+
     def _persist(self, creds: Credentials) -> None:
         self._token_file.parent.mkdir(parents=True, exist_ok=True)
-        self._token_file.write_text(creds.to_json(), encoding="utf-8")
+        plaintext = creds.to_json().encode("utf-8")
+        ciphertext = self._protector.encrypt(plaintext)
+        self._token_file.write_bytes(ciphertext)
+        logger.info("drive_auth.token_persisted", backend=self._protector.backend)

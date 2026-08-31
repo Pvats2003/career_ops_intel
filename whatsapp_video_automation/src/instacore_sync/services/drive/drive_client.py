@@ -23,7 +23,8 @@ from instacore_sync.core.exceptions import DriveApiError
 from instacore_sync.core.logging_setup import get_logger
 from instacore_sync.db.repositories.settings_repository import DriveFolderCacheRepository
 from instacore_sync.domain.models import UploadResult
-from instacore_sync.utils.retry import network_retry
+from instacore_sync.utils.google_api_errors import is_not_found_error
+from instacore_sync.utils.retry import google_api_retry
 
 logger = get_logger(__name__)
 
@@ -57,8 +58,10 @@ class DriveClient:
         """Find (or create) the top-level `date_label` folder under the configured root."""
         cache_key = date_label
         cached = self._folder_cache.get(cache_key)
-        if cached:
+        if cached and self._cached_folder_still_exists(cached):
             return cached
+        if cached:
+            self._evict_stale_cache_entry(cache_key, cached)
 
         parent_id = self._settings.root_folder_id
         folder_id = self._find_or_create_folder(date_label, parent_id)
@@ -69,15 +72,43 @@ class DriveClient:
         """Find (or create) the `IC-xxx` folder inside a date folder."""
         cache_key = f"{date_label}/{device_id}"
         cached = self._folder_cache.get(cache_key)
-        if cached:
+        if cached and self._cached_folder_still_exists(cached):
             return cached
+        if cached:
+            self._evict_stale_cache_entry(cache_key, cached)
 
         date_folder_id = self.get_or_create_date_folder(date_label)
         folder_id = self._find_or_create_folder(device_id, date_folder_id)
         self._folder_cache.set(cache_key, folder_id, date_folder_id)
         return folder_id
 
-    @network_retry(retry_on=(HttpError,))
+    def _cached_folder_still_exists(self, folder_id: str) -> bool:
+        """Cheap existence check for a cached folder id.
+
+        A cached Drive folder id can go stale if someone manually renames,
+        moves, or deletes the folder in Drive during the day — without
+        this check, every upload for that IC would silently keep failing
+        with a 404 on `files.create` until the app restarts and the cache
+        (which is DB-persisted, not just in-memory) happens to be cleared.
+        We don't cache a "not found" result here on purpose: it's one
+        cheap `files.get` call per cache *hit* that would otherwise have
+        gone stale, versus a full failed upload attempt.
+        """
+        try:
+            self._drive().files().get(fileId=folder_id, fields="id", supportsAllDrives=True).execute()
+            return True
+        except HttpError as exc:
+            # Only a definitive 404 evicts the entry — any other error
+            # (network blip, auth hiccup) must not evict a possibly-still-
+            # valid cache entry over a transient failure; let the normal
+            # upload retry path handle those instead.
+            return not is_not_found_error(exc)
+
+    def _evict_stale_cache_entry(self, cache_key: str, stale_folder_id: str) -> None:
+        logger.warning("drive.folder_cache.stale_entry_evicted", cache_key=cache_key, folder_id=stale_folder_id)
+        self._folder_cache.delete(cache_key)
+
+    @google_api_retry()
     def _find_or_create_folder(self, name: str, parent_id: str) -> str:
         escaped = name.replace("'", "\\'")
         query = (
@@ -167,11 +198,11 @@ class DriveClient:
         except OSError as exc:
             raise DriveApiError(f"Local file error while uploading {file_path.name}: {exc}") from exc
 
-    @network_retry(max_attempts=6, retry_on=(HttpError,))
+    @google_api_retry(max_attempts=6)
     def _next_chunk_with_retry(self, request):  # type: ignore[no-untyped-def]
         return request.next_chunk()
 
-    @network_retry(retry_on=(HttpError,))
+    @google_api_retry()
     def set_anyone_with_link(self, file_id: str) -> None:
         try:
             self._drive().permissions().create(

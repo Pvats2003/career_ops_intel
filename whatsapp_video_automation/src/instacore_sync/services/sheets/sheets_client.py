@@ -4,6 +4,15 @@ A row is identified by filename (unique per upload). If a row for the
 filename already exists (e.g. a retry after the app crashed mid-run) it is
 updated in place instead of appended, so re-processing never creates
 duplicate rows.
+
+Row lookups are served from an in-memory `filename -> row number` cache
+built from a single read the first time it's needed, instead of one
+`values.get` API call per upload — at 200-500 uploads/day that's the
+difference between 200-500 lookup calls and effectively one. The cache is
+process-lifetime (rebuilt fresh on every app restart) and assumes this
+process is the sole writer to the sheet while it's running; call
+`invalidate_cache()` (wired to a future "Resync Sheet" action) if the sheet
+was edited by hand mid-session.
 """
 
 from __future__ import annotations
@@ -19,7 +28,8 @@ from instacore_sync.core.config import SheetsSettings
 from instacore_sync.core.exceptions import SheetsApiError
 from instacore_sync.core.logging_setup import get_logger
 from instacore_sync.domain.models import SheetUpdateResult
-from instacore_sync.utils.retry import network_retry
+from instacore_sync.utils.retry import google_api_retry
+from instacore_sync.utils.text_sanitize import sanitize_for_spreadsheet_cell
 
 logger = get_logger(__name__)
 
@@ -33,6 +43,8 @@ class SheetsClient:
         self._settings = settings
         self._credentials_provider = credentials_provider
         self._service: Resource | None = None
+        self._row_cache: dict[str, int] = {}
+        self._next_row_number: int | None = None
 
     def _sheets(self) -> Resource:
         if self._service is None:
@@ -41,7 +53,14 @@ class SheetsClient:
             )
         return self._service
 
-    @network_retry(retry_on=(HttpError,))
+    def invalidate_cache(self) -> None:
+        """Force the next lookup to re-read the sheet instead of trusting
+        the in-memory row index — use after an out-of-band edit to the
+        sheet (e.g. a human manually reordered/deleted rows)."""
+        self._row_cache = {}
+        self._next_row_number = None
+
+    @google_api_retry()
     def upsert_row(
         self,
         *,
@@ -55,12 +74,13 @@ class SheetsClient:
         cols = self._settings.columns
         sheet = self._settings.worksheet_name
 
-        existing_row = self._find_row_by_filename(filename)
+        self._ensure_row_cache()
+        existing_row = self._row_cache.get(filename)
         row_values = {
-            cols.date: date_label,
-            cols.device_id: device_id,
-            cols.filename: filename,
-            cols.drive_link: drive_link,
+            cols.date: sanitize_for_spreadsheet_cell(date_label),
+            cols.device_id: sanitize_for_spreadsheet_cell(device_id),
+            cols.filename: sanitize_for_spreadsheet_cell(filename),
+            cols.drive_link: drive_link,  # our own generated Drive URL — never attacker-controlled
             cols.status: status,
             cols.uploaded_at: datetime.now().isoformat(timespec="seconds"),
             cols.ocr_confidence: f"{ocr_confidence:.2f}",
@@ -75,8 +95,11 @@ class SheetsClient:
                     created_new_row=False,
                 )
 
-            next_row = self._next_empty_row()
+            assert self._next_row_number is not None  # set by _ensure_row_cache
+            next_row = self._next_row_number
             self._write_row(sheet, next_row, row_values)
+            self._row_cache[filename] = next_row
+            self._next_row_number += 1
             return SheetUpdateResult(
                 spreadsheet_id=self._settings.spreadsheet_id,
                 row_number=next_row,
@@ -85,7 +108,10 @@ class SheetsClient:
         except HttpError as exc:
             raise SheetsApiError(f"Failed to write sheet row for {filename}: {exc}") from exc
 
-    def _find_row_by_filename(self, filename: str) -> int | None:
+    def _ensure_row_cache(self) -> None:
+        if self._next_row_number is not None:
+            return  # already primed this session
+
         cols = self._settings.columns
         col = cols.filename
         range_ = f"{self._settings.worksheet_name}!{col}{self._settings.header_row + 1}:{col}"
@@ -102,27 +128,10 @@ class SheetsClient:
 
         values = result.get("values", [])
         for offset, row in enumerate(values):
-            if row and row[0] == filename:
-                return self._settings.header_row + 1 + offset
-        return None
-
-    def _next_empty_row(self) -> int:
-        cols = self._settings.columns
-        col = cols.filename
-        range_ = f"{self._settings.worksheet_name}!{col}{self._settings.header_row + 1}:{col}"
-        try:
-            result = (
-                self._sheets()
-                .spreadsheets()
-                .values()
-                .get(spreadsheetId=self._settings.spreadsheet_id, range=range_)
-                .execute()
-            )
-        except HttpError as exc:
-            raise SheetsApiError(f"Failed to determine next empty row: {exc}") from exc
-
-        values = result.get("values", [])
-        return self._settings.header_row + 1 + len(values)
+            if row and row[0]:
+                self._row_cache[row[0]] = self._settings.header_row + 1 + offset
+        self._next_row_number = self._settings.header_row + 1 + len(values)
+        logger.info("sheets.row_cache.primed", known_rows=len(self._row_cache))
 
     def _write_row(self, sheet: str, row_number: int, values_by_column: dict[str, str]) -> None:
         data = [
@@ -134,7 +143,7 @@ class SheetsClient:
             body={"valueInputOption": "USER_ENTERED", "data": data},
         ).execute()
 
-    @network_retry(retry_on=(HttpError,))
+    @google_api_retry()
     def ensure_header_row(self) -> None:
         cols = self._settings.columns
         header_values = {

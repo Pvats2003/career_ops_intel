@@ -49,6 +49,12 @@ class VideoJob(BaseModel):
     device_id: str | None = None
     ocr_confidence: float = 0.0
     ocr_engine_used: OcrEngineName | None = None
+    ocr_raw_text: str | None = None
+    # True once an operator has manually picked the Device ID on the Needs
+    # Review screen — tells VideoProcessor to trust it and skip re-running
+    # OCR, which would otherwise just reproduce the same low-confidence
+    # guess that sent the video to Needs Review in the first place.
+    manually_confirmed: bool = False
 
     drive_file_id: str | None = None
     drive_link: str | None = None
@@ -61,6 +67,13 @@ class VideoJob(BaseModel):
 
     bytes_uploaded: int = 0
     upload_speed_bps: float = 0.0
+
+    # Timing for the current processing attempt only — not persisted to the
+    # `jobs` table (they're only meaningful for the terminal `UploadLogEntry`
+    # a completed attempt produces, not as ongoing job state to restore
+    # across a restart).
+    ocr_duration_seconds: float | None = None
+    upload_duration_seconds: float | None = None
 
     discovered_at: datetime = Field(default_factory=datetime.now)
     started_at: datetime | None = None
@@ -134,3 +147,11 @@ class UploadLogEntry(BaseModel):
     error_message: str | None
     created_at: datetime = Field(default_factory=datetime.now)
     completed_at: datetime | None = None
+    ocr_duration_seconds: float | None = None
+    upload_duration_seconds: float | None = None
+    total_duration_seconds: float | None = None
+    # Full traceback text, populated only for a truly unexpected exception
+    # (not for the classified, already-descriptive error types) — for
+    # after-the-fact debugging without needing to dig through the rotating
+    # developer log file for the matching timestamp.
+    stack_trace: str | None = None

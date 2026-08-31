@@ -42,7 +42,7 @@ ocr:
   min_confidence: 0.55
   max_seconds_scanned: 6.0      # never scan more than the first N seconds unless review fallback
   frame_interval_seconds: 0.5
-  device_id_pattern: "IC-\\d{1,5}"
+  device_id_pattern: "(?<![A-Za-z0-9])IC-\\d{1,5}(?!\\d)"
   full_scan_on_low_confidence: true   # last resort: scan whole video if first N seconds fail
 
 # --- Uploads -----------------------------------------------------------
@@ -61,3 +61,4 @@ app:
   minimize_to_tray: true
   poll_interval_seconds: 2.0
   log_level: "INFO"
+  jobs_retention_days: 30   # COMPLETED/DUPLICATE rows older than this are pruned on startup; 0 disables pruning

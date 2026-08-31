@@ -24,6 +24,7 @@ class PipelineSignalBus(QObject):
     auth_status_changed = Signal(object, object)     # GoogleAuthStatus, str | None
     ocr_engine_status_changed = Signal(str, object)  # engine name, OcrEngineStatus
     log_message = Signal(str, str)        # level, message
+    pause_state_changed = Signal(bool)    # is_paused
 
     # -- PipelineEventSink protocol implementation --------------------------
 
@@ -47,3 +48,6 @@ class PipelineSignalBus(QObject):
 
     def on_log_message(self, level: str, message: str) -> None:
         self.log_message.emit(level, message)
+
+    def on_pause_state_changed(self, is_paused: bool) -> None:
+        self.pause_state_changed.emit(is_paused)

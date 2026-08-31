@@ -56,6 +56,10 @@ class DriveFolderCacheRepository:
                 (cache_key, folder_id, parent_folder_id, datetime.now().isoformat()),
             )
 
+    def delete(self, cache_key: str) -> None:
+        with self._db.write_cursor() as cur:
+            cur.execute("DELETE FROM drive_folder_cache WHERE cache_key = ?", (cache_key,))
+
     def clear(self) -> None:
         with self._db.write_cursor() as cur:
             cur.execute("DELETE FROM drive_folder_cache")
