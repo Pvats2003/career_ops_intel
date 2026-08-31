@@ -1,0 +1,154 @@
+/* InstaCore Sync — light theme
+ * Mirrors dark_theme.qss structurally (same object/class names) with a
+ * bright, soft-glass palette for users who prefer light mode.
+ */
+
+* {
+    outline: none;
+    font-family: "Segoe UI", "Inter", sans-serif;
+}
+
+QWidget {
+    background-color: transparent;
+    color: #1C1E33;
+    font-size: 13px;
+}
+
+QMainWindow {
+    background-color: #F3F4FB;
+}
+
+#AppBackground {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #F7F8FD, stop:0.5 #F1F2FA, stop:1 #EDEEF9
+    );
+}
+
+#Sidebar {
+    background-color: rgba(255, 255, 255, 0.75);
+    border-right: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+#SidebarBrand {
+    color: #1C1E33;
+    font-size: 17px;
+    font-weight: 700;
+    padding: 22px 20px 6px 20px;
+}
+
+#SidebarSubtitle {
+    color: #6A6E96;
+    font-size: 11px;
+    padding: 0 20px 18px 20px;
+}
+
+QPushButton#NavButton {
+    text-align: left;
+    padding: 11px 18px;
+    margin: 3px 12px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    background-color: transparent;
+    color: #4B4F72;
+    font-weight: 500;
+}
+
+QPushButton#NavButton:hover {
+    background-color: rgba(93, 99, 249, 0.10);
+    color: #1C1E33;
+}
+
+QPushButton#NavButton:checked {
+    background-color: rgba(93, 99, 249, 0.16);
+    border: 1px solid rgba(93, 99, 249, 0.35);
+    color: #1C1E33;
+    font-weight: 600;
+}
+
+.GlassCard, QFrame#GlassCard, QFrame#StatCard {
+    background-color: rgba(255, 255, 255, 0.65);
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    border-radius: 16px;
+}
+
+QFrame#StatCard:hover {
+    border: 1px solid rgba(93, 99, 249, 0.5);
+}
+
+QLabel#StatValue {
+    font-size: 26px;
+    font-weight: 700;
+    color: #1C1E33;
+}
+
+QLabel#StatLabel {
+    font-size: 11px;
+    color: #6A6E96;
+    font-weight: 600;
+}
+
+QLabel#SectionTitle, QLabel#PageTitle {
+    color: #1C1E33;
+    font-weight: 700;
+}
+
+QLabel#PageTitle { font-size: 22px; }
+QLabel#SectionTitle { font-size: 16px; }
+
+QLabel#PageSubtitle, QLabel#Muted {
+    color: #6A6E96;
+    font-size: 12px;
+}
+
+QPushButton {
+    background-color: rgba(0, 0, 0, 0.04);
+    border: 1px solid rgba(0, 0, 0, 0.10);
+    border-radius: 9px;
+    padding: 8px 16px;
+    color: #1C1E33;
+    font-weight: 600;
+}
+
+QPushButton:hover { background-color: rgba(0, 0, 0, 0.08); }
+
+QPushButton#PrimaryButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #5D63F9, stop:1 #34C7CE);
+    border: none;
+    color: #FFFFFF;
+}
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QPlainTextEdit {
+    background-color: #FFFFFF;
+    border: 1px solid rgba(0, 0, 0, 0.12);
+    border-radius: 8px;
+    padding: 7px 10px;
+    color: #1C1E33;
+}
+
+QLineEdit:focus, QComboBox:focus { border: 1px solid #5D63F9; }
+
+QTableView, QTableWidget {
+    background-color: #FFFFFF;
+    alternate-background-color: #F7F8FD;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 12px;
+    gridline-color: rgba(0, 0, 0, 0.06);
+    selection-background-color: rgba(93, 99, 249, 0.18);
+    selection-color: #1C1E33;
+}
+
+QHeaderView::section {
+    background-color: #F1F2FA;
+    color: #6A6E96;
+    padding: 8px;
+    border: none;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    font-weight: 600;
+    font-size: 11px;
+}
+
+#TopBar {
+    background-color: rgba(255, 255, 255, 0.6);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}

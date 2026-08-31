@@ -1,0 +1,401 @@
+/* InstaCore Sync — dark theme
+ * A modern, glassmorphism-inspired palette: deep navy/violet backgrounds,
+ * translucent "glass" panels (semi-transparent fills + soft borders +
+ * rounded corners), and a cyan/violet accent pair. Qt Style Sheets cannot
+ * do real backdrop blur, so "glass" here is approximated with layered
+ * translucent panels over a subtly gradient window background — the
+ * closest a QSS-only stack can get without a custom OpenGL/QGraphicsEffect
+ * pipeline.
+ */
+
+* {
+    outline: none;
+    font-family: "Segoe UI", "Inter", sans-serif;
+}
+
+QWidget {
+    background-color: transparent;
+    color: #E7E9F5;
+    font-size: 13px;
+}
+
+QMainWindow {
+    background-color: #0E1020;
+}
+
+#AppBackground {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 #131529, stop:0.5 #171A33, stop:1 #10122A
+    );
+}
+
+/* -- Sidebar navigation ------------------------------------------------ */
+
+#Sidebar {
+    background-color: rgba(20, 22, 46, 0.75);
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+#SidebarBrand {
+    color: #FFFFFF;
+    font-size: 17px;
+    font-weight: 700;
+    padding: 22px 20px 6px 20px;
+}
+
+#SidebarSubtitle {
+    color: #8489B0;
+    font-size: 11px;
+    padding: 0 20px 18px 20px;
+}
+
+QPushButton#NavButton {
+    text-align: left;
+    padding: 11px 18px;
+    margin: 3px 12px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    background-color: transparent;
+    color: #B7BBDD;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+QPushButton#NavButton:hover {
+    background-color: rgba(124, 131, 253, 0.12);
+    color: #FFFFFF;
+}
+
+QPushButton#NavButton:checked {
+    background-color: rgba(124, 131, 253, 0.22);
+    border: 1px solid rgba(124, 131, 253, 0.45);
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+/* -- Glass cards --------------------------------------------------------- */
+
+.GlassCard, QFrame#GlassCard {
+    background-color: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 16px;
+}
+
+QFrame#StatCard {
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 14px;
+}
+
+QFrame#StatCard:hover {
+    border: 1px solid rgba(124, 131, 253, 0.55);
+    background-color: rgba(124, 131, 253, 0.08);
+}
+
+QLabel#StatValue {
+    font-size: 26px;
+    font-weight: 700;
+    color: #FFFFFF;
+}
+
+QLabel#StatLabel {
+    font-size: 11px;
+    color: #9599C2;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+
+QLabel#SectionTitle {
+    font-size: 16px;
+    font-weight: 700;
+    color: #FFFFFF;
+    padding: 4px 0 2px 0;
+}
+
+QLabel#PageTitle {
+    font-size: 22px;
+    font-weight: 700;
+    color: #FFFFFF;
+}
+
+QLabel#PageSubtitle {
+    font-size: 12px;
+    color: #8489B0;
+}
+
+QLabel#Muted {
+    color: #8489B0;
+    font-size: 12px;
+}
+
+/* -- Buttons -------------------------------------------------------------- */
+
+QPushButton {
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 9px;
+    padding: 8px 16px;
+    color: #E7E9F5;
+    font-weight: 600;
+}
+
+QPushButton:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+QPushButton:pressed {
+    background-color: rgba(255, 255, 255, 0.16);
+}
+
+QPushButton#PrimaryButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7C83FD, stop:1 #5DE0E6);
+    border: none;
+    color: #0B0D1E;
+}
+
+QPushButton#PrimaryButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #8B92FF, stop:1 #6DEAF0);
+}
+
+QPushButton#DangerButton {
+    background-color: rgba(255, 92, 122, 0.18);
+    border: 1px solid rgba(255, 92, 122, 0.5);
+    color: #FF8FA3;
+}
+
+QPushButton#DangerButton:hover {
+    background-color: rgba(255, 92, 122, 0.28);
+}
+
+QPushButton:disabled {
+    background-color: rgba(255, 255, 255, 0.04);
+    color: #565A80;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* -- Inputs --------------------------------------------------------------- */
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QPlainTextEdit {
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    padding: 7px 10px;
+    color: #E7E9F5;
+    selection-background-color: #7C83FD;
+}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+    border: 1px solid #7C83FD;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+
+QCheckBox {
+    color: #E7E9F5;
+    spacing: 8px;
+}
+
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    background-color: rgba(255, 255, 255, 0.04);
+}
+
+QCheckBox::indicator:checked {
+    background-color: #7C83FD;
+    border: 1px solid #7C83FD;
+}
+
+/* -- Tables ----------------------------------------------------------------- */
+
+QTableView, QTableWidget {
+    background-color: rgba(255, 255, 255, 0.03);
+    alternate-background-color: rgba(255, 255, 255, 0.015);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    gridline-color: rgba(255, 255, 255, 0.06);
+    selection-background-color: rgba(124, 131, 253, 0.28);
+    selection-color: #FFFFFF;
+}
+
+QHeaderView::section {
+    background-color: rgba(255, 255, 255, 0.05);
+    color: #9599C2;
+    padding: 8px;
+    border: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QTableView::item, QTableWidget::item {
+    padding: 6px;
+    border: none;
+}
+
+/* -- Status badges (dynamically assigned property `status`) ---------------- */
+
+QLabel[status="completed"] {
+    color: #4ADE80;
+    background-color: rgba(74, 222, 128, 0.14);
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QLabel[status="failed"] {
+    color: #FF6B81;
+    background-color: rgba(255, 107, 129, 0.14);
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QLabel[status="needs_review"] {
+    color: #FBBF24;
+    background-color: rgba(251, 191, 36, 0.14);
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QLabel[status="uploading"], QLabel[status="extracting"], QLabel[status="hashing"], QLabel[status="updating_sheet"] {
+    color: #7C83FD;
+    background-color: rgba(124, 131, 253, 0.16);
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QLabel[status="duplicate"] {
+    color: #9599C2;
+    background-color: rgba(149, 153, 194, 0.14);
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QLabel[status="queued"], QLabel[status="discovered"] {
+    color: #5DE0E6;
+    background-color: rgba(93, 224, 230, 0.14);
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+/* -- Progress bars ----------------------------------------------------------- */
+
+QProgressBar {
+    background-color: rgba(255, 255, 255, 0.06);
+    border: none;
+    border-radius: 6px;
+    height: 8px;
+    text-align: center;
+    color: transparent;
+}
+
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7C83FD, stop:1 #5DE0E6);
+    border-radius: 6px;
+}
+
+/* -- Tabs --------------------------------------------------------------------- */
+
+QTabWidget::pane {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background: transparent;
+    color: #9599C2;
+    padding: 9px 18px;
+    margin-right: 4px;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+}
+
+QTabBar::tab:selected {
+    background-color: rgba(124, 131, 253, 0.18);
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+/* -- Scrollbars ----------------------------------------------------------------- */
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 5px;
+    min-height: 30px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: rgba(255, 255, 255, 0.25);
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 5px;
+    min-width: 30px;
+}
+
+/* -- Tooltips ------------------------------------------------------------------- */
+
+QToolTip {
+    background-color: #1B1E3A;
+    color: #E7E9F5;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+
+/* -- Top bar / status strip ------------------------------------------------------ */
+
+#TopBar {
+    background-color: rgba(255, 255, 255, 0.03);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+QLabel#StatusDotOn {
+    color: #4ADE80;
+    font-size: 16px;
+}
+
+QLabel#StatusDotOff {
+    color: #FF6B81;
+    font-size: 16px;
+}
+
+QLabel#StatusDotWarn {
+    color: #FBBF24;
+    font-size: 16px;
+}
