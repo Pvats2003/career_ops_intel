@@ -42,6 +42,7 @@ from job_agent.applications.browser.snapshot import (
     SnapshotField,
     compute_snapshot_fingerprint,
 )
+from job_agent.applications.human_input import HUMAN_INPUT_SOURCE_PREFIX
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,16 @@ class SnapshotSections:
     unattached_optional_files: tuple[SnapshotField, ...]
 
 
+# Sources that mean "this question was actually resolved with a value" --
+# used by `_unresolved_reason_label` below to detect a field AnswerPlanner
+# vetoed for a STRUCTURAL reason (e.g. multiselect, which FormFiller has
+# no branch for) despite having a real answer, so it is never mislabeled
+# with a "resolved" looking badge while sitting in "Needs your input".
+_RESOLVED_LOOKING_SOURCE_PREFIXES = (
+    "candidate_fact:", "answer_bank:", "llm:", HUMAN_INPUT_SOURCE_PREFIX,
+)
+
+
 def _source_label(source: str) -> str:
     """Human-readable rendering of a SnapshotField's raw provenance
     string (the same `GeneratedAnswer.source` the answer engine already
@@ -67,6 +78,8 @@ def _source_label(source: str) -> str:
     never guessed at."""
     if source.startswith("candidate_fact:"):
         return "[green]✓ Trusted candidate fact[/green]"
+    if source.startswith(HUMAN_INPUT_SOURCE_PREFIX):
+        return "[green]✓ Human input[/green]"
     if source.startswith("answer_bank:"):
         return "[green]✓ Answer bank[/green]"
     if source.startswith("llm:"):
@@ -76,6 +89,21 @@ def _source_label(source: str) -> str:
     if not source:
         return "[dim](n/a)[/dim]"
     return f"[dim]{source}[/dim]"
+
+
+def _unresolved_reason_label(field: SnapshotField) -> str:
+    """Reason label for a field that IS in `unresolved_field_ids` --
+    distinct from `_source_label` above (which assumes the field was
+    successfully resolved). A field can be unresolved despite having a
+    "resolved-looking" source (candidate_fact:/answer_bank:/llm:/
+    human_input:) when AnswerPlanner vetoed it for a reason unrelated to
+    the answer itself (currently: multiselect, which FormFiller has no
+    fill branch for) -- that case is labeled UNSUPPORTED, never with the
+    misleading resolved-looking badge. Every other case falls back to
+    `_source_label`'s existing "Human decision required"/unknown mapping."""
+    if field.source.startswith(_RESOLVED_LOOKING_SOURCE_PREFIXES):
+        return "[magenta]⊘ Unsupported — cannot be filled automatically[/magenta]"
+    return _source_label(field.source)
 
 
 def snapshot_sections(snapshot: HumanReviewSnapshot) -> SnapshotSections:
@@ -152,7 +180,7 @@ def render_snapshot(snapshot: HumanReviewSnapshot, console: Console) -> None:
                     "[red](sensitive — password field, not supported for automated filling)[/red]"
                 )
             elif field is not None and field.source:
-                reason = _source_label(field.source)
+                reason = _unresolved_reason_label(field)
                 console.print(f"  [yellow]?[/yellow] {fid} — {label} ({reason})")
             else:
                 console.print(f"  [yellow]?[/yellow] {fid} — {label}")
