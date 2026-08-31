@@ -237,7 +237,11 @@ def test_browser_preview_command_never_calls_allowlist_approval_submit_or_creden
     those by this command starting to call it somewhere."""
     source = Path("src/job_agent/cli/main.py").read_text()
     start = source.index('@applications_app.command("browser-preview")')
-    end = source.index('@applications_app.command("run")')
+    # Ends at browser-approve, not "run" -- browser-approve/browser-fill
+    # (added in a later checkpoint) legitimately call create_approval()/
+    # get_valid_approval()/consume_approval(); that is not part of
+    # browser-preview's own body, which still never calls any of them.
+    end = source.index('@applications_app.command("browser-approve")')
     body = source[start:end]
     for term in _FORBIDDEN_CALL_PATTERNS:
         assert term not in body

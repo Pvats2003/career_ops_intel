@@ -180,7 +180,11 @@ def test_target_add_never_imports_playwright_or_the_browser_stack():
     browser call: it never even imports the modules that could."""
     source = Path("src/job_agent/cli/main.py").read_text()
     target_add_start = source.index('@applications_app.command("target-add")')
-    target_add_end = source.index('@applications_app.command("browser-preview")')
+    # Ends at the shared browser-command helpers, not "browser-preview"
+    # itself -- those helpers (used by browser-preview/-approve/-fill)
+    # legitimately reference BrowserApplicationProvider; that is not part
+    # of target-add's own body.
+    target_add_end = source.index("def _parse_answer_overrides")
     body = source[target_add_start:target_add_end]
     for forbidden in ("playwright", "BrowserSession", "BrowserApplicationProvider"):
         assert forbidden not in body
