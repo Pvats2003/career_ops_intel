@@ -1,0 +1,64 @@
+# InstaCore Sync — application configuration
+#
+# Copy this file to `config/settings.local.yaml` and edit it, or change the
+# same values from Settings screen inside the app (which writes to the same
+# file). Values here are safe defaults for a first run; nothing is destructive
+# on its own — actual Drive/Sheets access requires config/credentials.json,
+# see docs/GOOGLE_API_SETUP.md.
+
+# --- Folders -----------------------------------------------------------
+watch_folder: "C:/Users/<you>/Documents/WhatsApp Images/WhatsApp Video"
+processed_folder: "C:/InstacoreSync/Processed"
+needs_review_folder: "C:/InstacoreSync/NeedsReview"
+failed_folder: "C:/InstacoreSync/Failed"
+
+# --- Google Drive --------------------------------------------------------
+drive:
+  root_folder_id: ""            # Drive folder (or Shared Drive folder) that holds daily date folders
+  shared_drive_id: ""           # Optional: set if root_folder_id lives inside a Shared Drive
+  date_folder_format: "%d %b %Y"   # e.g. "31 Aug 2026" — keep the year, or folders collide every 365 days
+  make_public_link: true        # "Anyone with the link" viewer access on upload
+  credentials_file: "config/credentials.json"
+  token_file: "config/token.json"
+
+# --- Google Sheets ---------------------------------------------------------
+sheets:
+  spreadsheet_id: ""
+  worksheet_name: "Uploads"
+  columns:
+    date: "A"
+    device_id: "B"
+    filename: "C"
+    drive_link: "D"
+    status: "E"
+    uploaded_at: "F"
+    ocr_confidence: "G"
+  header_row: 1
+
+# --- OCR -------------------------------------------------------------------
+ocr:
+  engine: "tesseract"           # "tesseract" | "paddleocr" | "auto" (try both, keep best)
+  tesseract_cmd: ""             # override if tesseract.exe not on PATH
+  min_confidence: 0.55
+  max_seconds_scanned: 6.0      # never scan more than the first N seconds unless review fallback
+  frame_interval_seconds: 0.5
+  device_id_pattern: "(?<![A-Za-z0-9])IC-\\d{1,5}(?!\\d)"
+  full_scan_on_low_confidence: true   # last resort: scan whole video if first N seconds fail
+
+# --- Uploads -----------------------------------------------------------
+uploads:
+  max_concurrent: 12
+  retry_count: 5
+  retry_backoff_seconds: 2.0
+  chunk_size_mb: 8
+  duplicate_check: true
+
+# --- App ---------------------------------------------------------------
+app:
+  theme: "dark"
+  auto_start_with_windows: false
+  notifications_enabled: true
+  minimize_to_tray: true
+  poll_interval_seconds: 2.0
+  log_level: "INFO"
+  jobs_retention_days: 30   # COMPLETED/DUPLICATE rows older than this are pruned on startup; 0 disables pruning

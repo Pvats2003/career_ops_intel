@@ -1,0 +1,23 @@
+# Runtime dependencies for InstaCore Sync
+# Install with: pip install -r requirements.txt
+# Python 3.12 required.
+
+PySide6>=6.7,<7.0
+opencv-python-headless>=4.10
+numpy>=1.26
+watchdog>=4.0
+pydantic>=2.7
+pydantic-settings>=2.3
+PyYAML>=6.0
+pytesseract>=0.3.10
+paddleocr>=2.8
+paddlepaddle>=2.6
+google-api-python-client>=2.140
+google-auth>=2.34
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
+tenacity>=8.5
+structlog>=24.4
+python-dotenv>=1.0
+cryptography>=42.0
+pywin32>=306; sys_platform == "win32"
