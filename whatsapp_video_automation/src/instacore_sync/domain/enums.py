@@ -54,3 +54,11 @@ class LogLevel(StrEnum):
     WARNING = "WARNING"
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
+
+
+class HealthStatus(StrEnum):
+    """Outcome of one Health Check page check."""
+
+    PASS = "pass"
+    WARNING = "warning"
+    FAILED = "failed"

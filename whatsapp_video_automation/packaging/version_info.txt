@@ -1,0 +1,47 @@
+# UTF-8
+#
+# Windows EXE version-info resource for InstaCore Sync, consumed by
+# PyInstaller's EXE(..., version="packaging/version_info.txt") — this is
+# what makes Windows Explorer's file Properties -> Details tab (and the
+# installer's own version display) show real product/version metadata
+# instead of a blank "unknown" entry, which is the kind of thing that
+# makes a non-technical user reasonably suspicious of an .exe.
+#
+# Keep filevers/prodvers/FileVersion/ProductVersion in sync with
+# src/instacore_sync/__init__.py's __version__ and pyproject.toml's
+# [project].version — tests/unit/test_version.py checks the latter two
+# automatically; this file isn't machine-parseable from Python at import
+# time the same way, so it's a manual step on release (see
+# docs/RELEASE_CHECKLIST in the versioning docs).
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0),
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u"040904B0",
+          [
+            StringStruct(u"CompanyName", u"Career Ops Intel"),
+            StringStruct(u"FileDescription", u"InstaCore Sync — WhatsApp video automation"),
+            StringStruct(u"FileVersion", u"1.0.0.0"),
+            StringStruct(u"InternalName", u"InstaCoreSync"),
+            StringStruct(u"LegalCopyright", u"Copyright (c) Career Ops Intel"),
+            StringStruct(u"OriginalFilename", u"InstaCoreSync.exe"),
+            StringStruct(u"ProductName", u"InstaCore Sync"),
+            StringStruct(u"ProductVersion", u"1.0.0.0"),
+          ],
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct(u"Translation", [1033, 1200])]),
+  ],
+)

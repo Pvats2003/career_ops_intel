@@ -52,6 +52,15 @@ class PipelineThread(QThread):
         await self._stop_event.wait()
         await self._orchestrator.stop()
 
+    def wait_until_ready(self, timeout: float = 5.0) -> bool:
+        """Blocks until the pipeline's event loop object exists (i.e.
+        `start()` was called and the thread has begun running) — used by
+        the first-run wizard, which needs `sign_in_interactively()` and
+        the other thread-safe proxies below to actually be able to
+        schedule work before it shows itself. Returns whether the loop
+        became ready within `timeout`."""
+        return self._loop_ready.wait(timeout=timeout)
+
     def stop(self, timeout_ms: int = 10_000) -> None:
         self._loop_ready.wait(timeout=5.0)
         loop = self._loop
@@ -108,3 +117,50 @@ class PipelineThread(QThread):
         loop = self._loop
         if loop is not None and loop.is_running():
             asyncio.run_coroutine_threadsafe(self._orchestrator.sign_in_interactively(), loop)
+
+    def request_health_check(self) -> None:
+        """Thread-safe: run the Health Check page's checks and publish
+        the results via `health_check_completed` once done. Runs on the
+        pipeline thread's own loop (the checks do blocking network/disk
+        I/O); emitting the Qt signal from there is safe the same way
+        every other `PipelineSignalBus` signal is (see its docstring)."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+
+        async def _run() -> None:
+            results = await self._orchestrator.run_health_check()
+            self._signals.health_check_completed.emit(results)
+
+        asyncio.run_coroutine_threadsafe(_run(), loop)
+
+    # -- first-run wizard: per-step validation -----------------------------------
+
+    def verify_drive_folder(self, folder_id: str) -> None:
+        """Thread-safe: wizard's "Select Drive Root Folder" step."""
+        self._run_wizard_check("drive_folder", self._orchestrator.verify_drive_folder_for_wizard(folder_id))
+
+    def verify_spreadsheet(self, spreadsheet_id: str) -> None:
+        """Thread-safe: wizard's "Select Google Sheet" step."""
+        self._run_wizard_check(
+            "spreadsheet", self._orchestrator.verify_spreadsheet_for_wizard(spreadsheet_id)
+        )
+
+    def test_ocr(self) -> None:
+        """Thread-safe: wizard's "Test OCR" step."""
+        self._run_wizard_check("ocr", self._orchestrator.test_ocr_for_wizard())
+
+    def test_upload(self, folder_id: str) -> None:
+        """Thread-safe: wizard's "Test Upload" step."""
+        self._run_wizard_check("upload", self._orchestrator.test_upload_for_wizard(folder_id))
+
+    def _run_wizard_check(self, check_name: str, coro) -> None:  # noqa: ANN001
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+
+        async def _run() -> None:
+            result = await coro
+            self._signals.wizard_check_result.emit(check_name, result)
+
+        asyncio.run_coroutine_threadsafe(_run(), loop)

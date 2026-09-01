@@ -22,6 +22,15 @@ datas = [
     (str(PROJECT_ROOT / "config" / "settings.example.yaml"), "config"),
 ]
 
+# The application icon: embedded into the .exe's own resources via EXE()'s
+# `icon=` below (Windows Explorer/taskbar icon), *and* bundled here as a
+# plain data file so the running app can load it at runtime too (window
+# icon, system tray icon) via resource_paths.icon_path() -- those are two
+# separate mechanisms in PyInstaller and both are needed.
+_ICON_DIR = PROJECT_ROOT / "src" / "instacore_sync" / "ui" / "resources" / "icons"
+if _ICON_DIR.exists():
+    datas.append((str(_ICON_DIR), "instacore_sync/ui/resources/icons"))
+
 # PaddleOCR ships model files and non-Python resources that PyInstaller's
 # static analysis cannot discover; collect them explicitly when present.
 hiddenimports = [
@@ -62,6 +71,9 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+_ICON_FILE = PROJECT_ROOT / "src" / "instacore_sync" / "ui" / "resources" / "icons" / "app_icon.ico"
+_VERSION_FILE = PROJECT_ROOT / "packaging" / "version_info.txt"
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -73,9 +85,11 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
-    icon=str(PROJECT_ROOT / "src" / "instacore_sync" / "ui" / "resources" / "icons" / "app_icon.ico")
-    if (PROJECT_ROOT / "src" / "instacore_sync" / "ui" / "resources" / "icons" / "app_icon.ico").exists()
-    else None,
+    icon=str(_ICON_FILE) if _ICON_FILE.exists() else None,
+    # Windows Explorer's file Properties -> Details tab (product name,
+    # version, publisher) -- only meaningful on a real Windows build;
+    # PyInstaller silently ignores this on other platforms.
+    version=str(_VERSION_FILE) if _VERSION_FILE.exists() else None,
 )
 
 coll = COLLECT(

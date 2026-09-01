@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from instacore_sync.domain.enums import JobStatus, OcrEngineName
+from instacore_sync.domain.enums import HealthStatus, JobStatus, OcrEngineName
 
 
 class DeviceIdExtraction(BaseModel):
@@ -126,6 +126,17 @@ class SheetUpdateResult(BaseModel):
     spreadsheet_id: str
     row_number: int
     created_new_row: bool
+
+
+class HealthCheckResult(BaseModel):
+    """One row on the Health Check page."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    status: HealthStatus
+    message: str
+    suggested_fix: str | None = None
 
 
 class DailyStats(BaseModel):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -14,9 +15,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from instacore_sync import __version__
 from instacore_sync.core.config import AppSettings
 from instacore_sync.core.constants import APP_NAME
 from instacore_sync.core.logging_setup import get_logger
+from instacore_sync.core.resource_paths import icon_path
 from instacore_sync.db.repositories.jobs_repository import JobsRepository
 from instacore_sync.db.repositories.logs_repository import LogsRepository
 from instacore_sync.domain.enums import GoogleAuthStatus, JobStatus, OcrEngineStatus, WatcherStatus
@@ -25,14 +28,29 @@ from instacore_sync.services.drive.drive_auth import GoogleAuthService
 from instacore_sync.ui.theme.theme_manager import ThemeManager
 from instacore_sync.ui.viewmodels.dashboard_viewmodel import DashboardViewModel
 from instacore_sync.ui.views.dashboard_view import DashboardView
+from instacore_sync.ui.views.health_check_view import HealthCheckView
 from instacore_sync.ui.views.logs_view import LogsView
 from instacore_sync.ui.views.needs_review_view import NeedsReviewView
 from instacore_sync.ui.views.queue_view import QueueView
 from instacore_sync.ui.views.settings_view import SettingsView
+from instacore_sync.ui.wizard.first_run_wizard import FirstRunWizard
 from instacore_sync.workers.pipeline_thread import PipelineThread
 from instacore_sync.workers.signals import PipelineSignalBus
 
 logger = get_logger(__name__)
+
+
+def _load_app_icon() -> QIcon:
+    """Best-effort load of the bundled application icon. Missing (a dev
+    checkout that hasn't run `packaging/generate_icon.py`, or an
+    unexpected packaging layout) must never be fatal -- Qt is perfectly
+    happy with a null QIcon, it just falls back to a generic window/tray
+    icon, which is a cosmetic gap worth catching in QA, not a crash."""
+    path = icon_path()
+    if not path.exists():
+        logger.warning("main_window.icon_not_found", path=str(path))
+        return QIcon()
+    return QIcon(str(path))
 
 
 class MainWindow(QMainWindow):
@@ -53,9 +71,11 @@ class MainWindow(QMainWindow):
         self._theme = theme_manager
         self._is_paused = False
 
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{__version__}")
         self.resize(1280, 800)
         self.setMinimumSize(1024, 680)
+        self._app_icon = _load_app_icon()
+        self.setWindowIcon(self._app_icon)
 
         central = QWidget()
         central.setObjectName("AppBackground")
@@ -77,8 +97,13 @@ class MainWindow(QMainWindow):
         self._queue_view = QueueView(jobs_repo, signal_bus, pipeline_thread)
         self._needs_review_view = NeedsReviewView(jobs_repo, signal_bus, pipeline_thread, settings)
         self._logs_view = LogsView(logs_repo)
+        self._health_check_view = HealthCheckView(signal_bus, pipeline_thread)
         self._settings_view = SettingsView(
-            settings, theme_manager, self._on_theme_changed, pipeline_thread.sign_in_interactively
+            settings,
+            theme_manager,
+            self._on_theme_changed,
+            pipeline_thread.sign_in_interactively,
+            self._on_rerun_wizard_clicked,
         )
 
         for view in (
@@ -86,6 +111,7 @@ class MainWindow(QMainWindow):
             self._queue_view,
             self._needs_review_view,
             self._logs_view,
+            self._health_check_view,
             self._settings_view,
         ):
             self._stack.addWidget(view)
@@ -116,7 +142,7 @@ class MainWindow(QMainWindow):
         brand.setObjectName("SidebarBrand")
         layout.addWidget(brand)
 
-        subtitle = QLabel("Instacore video automation")
+        subtitle = QLabel(f"Instacore video automation · v{__version__}")
         subtitle.setObjectName("SidebarSubtitle")
         layout.addWidget(subtitle)
 
@@ -128,7 +154,8 @@ class MainWindow(QMainWindow):
             ("📁  Upload Queue", 1),
             ("🔍  Needs Review", 2),
             ("🧾  Logs", 3),
-            ("⚙️  Settings", 4),
+            ("🩺  Health Check", 4),
+            ("⚙️  Settings", 5),
         ]
         for label, index in nav_items:
             button = QPushButton(label)
@@ -264,6 +291,7 @@ class MainWindow(QMainWindow):
             self._tray = None
             return
         self._tray = QSystemTrayIcon(self)
+        self._tray.setIcon(self._app_icon)
         self._tray.setToolTip(APP_NAME)
         self._tray.show()
 
@@ -294,6 +322,15 @@ class MainWindow(QMainWindow):
         self._settings.app.theme = theme
         self._theme.apply(self.centralWidget(), theme)
         self._settings.save()
+
+    def _on_rerun_wizard_clicked(self) -> None:
+        """Settings -> "Run Setup Wizard Again" — independent of the
+        `onboarding_complete` flag app.py checks at startup; this is a
+        manual re-entry point for anyone who skipped a step the first
+        time, not a reset of that flag."""
+        wizard = FirstRunWizard(self._settings, self._signals, self._pipeline_thread, self._app_icon)
+        if wizard.exec() == FirstRunWizard.DialogCode.Accepted:
+            wizard.apply_to_settings()
 
     def closeEvent(self, event) -> None:  # noqa: N802, ANN001
         if self._settings.app.minimize_to_tray and getattr(self, "_tray", None) is not None:

@@ -54,6 +54,41 @@ class DriveClient:
             )
         return self._service
 
+    # -- Health check -----------------------------------------------------------
+
+    @google_api_retry()
+    def verify_root_folder_accessible(self, folder_id: str) -> str:
+        """Read-only check for the Health Check page: does the configured
+        root folder exist and can this account see it? Returns the
+        folder's name on success. Deliberately a plain metadata `get`
+        (never creates/lists anything) so running a health check has no
+        side effects."""
+        try:
+            response = (
+                self._drive()
+                .files()
+                .get(fileId=folder_id, fields="id, name, mimeType", supportsAllDrives=True)
+                .execute()
+            )
+        except HttpError as exc:
+            raise DriveApiError(f"Root folder {folder_id!r} is not accessible: {exc}") from exc
+        if response.get("mimeType") != _FOLDER_MIME:
+            raise DriveApiError(f"{folder_id!r} exists but is not a folder")
+        return response.get("name", folder_id)
+
+    @google_api_retry()
+    def trash_file(self, file_id: str) -> None:
+        """Trashes a single file — used by the first-run wizard's "Test
+        Upload" step to clean up the small connectivity-check file it
+        uploads, so onboarding doesn't leave litter behind in the user's
+        actual Drive folder."""
+        try:
+            self._drive().files().update(
+                fileId=file_id, body={"trashed": True}, supportsAllDrives=True
+            ).execute()
+        except HttpError as exc:
+            raise DriveApiError(f"Failed to trash file {file_id}: {exc}") from exc
+
     # -- Folder discovery/creation ------------------------------------------------
 
     def get_or_create_date_folder(self, date_label: str) -> str:

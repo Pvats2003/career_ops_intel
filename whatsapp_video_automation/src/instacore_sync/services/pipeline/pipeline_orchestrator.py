@@ -19,19 +19,26 @@ event sink to Qt signals.
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from instacore_sync.core.config import AppSettings
-from instacore_sync.core.exceptions import DriveAuthError
+from instacore_sync.core.exceptions import DriveApiError, DriveAuthError
 from instacore_sync.core.logging_setup import get_logger
 from instacore_sync.db.repositories.jobs_repository import JobsRepository
 from instacore_sync.db.repositories.logs_repository import LogsRepository
-from instacore_sync.domain.enums import JobStatus, OcrEngineName, WatcherStatus
-from instacore_sync.domain.models import DailyStats, VideoJob
+from instacore_sync.domain.enums import HealthStatus, JobStatus, OcrEngineName, WatcherStatus
+from instacore_sync.domain.models import DailyStats, HealthCheckResult, VideoJob
 from instacore_sync.services.dedup.dedup_service import DedupService
 from instacore_sync.services.drive.drive_auth import GoogleAuthService
 from instacore_sync.services.drive.drive_client import DriveClient
+from instacore_sync.services.health.health_check_service import (
+    check_drive,
+    check_ocr,
+    check_sheets,
+    run_health_checks,
+)
 from instacore_sync.services.ocr.device_id_extractor import DeviceIdExtractor
 from instacore_sync.services.ocr.engine_factory import OcrEngineFactory
 from instacore_sync.services.pipeline.events import NullEventSink, PipelineEventSink
@@ -310,3 +317,91 @@ class PipelineOrchestrator:
             current_transfer_speed_bps=current_speed,
             estimated_seconds_remaining=eta,
         )
+
+    # -- health check ------------------------------------------------------------
+
+    async def run_health_check(self) -> list[HealthCheckResult]:
+        """Runs the Health Check page's battery of checks off the event
+        loop (they do blocking network/disk I/O) and returns the results.
+        Reads `self._watcher`/`self._worker_pool` directly rather than
+        through getters, since this is the one place both their current
+        status and their absence (not started yet) both need representing
+        plainly."""
+        loop = asyncio.get_running_loop()
+        watcher_status = self._watcher.status if self._watcher is not None else WatcherStatus.STOPPED
+        worker_pool_running = self._worker_pool.is_running
+        worker_pool_active_count = self._worker_pool.active_count
+
+        def _run() -> list[HealthCheckResult]:
+            return run_health_checks(
+                settings=self._settings,
+                jobs_repo=self._jobs_repo,
+                google_auth=self._google_auth,
+                drive_client=self._drive,
+                sheets_client=self._sheets,
+                ocr_engine_factory=self._ocr_engine_factory,
+                watcher_status=watcher_status,
+                worker_pool_running=worker_pool_running,
+                worker_pool_active_count=worker_pool_active_count,
+            )
+
+        return await loop.run_in_executor(None, _run)
+
+    # -- first-run wizard: per-step validation -----------------------------------
+    #
+    # Each of these mirrors one Health Check row but targets a *candidate*
+    # value the wizard's own page is currently holding (a folder ID just
+    # typed in, not yet saved to settings) — the wizard must not let the
+    # user click Next past a step whose value doesn't actually work.
+
+    async def verify_drive_folder_for_wizard(self, folder_id: str) -> HealthCheckResult:
+        loop = asyncio.get_running_loop()
+        auth_status = self._google_auth.status
+        return await loop.run_in_executor(None, lambda: check_drive(self._drive, folder_id, auth_status))
+
+    async def verify_spreadsheet_for_wizard(self, spreadsheet_id: str) -> HealthCheckResult:
+        loop = asyncio.get_running_loop()
+        auth_status = self._google_auth.status
+        return await loop.run_in_executor(
+            None, lambda: check_sheets(self._sheets, spreadsheet_id, auth_status)
+        )
+
+    async def test_ocr_for_wizard(self) -> HealthCheckResult:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: check_ocr(self._ocr_engine_factory))
+
+    async def test_upload_for_wizard(self, folder_id: str) -> HealthCheckResult:
+        """Uploads a tiny marker file to `folder_id` and immediately
+        trashes it. Unlike `verify_drive_folder_for_wizard` (read-only
+        metadata check), this proves the account actually has *write*
+        permission on the folder — the one thing that matters most before
+        telling the user setup is complete."""
+        loop = asyncio.get_running_loop()
+
+        def _run() -> HealthCheckResult:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, encoding="utf-8"
+            ) as handle:
+                handle.write("InstaCore Sync setup connectivity test. Safe to delete.\n")
+                temp_path = Path(handle.name)
+            try:
+                result = self._drive.upload_file(temp_path, folder_id, chunk_size_mb=1)
+                try:
+                    self._drive.trash_file(result.file_id)
+                except DriveApiError:
+                    logger.warning("wizard.test_upload_cleanup_failed", file_id=result.file_id)
+                return HealthCheckResult(
+                    name="Test Upload", status=HealthStatus.PASS, message="Upload succeeded"
+                )
+            except DriveApiError as exc:
+                return HealthCheckResult(
+                    name="Test Upload",
+                    status=HealthStatus.FAILED,
+                    message=str(exc),
+                    suggested_fix="Confirm your Google account has edit access to the selected "
+                    "Drive folder.",
+                )
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+        return await loop.run_in_executor(None, _run)

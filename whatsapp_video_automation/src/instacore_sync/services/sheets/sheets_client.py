@@ -84,6 +84,22 @@ class SheetsClient:
         self._cache_primed = False
 
     @google_api_retry()
+    def verify_spreadsheet_accessible(self, spreadsheet_id: str) -> str:
+        """Read-only check for the Health Check page: does the configured
+        spreadsheet exist and can this account see it? Returns the
+        spreadsheet's title on success."""
+        try:
+            response = (
+                self._sheets()
+                .spreadsheets()
+                .get(spreadsheetId=spreadsheet_id, fields="properties.title")
+                .execute()
+            )
+        except HttpError as exc:
+            raise SheetsApiError(f"Spreadsheet {spreadsheet_id!r} is not accessible: {exc}") from exc
+        return response.get("properties", {}).get("title", spreadsheet_id)
+
+    @google_api_retry()
     def upsert_row(
         self,
         *,

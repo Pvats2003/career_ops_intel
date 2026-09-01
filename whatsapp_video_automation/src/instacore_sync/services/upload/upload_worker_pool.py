@@ -63,6 +63,12 @@ class UploadWorkerPool:
     def is_paused(self) -> bool:
         return not self._resume_event.is_set()
 
+    @property
+    def is_running(self) -> bool:
+        """Whether `start()` has been called and `stop()` hasn't — the
+        Health Check page's "Background Workers" row."""
+        return self._running
+
     def pause(self) -> None:
         if self._resume_event.is_set():
             self._resume_event.clear()

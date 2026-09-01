@@ -25,6 +25,8 @@ class PipelineSignalBus(QObject):
     ocr_engine_status_changed = Signal(str, object)  # engine name, OcrEngineStatus
     log_message = Signal(str, str)        # level, message
     pause_state_changed = Signal(bool)    # is_paused
+    health_check_completed = Signal(list)  # list[HealthCheckResult]
+    wizard_check_result = Signal(str, object)  # check name, HealthCheckResult
 
     # -- PipelineEventSink protocol implementation --------------------------
 

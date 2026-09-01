@@ -11,7 +11,6 @@ so there is exactly one source of truth for persisted configuration.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,49 +24,10 @@ from instacore_sync.core.constants import (
     DEFAULT_SETTINGS_FILENAME,
     DEVICE_ID_REGEX_DEFAULT,
 )
+from instacore_sync.core.exceptions import ConfigurationError
+from instacore_sync.core.resource_paths import app_base_dir as _app_base_dir
+from instacore_sync.core.resource_paths import bundled_resource_dir as _bundled_resource_dir
 from instacore_sync.domain.enums import OcrEngineName
-
-
-def _is_frozen() -> bool:
-    """True inside a PyInstaller-built .exe, false running from source."""
-    return bool(getattr(sys, "frozen", False))
-
-
-def _app_base_dir() -> Path:
-    """Where user-writable/user-provided files (`config/settings.local.yaml`,
-    `config/credentials.json`, `config/token.json`) live, relative to.
-
-    `Path(__file__).resolve().parents[3]` (the old implementation) walks up
-    from this source file's own location to the project root — correct
-    when running from a source checkout, but meaningless once this module
-    is frozen into a PyInstaller build: a module bundled into the PYZ
-    archive doesn't have a real on-disk `__file__`, and even where
-    PyInstaller fakes one up, indexing `.parents[3]` off it doesn't land
-    anywhere a distributed .exe controls. Every one of the 500 installs
-    this app ships to needs `credentials.json` discoverable next to the
-    installed .exe (exactly where docs/GOOGLE_API_SETUP.md already tells
-    users to put it) and `settings.local.yaml`/`token.json` to persist
-    there too, stable across app restarts — so frozen mode resolves
-    relative to `sys.executable`'s directory instead.
-    """
-    if _is_frozen():
-        return Path(sys.executable).resolve().parent
-    # src/instacore_sync/core/config.py -> src/instacore_sync/core -> src/instacore_sync -> src -> project root
-    return Path(__file__).resolve().parents[3]
-
-
-def _bundled_resource_dir() -> Path:
-    """Where read-only resources PyInstaller bundled alongside the app
-    live — currently just `settings.example.yaml`, the seed template
-    copied to `settings.local.yaml` on first run. PyInstaller always
-    exposes these via `sys._MEIPASS` regardless of one-file/one-folder
-    packaging or where exactly it lays out the bundle internally, so this
-    is the one reliable way to find them frozen; source-tree development
-    uses the same project root as `_app_base_dir`.
-    """
-    if _is_frozen():
-        return Path(getattr(sys, "_MEIPASS", _app_base_dir()))
-    return Path(__file__).resolve().parents[3]
 
 
 def _default_settings_path() -> Path:
@@ -76,6 +36,32 @@ def _default_settings_path() -> Path:
 
 def _example_settings_path() -> Path:
     return _bundled_resource_dir() / "config" / "settings.example.yaml"
+
+
+def settings_dir() -> Path:
+    """Where `settings.local.yaml` (and thus `credentials.json`/
+    `token.json`, its siblings) lives — exposed publicly for Safe Mode's
+    "Open Settings Folder" button, which needs this without being able to
+    assume a working `AppSettings` instance exists yet."""
+    return _default_settings_path().parent
+
+
+def reset_settings_to_defaults() -> None:
+    """Overwrite `settings.local.yaml` with the bundled default template.
+
+    Deliberately a standalone function operating on file paths, not an
+    `AppSettings` method: this exists specifically for Safe Mode, where
+    the current `settings.local.yaml` may be exactly what's unparseable
+    (malformed YAML, a field that fails validation) — the whole point is
+    to recover *without* needing to successfully construct an
+    `AppSettings` instance first.
+    """
+    example = _example_settings_path()
+    if not example.exists():
+        raise ConfigurationError(f"Bundled settings.example.yaml not found at {example}")
+    target = _default_settings_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def user_data_dir() -> Path:
@@ -156,6 +142,12 @@ class AppUiSettings(BaseModel):
     # months of 150-500 videos/day. FAILED and NEEDS_REVIEW rows are never
     # auto-pruned; they stay until a human resolves them.
     jobs_retention_days: int = 30
+    # A full backup (settings + database + logs) is checked on every app
+    # start and taken automatically if the last one is older than this —
+    # 0 disables automatic backups (manual "Backup Now" in Settings still
+    # works). See services/backup/backup_service.py.
+    auto_backup_interval_days: int = 7
+    auto_backup_keep_count: int = 5
 
 
 class _YamlSettingsSource(PydanticBaseSettingsSource):
@@ -274,8 +266,20 @@ class AppSettings(BaseSettings):
             setattr(self, field_name, getattr(other, field_name))
 
     @property
+    def settings_file_path(self) -> Path:
+        return _default_settings_path()
+
+    @property
     def db_path(self) -> Path:
         return user_data_dir() / DEFAULT_DB_FILENAME
+
+    @property
+    def logs_dir(self) -> Path:
+        return user_data_dir() / "logs"
+
+    @property
+    def backups_dir(self) -> Path:
+        return user_data_dir() / "backups"
 
     @property
     def credentials_path(self) -> Path:

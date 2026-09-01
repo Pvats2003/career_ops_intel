@@ -29,7 +29,9 @@ from PySide6.QtWidgets import (
 )
 
 from instacore_sync.core.config import AppSettings
+from instacore_sync.core.exceptions import ConfigurationError
 from instacore_sync.domain.enums import OcrEngineName
+from instacore_sync.services.backup.backup_service import BackupPaths, create_backup, restore_backup
 from instacore_sync.ui.theme.theme_manager import ThemeManager
 
 
@@ -58,6 +60,7 @@ class SettingsView(QWidget):
         theme_manager: ThemeManager,
         on_theme_changed: Callable[[str], None],
         on_sign_in_clicked: Callable[[], None] | None = None,
+        on_rerun_wizard: Callable[[], None] | None = None,
         parent=None,  # noqa: ANN001
     ) -> None:
         super().__init__(parent)
@@ -65,6 +68,7 @@ class SettingsView(QWidget):
         self._theme_manager = theme_manager
         self._on_theme_changed = on_theme_changed
         self._on_sign_in_clicked = on_sign_in_clicked
+        self._on_rerun_wizard = on_rerun_wizard
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -101,6 +105,18 @@ class SettingsView(QWidget):
         )
         import_button.clicked.connect(self._on_import_clicked)
         footer.addWidget(import_button)
+
+        backup_button = QPushButton("Backup Now…")
+        backup_button.setToolTip(
+            "Creates a full backup: settings, the database (upload history, queue), and logs."
+        )
+        backup_button.clicked.connect(self._on_backup_now_clicked)
+        footer.addWidget(backup_button)
+
+        restore_button = QPushButton("Restore from Backup…")
+        restore_button.setToolTip("Restores settings, database, and logs from a backup file.")
+        restore_button.clicked.connect(self._on_restore_clicked)
+        footer.addWidget(restore_button)
 
         footer.addStretch(1)
         save_button = QPushButton("Save Settings")
@@ -148,6 +164,15 @@ class SettingsView(QWidget):
             "Failed and Needs Review items are never auto-removed."
         )
         form.addRow("Keep completed history for", self._retention_spin)
+
+        if self._on_rerun_wizard is not None:
+            rerun_wizard_button = QPushButton("Run Setup Wizard Again…")
+            rerun_wizard_button.setToolTip(
+                "Re-opens the guided setup (folders, Google sign-in, Drive/Sheets, OCR and "
+                "upload tests) — useful if you skipped a step the first time."
+            )
+            rerun_wizard_button.clicked.connect(self._on_rerun_wizard)
+            form.addRow("Setup wizard", rerun_wizard_button)
 
         return widget
 
@@ -360,6 +385,58 @@ class SettingsView(QWidget):
             self,
             "Import complete",
             "Settings imported and saved. Restart InstaCore Sync for the changes to take full effect.",
+        )
+
+    # -- full backup / restore (settings + database + logs) ---------------------
+
+    def _backup_paths(self) -> BackupPaths:
+        s = self._settings
+        return BackupPaths(
+            settings_file=s.settings_file_path,
+            database_file=s.db_path,
+            logs_dir=s.logs_dir,
+            backups_dir=s.backups_dir,
+        )
+
+    def _on_backup_now_clicked(self) -> None:
+        try:
+            zip_path = create_backup(self._backup_paths())
+        except OSError as exc:
+            QMessageBox.critical(self, "Backup failed", str(exc))
+            return
+        QMessageBox.information(
+            self, "Backup complete", f"Settings, database, and logs were backed up to:\n{zip_path}"
+        )
+
+    def _on_restore_clicked(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Restore from Backup", str(self._settings.backups_dir), "Backup Files (*.zip)"
+        )
+        if not path_str:
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Restore from backup?",
+            "This replaces your current settings, database (upload history and queue), and logs "
+            "with the contents of this backup. This cannot be undone.\n\n"
+            "InstaCore Sync must be restarted afterward for the restored data to load — do not "
+            "continue if the pipeline is mid-upload.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            restore_backup(Path(path_str), self._backup_paths())
+        except (ConfigurationError, OSError) as exc:
+            QMessageBox.critical(self, "Restore failed", str(exc))
+            return
+
+        QMessageBox.information(
+            self,
+            "Restore complete",
+            "Backup restored. Close and restart InstaCore Sync now to load the restored data.",
         )
 
     # -- persistence ------------------------------------------------------------

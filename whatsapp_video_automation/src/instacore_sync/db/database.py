@@ -21,10 +21,27 @@ from pathlib import Path
 
 from instacore_sync.core.exceptions import RepositoryError
 from instacore_sync.core.logging_setup import get_logger
+from instacore_sync.core.resource_paths import bundled_resource_dir, is_frozen
 
 logger = get_logger(__name__)
 
-_MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+def _migrations_dir() -> Path:
+    """Where the `*.sql` migration files live.
+
+    Regression fix: this used to be `Path(__file__).parent / "migrations"`
+    at module import time — correct from source, but silently catastrophic
+    once frozen: a module bundled into the PYZ archive has no real
+    on-disk `__file__`, so `_run_migrations()`'s glob would find zero
+    `.sql` files, `schema_migrations` and every other table would never
+    get created, and *every* database operation in a packaged .exe would
+    fail with "no such table" from the first launch onward. Migrations
+    are bundled as `datas` in `packaging/pyinstaller.spec`, resolved the
+    same frozen-aware way as the theme QSS files and settings template.
+    """
+    if is_frozen():
+        return bundled_resource_dir() / "instacore_sync" / "db" / "migrations"
+    return Path(__file__).resolve().parent / "migrations"
 
 
 class Database:
@@ -74,7 +91,7 @@ class Database:
         except sqlite3.OperationalError:
             pass  # schema_migrations doesn't exist yet -> nothing applied.
 
-        migration_files = sorted(_MIGRATIONS_DIR.glob("*.sql"))
+        migration_files = sorted(_migrations_dir().glob("*.sql"))
         for path in migration_files:
             version = int(path.stem.split("_", 1)[0])
             if version in applied:

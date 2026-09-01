@@ -360,3 +360,33 @@ async def test_sign_in_interactively_uses_the_interactive_path(orchestrator_with
         assert google_auth.calls == [False, True]
     finally:
         await orchestrator.stop()
+
+
+@pytest.mark.asyncio
+async def test_run_health_check_returns_one_result_per_check(orchestrator: PipelineOrchestrator) -> None:
+    from instacore_sync.domain.enums import HealthStatus
+
+    await orchestrator.start()
+    try:
+        results = await orchestrator.run_health_check()
+    finally:
+        await orchestrator.stop()
+
+    assert len(results) == 10
+    names = {r.name for r in results}
+    assert {"Internet", "Google Drive", "Google Sheets", "OCR Engine", "Disk Space",
+            "Folder Permissions", "Database", "Folder Watcher", "Background Workers",
+            "Google Authentication"} == names
+    assert all(isinstance(r.status, HealthStatus) for r in results)
+
+
+@pytest.mark.asyncio
+async def test_run_health_check_reflects_watcher_before_start(orchestrator: PipelineOrchestrator) -> None:
+    """Calling this before start() (self._watcher is still None) must not
+    crash -- the Folder Watcher row should just read as not running."""
+    from instacore_sync.domain.enums import HealthStatus
+
+    results = await orchestrator.run_health_check()
+
+    watcher_result = next(r for r in results if r.name == "Folder Watcher")
+    assert watcher_result.status == HealthStatus.FAILED

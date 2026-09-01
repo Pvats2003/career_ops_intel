@@ -57,9 +57,13 @@ WhatsApp folder  →  Folder Watcher  →  OCR (Device ID)  →  Google Drive  �
   the UI never blocks on writer threads, and automatic pruning of old
   completed entries so the working table doesn't grow forever.
 - Clean, feature-based, dependency-injected architecture with type hints
-  throughout and a real unit + integration test suite (141 tests,
+  throughout and a real unit + integration test suite (227 tests,
   including a concurrency stress test that drives dozens of videos through
   the real async worker pool under induced random failures).
+- **Production-ready v1.0.0 release**: a guided first-run wizard, a
+  Health Check page, Safe Mode on startup failure, automatic backups, a
+  real Windows installer with an app icon and version info, and a full
+  end-user documentation set — see "Not a developer?" below.
 
 ## Project layout
 
@@ -98,6 +102,27 @@ model, and — if you're rolling this out to a team rather than running it
 yourself — [`docs/DEPLOYMENT_AT_SCALE.md`](docs/DEPLOYMENT_AT_SCALE.md) for
 what changes (and what you must configure in Google Cloud Console) once many
 independent installs write into one shared Drive/Sheets destination.
+
+## Not a developer? Start here instead
+
+Everything above is for people building or maintaining InstaCore Sync.
+If you just need to **install and use** it:
+
+- [`docs/QUICK_START.md`](docs/QUICK_START.md) — fastest path from
+  "just installed" to your first video processed.
+- [`docs/INSTALLATION_GUIDE.md`](docs/INSTALLATION_GUIDE.md) — the
+  Windows installer, step by step.
+- [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) — every screen, in full.
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) and
+  [`docs/FAQ.md`](docs/FAQ.md) — when something isn't working.
+- [`docs/RECOVERY_GUIDE.md`](docs/RECOVERY_GUIDE.md) — Safe Mode,
+  backups, and restoring from one.
+- [`docs/ADMIN_GUIDE.md`](docs/ADMIN_GUIDE.md) and
+  [`docs/DEPLOYMENT_GUIDE.md`](docs/DEPLOYMENT_GUIDE.md) — rolling this
+  out to a team.
+- [`CHANGELOG.md`](CHANGELOG.md), [`RELEASE_NOTES.md`](RELEASE_NOTES.md),
+  and [`docs/QA_REPORT.md`](docs/QA_REPORT.md) — what's in this release,
+  what was tested, and what's known to still need attention.
 
 ## Quick start (development)
 
