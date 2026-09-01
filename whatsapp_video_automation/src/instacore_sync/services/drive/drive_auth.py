@@ -5,6 +5,11 @@ rest** (see `token_crypto.py`), so the user only goes through the browser
 consent screen once; subsequent runs silently decrypt and refresh the
 access token. See docs/GOOGLE_API_SETUP.md for how to obtain
 `credentials.json` from Google Cloud Console.
+
+`get_credentials()` deliberately never launches the interactive browser
+consent flow unless explicitly told to (`interactive=True`) — see its
+docstring. A silent refresh of an existing token is always attempted
+either way.
 """
 
 from __future__ import annotations
@@ -47,11 +52,30 @@ class GoogleAuthService:
     def account_email(self) -> str | None:
         return self._account_email
 
-    def get_credentials(self) -> Credentials:
+    def get_credentials(self, *, interactive: bool = False) -> Credentials:
+        """Return valid credentials, refreshing silently if needed.
+
+        `interactive=False` (the default, and what every Drive/Sheets API
+        call and the pipeline's own startup probe use) never opens a
+        browser: if there's no usable token and no refresh token to renew,
+        it raises `DriveAuthError` immediately so the caller can surface
+        "sign-in required" instead of the process silently launching
+        `flow.run_local_server(...)`. That matters a great deal once this
+        stops being one operator's own machine: at startup, this used to
+        run inside `PipelineOrchestrator.start()`, which is awaited before
+        the folder watcher or upload pool ever starts — for any of the 500
+        installs without a valid stored token (first run, an expired
+        refresh token, a revoked grant), the *entire pipeline* would hang
+        waiting on a browser window that user never asked for and might
+        not even have a display/browser available to complete (a remote
+        desktop session, a kiosk machine). Only an explicit user action —
+        Settings -> "Sign in with Google" — should ever set
+        `interactive=True`.
+        """
         with self._lock:
             if self._credentials and self._credentials.valid:
                 return self._credentials
-            self._credentials = self._load_or_authenticate()
+            self._credentials = self._load_or_authenticate(interactive=interactive)
             return self._credentials
 
     def sign_out(self) -> None:
@@ -65,7 +89,7 @@ class GoogleAuthService:
             if key_file.exists():
                 key_file.unlink()
 
-    def _load_or_authenticate(self) -> Credentials:
+    def _load_or_authenticate(self, *, interactive: bool) -> Credentials:
         self._status = GoogleAuthStatus.AUTHENTICATING
         creds: Credentials | None = None
 
@@ -85,6 +109,15 @@ class GoogleAuthService:
             except RefreshError as exc:
                 logger.warning("drive_auth.refresh_failed", error=str(exc))
                 self._status = GoogleAuthStatus.EXPIRED
+
+        if not interactive:
+            self._status = (
+                GoogleAuthStatus.EXPIRED if creds is not None else GoogleAuthStatus.SIGNED_OUT
+            )
+            raise DriveAuthError(
+                "Google sign-in required — no valid stored credentials, and this call is not "
+                "allowed to open an interactive consent screen. Use Settings -> Sign in with Google."
+            )
 
         if not self._credentials_file.exists():
             self._status = GoogleAuthStatus.ERROR

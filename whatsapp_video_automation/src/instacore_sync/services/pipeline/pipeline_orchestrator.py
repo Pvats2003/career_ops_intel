@@ -27,7 +27,7 @@ from instacore_sync.core.exceptions import DriveAuthError
 from instacore_sync.core.logging_setup import get_logger
 from instacore_sync.db.repositories.jobs_repository import JobsRepository
 from instacore_sync.db.repositories.logs_repository import LogsRepository
-from instacore_sync.domain.enums import GoogleAuthStatus, JobStatus, OcrEngineName, WatcherStatus
+from instacore_sync.domain.enums import JobStatus, OcrEngineName, WatcherStatus
 from instacore_sync.domain.models import DailyStats, VideoJob
 from instacore_sync.services.dedup.dedup_service import DedupService
 from instacore_sync.services.drive.drive_auth import GoogleAuthService
@@ -245,13 +245,34 @@ class PipelineOrchestrator:
             self._events.on_ocr_engine_status(engine.name.value, status)
 
     async def _probe_google_auth(self) -> None:
+        """Silent-only: never opens a browser consent screen (see
+        `GoogleAuthService.get_credentials`'s docstring). This runs as part
+        of `start()`, awaited before the folder watcher or upload pool
+        start — an interactive flow here would hang the entire pipeline
+        for any install without a valid stored token yet."""
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, self._google_auth.get_credentials)
+            await loop.run_in_executor(None, lambda: self._google_auth.get_credentials(interactive=False))
             self._events.on_auth_status(self._google_auth.status, self._google_auth.account_email)
         except DriveAuthError as exc:
-            self._events.on_auth_status(GoogleAuthStatus.ERROR, None)
-            self._events.on_log_message("WARNING", f"Google sign-in not completed yet: {exc}")
+            self._events.on_auth_status(self._google_auth.status, None)
+            self._events.on_log_message(
+                "WARNING", f"Google sign-in required — use Settings to sign in. ({exc})"
+            )
+
+    async def sign_in_interactively(self) -> None:
+        """Explicit user-initiated sign-in (Settings -> "Sign in with
+        Google") — the only path allowed to open a browser consent
+        screen. Safe to call whether or not the pipeline is running."""
+        loop = asyncio.get_running_loop()
+        self._events.on_log_message("INFO", "Opening Google sign-in in your browser...")
+        try:
+            await loop.run_in_executor(None, lambda: self._google_auth.get_credentials(interactive=True))
+            self._events.on_auth_status(self._google_auth.status, self._google_auth.account_email)
+            self._events.on_log_message("INFO", "Google sign-in complete.")
+        except DriveAuthError as exc:
+            self._events.on_auth_status(self._google_auth.status, None)
+            self._events.on_log_message("ERROR", f"Google sign-in failed: {exc}")
 
     # -- stats -----------------------------------------------------------------
 

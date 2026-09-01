@@ -11,6 +11,7 @@ so there is exactly one source of truth for persisted configuration.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,17 +28,54 @@ from instacore_sync.core.constants import (
 from instacore_sync.domain.enums import OcrEngineName
 
 
-def _repo_root() -> Path:
+def _is_frozen() -> bool:
+    """True inside a PyInstaller-built .exe, false running from source."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _app_base_dir() -> Path:
+    """Where user-writable/user-provided files (`config/settings.local.yaml`,
+    `config/credentials.json`, `config/token.json`) live, relative to.
+
+    `Path(__file__).resolve().parents[3]` (the old implementation) walks up
+    from this source file's own location to the project root — correct
+    when running from a source checkout, but meaningless once this module
+    is frozen into a PyInstaller build: a module bundled into the PYZ
+    archive doesn't have a real on-disk `__file__`, and even where
+    PyInstaller fakes one up, indexing `.parents[3]` off it doesn't land
+    anywhere a distributed .exe controls. Every one of the 500 installs
+    this app ships to needs `credentials.json` discoverable next to the
+    installed .exe (exactly where docs/GOOGLE_API_SETUP.md already tells
+    users to put it) and `settings.local.yaml`/`token.json` to persist
+    there too, stable across app restarts — so frozen mode resolves
+    relative to `sys.executable`'s directory instead.
+    """
+    if _is_frozen():
+        return Path(sys.executable).resolve().parent
     # src/instacore_sync/core/config.py -> src/instacore_sync/core -> src/instacore_sync -> src -> project root
     return Path(__file__).resolve().parents[3]
 
 
+def _bundled_resource_dir() -> Path:
+    """Where read-only resources PyInstaller bundled alongside the app
+    live — currently just `settings.example.yaml`, the seed template
+    copied to `settings.local.yaml` on first run. PyInstaller always
+    exposes these via `sys._MEIPASS` regardless of one-file/one-folder
+    packaging or where exactly it lays out the bundle internally, so this
+    is the one reliable way to find them frozen; source-tree development
+    uses the same project root as `_app_base_dir`.
+    """
+    if _is_frozen():
+        return Path(getattr(sys, "_MEIPASS", _app_base_dir()))
+    return Path(__file__).resolve().parents[3]
+
+
 def _default_settings_path() -> Path:
-    return _repo_root() / "config" / DEFAULT_SETTINGS_FILENAME
+    return _app_base_dir() / "config" / DEFAULT_SETTINGS_FILENAME
 
 
 def _example_settings_path() -> Path:
-    return _repo_root() / "config" / "settings.example.yaml"
+    return _bundled_resource_dir() / "config" / "settings.example.yaml"
 
 
 def user_data_dir() -> Path:
@@ -60,7 +98,10 @@ def user_data_dir() -> Path:
 class DriveSettings(BaseModel):
     root_folder_id: str = ""
     shared_drive_id: str = ""
-    date_folder_format: str = "%d %b"
+    # Must include the year: "%d %b" alone (e.g. "01 Sep") collides with
+    # itself every 365 days, silently mixing videos from different years
+    # into the same date folder for an app meant to run indefinitely.
+    date_folder_format: str = "%d %b %Y"
     make_public_link: bool = True
     credentials_file: str = "config/credentials.json"
     token_file: str = "config/token.json"
@@ -239,9 +280,9 @@ class AppSettings(BaseSettings):
     @property
     def credentials_path(self) -> Path:
         p = Path(self.drive.credentials_file)
-        return p if p.is_absolute() else _repo_root() / p
+        return p if p.is_absolute() else _app_base_dir() / p
 
     @property
     def token_path(self) -> Path:
         p = Path(self.drive.token_file)
-        return p if p.is_absolute() else _repo_root() / p
+        return p if p.is_absolute() else _app_base_dir() / p

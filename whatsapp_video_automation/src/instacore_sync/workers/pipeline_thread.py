@@ -101,3 +101,10 @@ class PipelineThread(QThread):
         loop = self._loop
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(self._orchestrator.resolve_needs_review, job_id, manual_device_id)
+
+    def sign_in_interactively(self) -> None:
+        """Thread-safe: Settings' "Sign in with Google" button — the only
+        path allowed to open an interactive browser consent screen."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._orchestrator.sign_in_interactively(), loop)

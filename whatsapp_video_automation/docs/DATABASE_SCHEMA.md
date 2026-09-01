@@ -90,7 +90,7 @@ is expected to be pruned periodically in a future maintenance job (old
 `uploaded_hashes.job_id` intentionally has **no foreign key** to this table
 (see below).
 
-### `uploaded_hashes` — permanent dedup index
+### `uploaded_hashes` — local dedup index (fast path, not the source of truth)
 SHA-256 → the Drive file it was uploaded as. `HashesRepository`/`DedupService`
 check this before every upload; a match short-circuits the pipeline straight
 to `DUPLICATE` without re-uploading. `job_id`/`original_filename` here are
@@ -98,6 +98,14 @@ informational only, **not** a foreign key to `jobs` — this index must
 survive independently of whatever retention policy the `jobs` working table
 eventually gets, since "never upload the same video twice" is a permanent
 guarantee, not one scoped to how long we keep job history.
+
+This table is local to *this install* — when many independent installs
+share one Drive destination, a video forwarded to several people is a
+miss in every one of their local `uploaded_hashes` tables until one of
+them finishes uploading it. `VideoProcessor._find_remote_duplicate()`
+covers that gap on a local miss by asking Drive itself (via the `sha256`
+custom property every upload is tagged with) and backfilling this table
+from the result — see `docs/DEPLOYMENT_AT_SCALE.md`.
 
 ### `upload_logs` — durable, append-only audit trail
 One row is appended by `VideoProcessor._finalize()` every time a job reaches
@@ -107,13 +115,22 @@ rows here are never updated or deleted by normal operation, making it safe
 to point BI/reporting tools at it directly.
 
 ### `drive_folder_cache` — Drive API call reduction
-Maps a cache key (`"31 Aug"` for a date folder, `"31 Aug/IC-188"` for a
-device folder nested under it) to the resolved Drive folder ID, so
+Maps a cache key (`"31 Aug 2026"` for a date folder, `"31 Aug 2026/IC-188"`
+for a device folder nested under it) to the resolved Drive folder ID, so
 `DriveClient.get_or_create_date_folder()` /
 `get_or_create_device_folder()` only call the Drive `files.list`/`files.create`
 APIs once per folder per app lifetime rather than once per video (at
 150-200 videos/day into a handful of IC folders, this avoids hundreds of
 redundant list calls and materially reduces Drive API quota usage).
+
+This cache is purely local to one install — it is never the source of
+truth for *whether a folder exists*, only a shortcut to skip re-asking
+Drive. When many independent installs share one Drive destination,
+`DriveClient._find_or_create_folder()` still has to handle two processes
+racing to create the same folder (Drive itself has no atomic
+check-then-create); see its docstring and
+[`docs/DEPLOYMENT_AT_SCALE.md`](DEPLOYMENT_AT_SCALE.md) for how that
+reconciles.
 
 ### `app_state` — generic key/value store
 A small escape hatch for state that doesn't belong in the YAML settings file

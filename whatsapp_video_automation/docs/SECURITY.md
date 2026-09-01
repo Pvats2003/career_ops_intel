@@ -66,6 +66,14 @@ setting link-sharing permissions — Drive's more narrow scopes don't cover
 folder creation) and `spreadsheets`. It never requests broader account
 access.
 
+`drive` is a Google-designated **restricted** scope, which has real
+deployment consequences once this stops being one person's own sign-in —
+an unverified consent screen is capped at 100 test users, and full
+external verification for a restricted scope requires a CASA security
+assessment. See
+[`docs/DEPLOYMENT_AT_SCALE.md`](DEPLOYMENT_AT_SCALE.md#the-blocker-you-cannot-code-your-way-around-oauth-verification)
+for what this means for a team rollout and the two ways to resolve it.
+
 ## What this does **not** protect against
 
 Being direct about the boundary matters more than the boundary itself:

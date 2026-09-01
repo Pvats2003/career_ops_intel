@@ -90,10 +90,14 @@ whatsapp_video_automation/
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the pieces fit
 together, [`docs/DATABASE_SCHEMA.md`](docs/DATABASE_SCHEMA.md) for the SQLite
-schema, [`docs/SETUP.md`](docs/SETUP.md) to run it locally, and
+schema, [`docs/SETUP.md`](docs/SETUP.md) to run it locally,
 [`docs/GOOGLE_API_SETUP.md`](docs/GOOGLE_API_SETUP.md) to wire up Drive/Sheets
-access, and [`docs/PACKAGING.md`](docs/PACKAGING.md) to build the Windows
-installer.
+access, [`docs/PACKAGING.md`](docs/PACKAGING.md) to build the Windows
+installer, [`docs/SECURITY.md`](docs/SECURITY.md) for the credential/security
+model, and — if you're rolling this out to a team rather than running it
+yourself — [`docs/DEPLOYMENT_AT_SCALE.md`](docs/DEPLOYMENT_AT_SCALE.md) for
+what changes (and what you must configure in Google Cloud Console) once many
+independent installs write into one shared Drive/Sheets destination.
 
 ## Quick start (development)
 

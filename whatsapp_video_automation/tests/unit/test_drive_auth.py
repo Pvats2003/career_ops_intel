@@ -1,4 +1,5 @@
-"""Regression tests for `GoogleAuthService`'s token-encryption-at-rest.
+"""Regression tests for `GoogleAuthService`'s token-encryption-at-rest and
+its silent-vs-interactive sign-in split.
 
 Verifies the plaintext-on-disk gap is actually closed (not just that the
 crypto primitive works in isolation) and that a normal
@@ -11,6 +12,11 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
+from instacore_sync.core.exceptions import DriveAuthError
+from instacore_sync.domain.enums import GoogleAuthStatus
+from instacore_sync.services.drive import drive_auth as drive_auth_module
 from instacore_sync.services.drive.drive_auth import GoogleAuthService
 
 
@@ -77,3 +83,91 @@ def test_sign_out_removes_token_and_key_files(tmp_path: Path) -> None:
 
     assert not token_path.exists()
     assert not key_path.exists()
+
+
+def test_non_interactive_get_credentials_never_launches_browser_flow_when_signed_out(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression test for a real startup-hang bug: with no stored token at
+    all (first run, or after sign-out), the default (non-interactive) path
+    must fail fast with DriveAuthError instead of opening a browser and
+    blocking — this call happens inside PipelineOrchestrator.start(),
+    awaited before the folder watcher or upload pool ever start, so a
+    silent interactive flow here would hang the entire pipeline for any
+    of 500 installs that haven't signed in yet."""
+    (tmp_path / "credentials.json").write_text("{}")  # exists, so this isn't the "missing file" path
+    service = GoogleAuthService(tmp_path / "credentials.json", tmp_path / "token.json")
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("run_local_server must never be invoked without interactive=True")
+
+    monkeypatch.setattr(
+        drive_auth_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        lambda *a, **kw: type("FakeFlow", (), {"run_local_server": _must_not_be_called})(),
+    )
+
+    with pytest.raises(DriveAuthError):
+        service.get_credentials(interactive=False)
+    assert service.status == GoogleAuthStatus.SIGNED_OUT
+
+
+def test_interactive_get_credentials_runs_the_consent_flow_when_signed_out(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "credentials.json").write_text("{}")
+    token_path = tmp_path / "token.json"
+    service = GoogleAuthService(tmp_path / "credentials.json", token_path)
+
+    fake_creds = _fake_credentials()
+
+    class _FakeFlow:
+        def run_local_server(self, port: int = 0):
+            return fake_creds
+
+    monkeypatch.setattr(
+        drive_auth_module.InstalledAppFlow, "from_client_secrets_file", lambda *a, **kw: _FakeFlow()
+    )
+
+    result = service.get_credentials(interactive=True)
+
+    assert result is fake_creds
+    assert service.status == GoogleAuthStatus.AUTHENTICATED
+    assert token_path.exists()  # persisted for next time
+
+
+def test_non_interactive_silent_refresh_succeeds_without_ever_needing_interactive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An expired-but-refreshable token must never need the interactive
+    flag at all — only a *dead* token (no refresh token, or refresh
+    itself fails) should ever require it."""
+    token_path = tmp_path / "token.json"
+    service = GoogleAuthService(tmp_path / "credentials.json", token_path)
+
+    refreshed = _fake_credentials(token="new-access-token")
+    stale = MagicMock()
+    stale.valid = False
+    stale.expired = True
+    stale.refresh_token = "refresh-token-secret"
+
+    def _refresh(request):
+        stale.valid = True
+
+    stale.refresh.side_effect = _refresh
+    stale.to_json.return_value = refreshed.to_json.return_value
+    monkeypatch.setattr(service, "_load_encrypted_token", lambda: stale)
+
+    def _flow_must_not_be_built(*a, **kw):
+        raise AssertionError("interactive flow must not be constructed for a refreshable token")
+
+    monkeypatch.setattr(drive_auth_module.InstalledAppFlow, "from_client_secrets_file", _flow_must_not_be_built)
+
+    # _load_or_authenticate only calls _load_encrypted_token when the
+    # token file exists on disk.
+    token_path.write_bytes(b"placeholder-ciphertext")
+
+    result = service.get_credentials(interactive=False)
+
+    assert result is stale
+    assert service.status == GoogleAuthStatus.AUTHENTICATED

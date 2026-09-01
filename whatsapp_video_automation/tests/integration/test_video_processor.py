@@ -39,7 +39,12 @@ class _StubDrive:
     def get_or_create_device_folder(self, date_label: str, device_id: str) -> str:
         return f"folder-{date_label}-{device_id}"
 
-    def upload_file(self, path: Path, folder_id: str, *, chunk_size_mb: int, progress_callback=None):
+    def find_duplicate_by_hash(self, sha256: str):
+        return None  # no cross-process duplicate in these single-process tests
+
+    def upload_file(
+        self, path: Path, folder_id: str, *, chunk_size_mb: int, progress_callback=None, sha256: str | None = None
+    ):
         if progress_callback:
             progress_callback(path.stat().st_size, path.stat().st_size)
         self.uploaded.append((path, folder_id))
@@ -158,6 +163,85 @@ def test_duplicate_video_is_skipped_without_uploading(tmp_path: Path, database: 
     processed_second = processor.process(second_job)
     assert processed_second.status == JobStatus.DUPLICATE
     assert len(drive.uploaded) == 1  # not uploaded again
+
+
+class _RemoteDuplicateDrive(_StubDrive):
+    """Simulates a *different* process already having uploaded this exact
+    video into the shared destination: this process's own local
+    `uploaded_hashes` table has never heard of it (empty), but Drive
+    itself reports a match via the custom `sha256` property every upload
+    is tagged with."""
+
+    def __init__(self, existing_file_id: str, existing_name: str, existing_link: str) -> None:
+        super().__init__()
+        self._existing_file_id = existing_file_id
+        self._existing_name = existing_name
+        self._existing_link = existing_link
+        self.find_duplicate_by_hash_calls = 0
+
+    def find_duplicate_by_hash(self, sha256: str):
+        from instacore_sync.domain.models import DriveHashMatch
+
+        self.find_duplicate_by_hash_calls += 1
+        return DriveHashMatch(
+            file_id=self._existing_file_id, name=self._existing_name, web_view_link=self._existing_link
+        )
+
+
+def test_cross_process_duplicate_is_detected_via_drive_and_skipped(tmp_path: Path, database: Database) -> None:
+    """The shared-destination scenario: this process's local dedup index
+    has never seen this hash (a different team member's app instance
+    uploaded it), so only Drive's own record of it — found through the
+    cross-process check — can catch it. Must skip the upload exactly like
+    a locally-known duplicate would, and must not hit OCR/upload at all."""
+    ocr = _StubOcr(DeviceIdExtraction(device_id="IC-188", confidence=0.95, engine_used=OcrEngineName.TESSERACT))
+    drive = _RemoteDuplicateDrive(
+        existing_file_id="remote-file-1",
+        existing_name="uploaded_by_someone_else.mp4",
+        existing_link="https://drive.google.com/file/d/remote-file-1/view",
+    )
+    sheets = _StubSheets()
+    processor = _make_processor(tmp_path, database, ocr, drive, sheets)
+
+    job = processor.process(_video_job(tmp_path, "forwarded_to_me_too.mp4"))
+
+    assert job.status == JobStatus.DUPLICATE
+    assert job.drive_link == "https://drive.google.com/file/d/remote-file-1/view"
+    assert drive.find_duplicate_by_hash_calls == 1
+    assert len(drive.uploaded) == 0  # never re-uploaded
+    assert ocr.call_count == 0  # dedup check short-circuits before OCR runs
+
+    # And it's backfilled locally, so a second identical video (or a retry
+    # of this one) is caught by the fast local check without another
+    # network round trip.
+    second = processor.process(_video_job(tmp_path, "same_content_again.mp4"))
+    assert second.status == JobStatus.DUPLICATE
+    assert drive.find_duplicate_by_hash_calls == 1  # not called again — local cache now has it
+
+
+class _DriveDownDuringDedupCheck(_StubDrive):
+    """The cross-process dedup check itself fails (Drive unreachable) —
+    must fail open and let a legitimate upload through rather than
+    blocking every video whenever this one extra check has a bad moment."""
+
+    def find_duplicate_by_hash(self, sha256: str):
+        from instacore_sync.core.exceptions import DriveApiError
+
+        raise DriveApiError("simulated: Drive unreachable for the dedup check")
+
+
+def test_remote_dedup_check_failure_fails_open_and_upload_still_proceeds(
+    tmp_path: Path, database: Database
+) -> None:
+    ocr = _StubOcr(DeviceIdExtraction(device_id="IC-188", confidence=0.95, engine_used=OcrEngineName.TESSERACT))
+    drive = _DriveDownDuringDedupCheck()
+    sheets = _StubSheets()
+    processor = _make_processor(tmp_path, database, ocr, drive, sheets)
+
+    job = processor.process(_video_job(tmp_path))
+
+    assert job.status == JobStatus.COMPLETED
+    assert len(drive.uploaded) == 1
 
 
 def test_pattern_invalid_device_id_is_rejected_before_drive_upload(tmp_path: Path, database: Database) -> None:

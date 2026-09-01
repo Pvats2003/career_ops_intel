@@ -77,7 +77,9 @@ class MainWindow(QMainWindow):
         self._queue_view = QueueView(jobs_repo, signal_bus, pipeline_thread)
         self._needs_review_view = NeedsReviewView(jobs_repo, signal_bus, pipeline_thread, settings)
         self._logs_view = LogsView(logs_repo)
-        self._settings_view = SettingsView(settings, theme_manager, self._on_theme_changed)
+        self._settings_view = SettingsView(
+            settings, theme_manager, self._on_theme_changed, pipeline_thread.sign_in_interactively
+        )
 
         for view in (
             self._dashboard_view,

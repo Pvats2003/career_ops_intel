@@ -8,6 +8,7 @@ Supports both a normal "My Drive" folder tree and a Shared Drive (set
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -22,13 +23,14 @@ from instacore_sync.core.constants import DRIVE_CHUNK_ALIGNMENT_BYTES
 from instacore_sync.core.exceptions import DriveApiError
 from instacore_sync.core.logging_setup import get_logger
 from instacore_sync.db.repositories.settings_repository import DriveFolderCacheRepository
-from instacore_sync.domain.models import UploadResult
+from instacore_sync.domain.models import DriveHashMatch, UploadResult
 from instacore_sync.utils.google_api_errors import is_not_found_error
 from instacore_sync.utils.retry import google_api_retry
 
 logger = get_logger(__name__)
 
 _FOLDER_MIME = "application/vnd.google-apps.folder"
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 ProgressCallback = Callable[[int, int], None]  # (bytes_uploaded, total_bytes)
 
@@ -110,14 +112,150 @@ class DriveClient:
 
     @google_api_retry()
     def _find_or_create_folder(self, name: str, parent_id: str) -> str:
-        escaped = name.replace("'", "\\'")
+        """Find (or create) a folder named `name` directly under `parent_id`.
+
+        Google Drive has no atomic "create if not exists" for folders —
+        `files.list` then `files.create` is inherently a check-then-act
+        race. That race is invisible with a single operator's one process,
+        but with a shared destination written to by many independent app
+        instances at once (every team member's own copy, all pointed at
+        the same root folder), two processes can both list "31 Aug/IC-188",
+        both see nothing, and both create it — Drive happily allows two
+        folders with the identical name/parent, silently scattering that
+        IC's videos across both for the rest of the day.
+
+        We can't prevent the race, but we can make it self-healing: after
+        creating, re-list for the same name/parent. If more than one now
+        exists, every process computes the *same* deterministic winner
+        (oldest `createdTime`, tie-broken by id) — so all concurrent
+        callers converge on one folder without needing to coordinate. A
+        process that just lost the race trashes the folder it *itself*
+        just created a moment ago (which by construction cannot yet
+        contain any files: nothing is uploaded until this method returns
+        a folder id to upload into) rather than ever touching a folder
+        another process created, so this never risks deleting content.
+        """
+        try:
+            existing = self._list_folders_by_name(name, parent_id)
+            if len(existing) == 1:
+                return existing[0]["id"]
+            if len(existing) > 1:
+                return self._resolve_duplicate_folders(existing, name, parent_id)
+
+            metadata = {"name": name, "mimeType": _FOLDER_MIME, "parents": [parent_id]}
+            created = (
+                self._drive()
+                .files()
+                .create(body=metadata, fields="id, name, createdTime", supportsAllDrives=True)
+                .execute()
+            )
+            new_id = created["id"]
+            logger.info("drive.folder.created", name=name, parent=parent_id, id=new_id)
+
+            # Reconcile: another process may have created the same folder
+            # in the window between our list() above and this create().
+            after_create = self._list_folders_by_name(name, parent_id)
+            if len(after_create) > 1:
+                return self._resolve_duplicate_folders(after_create, name, parent_id)
+            return new_id
+        except HttpError as exc:
+            raise DriveApiError(f"Failed to find/create Drive folder {name!r}: {exc}") from exc
+
+    def _list_folders_by_name(self, name: str, parent_id: str) -> list[dict]:
+        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
         query = (
             f"name = '{escaped}' and mimeType = '{_FOLDER_MIME}' "
             f"and '{parent_id}' in parents and trashed = false"
         )
         list_kwargs: dict[str, object] = {
             "q": query,
-            "fields": "files(id, name)",
+            "fields": "files(id, name, createdTime)",
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            # Deterministic ordering means "first result" is a meaningful,
+            # stable choice rather than whatever order the API feels like
+            # returning today.
+            "orderBy": "createdTime,name",
+        }
+        if self._settings.shared_drive_id:
+            list_kwargs["corpora"] = "drive"
+            list_kwargs["driveId"] = self._settings.shared_drive_id
+
+        response = self._drive().files().list(**list_kwargs).execute()
+        return response.get("files", [])
+
+    def _resolve_duplicate_folders(self, folders: list[dict], name: str, parent_id: str) -> str:
+        canonical = min(folders, key=lambda f: (f.get("createdTime") or "", f["id"]))
+        losers = [f for f in folders if f["id"] != canonical["id"]]
+        logger.warning(
+            "drive.folder.duplicate_detected",
+            name=name,
+            parent=parent_id,
+            canonical_id=canonical["id"],
+            duplicate_count=len(losers),
+        )
+        for loser in losers:
+            self._trash_empty_duplicate_folder(loser["id"], name)
+        return canonical["id"]
+
+    def _trash_empty_duplicate_folder(self, folder_id: str, name: str) -> None:
+        """Best-effort cleanup of a losing duplicate folder.
+
+        Only ever called on a folder id this exact call chain just created
+        moments ago (see `_find_or_create_folder`) and that therefore has
+        had no chance to receive an upload yet. Still checks for children
+        before trashing as defense in depth — if this assumption is ever
+        wrong (e.g. a future caller path changes), we must never destroy
+        someone's uploaded video by deleting the folder it landed in; we
+        simply leave a rare, harmless duplicate folder behind instead.
+        """
+        try:
+            children = (
+                self._drive()
+                .files()
+                .list(
+                    q=f"'{folder_id}' in parents and trashed = false",
+                    fields="files(id)",
+                    pageSize=1,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            if children.get("files"):
+                logger.warning("drive.folder.duplicate_not_empty_left_in_place", folder_id=folder_id, name=name)
+                return
+            self._drive().files().update(fileId=folder_id, body={"trashed": True}, supportsAllDrives=True).execute()
+            logger.info("drive.folder.duplicate_trashed", folder_id=folder_id, name=name)
+        except HttpError as exc:
+            logger.warning("drive.folder.duplicate_cleanup_failed", folder_id=folder_id, error=str(exc))
+
+    # -- Cross-process dedup ----------------------------------------------------
+
+    @google_api_retry()
+    def find_duplicate_by_hash(self, sha256: str) -> DriveHashMatch | None:
+        """Ask Drive itself whether a file with this SHA-256 already
+        exists — the authoritative dedup check when the destination is
+        shared by many independent app instances (every team member's own
+        copy). The local `uploaded_hashes` SQLite table only knows what
+        *this* process has uploaded; if the same video is forwarded to two
+        different people, their two processes' local indexes are both
+        empty for it right up until one of them finishes uploading, so a
+        purely local check can't catch this. Every upload tags its file
+        with a custom `sha256` property (see `upload_file`); Drive indexes
+        custom properties for search, so this is one `files.list` call —
+        no coordination service or backend needed, and it works for any
+        file this account can see anywhere in Drive, not just under the
+        configured root, so it also catches the (accidental) case of a
+        video someone already uploaded to a different date/device folder.
+        """
+        if not _SHA256_HEX_RE.match(sha256):
+            raise ValueError(f"Not a valid SHA-256 hex digest: {sha256!r}")
+
+        list_kwargs: dict[str, object] = {
+            "q": f"properties has {{ key='sha256' and value='{sha256}' }} and trashed = false",
+            "fields": "files(id, name, webViewLink)",
+            "pageSize": 1,
             "supportsAllDrives": True,
             "includeItemsFromAllDrives": True,
         }
@@ -127,21 +265,18 @@ class DriveClient:
 
         try:
             response = self._drive().files().list(**list_kwargs).execute()
-            existing = response.get("files", [])
-            if existing:
-                return existing[0]["id"]
-
-            metadata = {"name": name, "mimeType": _FOLDER_MIME, "parents": [parent_id]}
-            created = (
-                self._drive()
-                .files()
-                .create(body=metadata, fields="id", supportsAllDrives=True)
-                .execute()
-            )
-            logger.info("drive.folder.created", name=name, parent=parent_id, id=created["id"])
-            return created["id"]
         except HttpError as exc:
-            raise DriveApiError(f"Failed to find/create Drive folder {name!r}: {exc}") from exc
+            raise DriveApiError(f"Failed to search Drive for duplicate hash {sha256[:12]}...: {exc}") from exc
+
+        files = response.get("files", [])
+        if not files:
+            return None
+        match = files[0]
+        return DriveHashMatch(
+            file_id=match["id"],
+            name=match.get("name", ""),
+            web_view_link=match.get("webViewLink") or self.build_view_link(match["id"]),
+        )
 
     # -- Upload ---------------------------------------------------------------
 
@@ -152,12 +287,19 @@ class DriveClient:
         *,
         chunk_size_mb: int = 8,
         progress_callback: ProgressCallback | None = None,
+        sha256: str | None = None,
     ) -> UploadResult:
         started = time.monotonic()
         total_bytes = file_path.stat().st_size
         chunk_size = max(DRIVE_CHUNK_ALIGNMENT_BYTES, int(chunk_size_mb * 1024 * 1024))
 
-        metadata = {"name": file_path.name, "parents": [folder_id]}
+        metadata: dict[str, object] = {"name": file_path.name, "parents": [folder_id]}
+        if sha256:
+            # Custom property, not a rename/content change — this is what
+            # `find_duplicate_by_hash` searches on to give every other
+            # process sharing this destination a real, Drive-native way to
+            # discover "someone already uploaded this exact video".
+            metadata["properties"] = {"sha256": sha256}
         media = MediaFileUpload(str(file_path), chunksize=chunk_size, resumable=True)
 
         try:

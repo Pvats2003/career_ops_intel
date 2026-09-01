@@ -34,7 +34,7 @@ class _StubGoogleAuth:
     status = "signed_out"
     account_email = None
 
-    def get_credentials(self):
+    def get_credentials(self, *, interactive: bool = False):
         raise DriveAuthError("no credentials configured in this test")
 
 
@@ -235,5 +235,128 @@ async def test_resolve_needs_review_rejects_non_needs_review_job(orchestrator: P
         orchestrator._jobs_repo.upsert(job)
 
         assert orchestrator.resolve_needs_review(job.job_id, "IC-188") is False
+    finally:
+        await orchestrator.stop()
+
+
+class _HangingIfInteractiveGoogleAuth:
+    """Stands in for the real GoogleAuthService: a non-interactive call
+    fails fast (no stored token in this test); an interactive call raises
+    loudly instead of actually hanging (a real `flow.run_local_server(...)`
+    would block on a browser that never arrives, which we don't want to
+    reproduce in a fast test suite) — either way, this fails the test the
+    moment the interactive path is reached from automatic code. This is
+    the regression test for a real startup-hang bug: `PipelineOrchestrator
+    .start()` used to call the *interactive* path unconditionally, so any
+    of 500 installs without a valid stored token would never get past
+    `start()` — the folder watcher and upload pool would simply never
+    start, with no error, no timeout, nothing in the UI to explain why
+    videos just weren't being picked up.
+    """
+
+    status = "signed_out"
+    account_email = None
+
+    def __init__(self) -> None:
+        self.interactive_calls = 0
+        self.non_interactive_calls = 0
+
+    def get_credentials(self, *, interactive: bool = False):
+        if interactive:
+            self.interactive_calls += 1
+            raise AssertionError(
+                "get_credentials(interactive=True) must never be called from an "
+                "automatic/background code path — only an explicit user action"
+            )
+        self.non_interactive_calls += 1
+        raise DriveAuthError("no stored token in this test")
+
+
+@pytest.fixture
+def orchestrator_with_hanging_auth(tmp_path: Path, database: Database):
+    settings = AppSettings()
+    settings.watch_folder = str(tmp_path / "watch")
+    settings.processed_folder = str(tmp_path / "Processed")
+    settings.needs_review_folder = str(tmp_path / "NeedsReview")
+    settings.failed_folder = str(tmp_path / "Failed")
+    settings.app.jobs_retention_days = 0
+
+    jobs_repo = JobsRepository(database)
+    logs_repo = LogsRepository(database)
+    dedup = DedupService(HashService(), HashesRepository(database))
+    ocr_factory = OcrEngineFactory(settings.ocr)
+    google_auth = _HangingIfInteractiveGoogleAuth()
+
+    orchestrator = PipelineOrchestrator(
+        settings, jobs_repo, logs_repo, dedup, ocr_factory, google_auth, MagicMock(), MagicMock()
+    )
+    return orchestrator, google_auth
+
+
+@pytest.mark.asyncio
+async def test_start_never_attempts_interactive_sign_in(orchestrator_with_hanging_auth) -> None:
+    orchestrator, google_auth = orchestrator_with_hanging_auth
+    try:
+        await asyncio.wait_for(orchestrator.start(), timeout=2.0)  # must not hang
+    finally:
+        await orchestrator.stop()
+
+    assert google_auth.non_interactive_calls == 1
+    assert google_auth.interactive_calls == 0
+
+
+class _RecordingGoogleAuth:
+    """Records exactly which mode `get_credentials` was called with, and
+    always fails (no real OAuth in this test) — but as a plain
+    DriveAuthError rather than raising loudly, since this fake is used to
+    verify `sign_in_interactively` correctly uses the interactive path and
+    reports (rather than propagates) the eventual failure."""
+
+    status = "signed_out"
+    account_email = None
+
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+
+    def get_credentials(self, *, interactive: bool = False):
+        self.calls.append(interactive)
+        raise DriveAuthError("no real OAuth in this test")
+
+
+@pytest.fixture
+def orchestrator_with_recording_auth(tmp_path: Path, database: Database):
+    settings = AppSettings()
+    settings.watch_folder = str(tmp_path / "watch")
+    settings.processed_folder = str(tmp_path / "Processed")
+    settings.needs_review_folder = str(tmp_path / "NeedsReview")
+    settings.failed_folder = str(tmp_path / "Failed")
+    settings.app.jobs_retention_days = 0
+
+    jobs_repo = JobsRepository(database)
+    logs_repo = LogsRepository(database)
+    dedup = DedupService(HashService(), HashesRepository(database))
+    ocr_factory = OcrEngineFactory(settings.ocr)
+    google_auth = _RecordingGoogleAuth()
+
+    orchestrator = PipelineOrchestrator(
+        settings, jobs_repo, logs_repo, dedup, ocr_factory, google_auth, MagicMock(), MagicMock()
+    )
+    return orchestrator, google_auth
+
+
+@pytest.mark.asyncio
+async def test_sign_in_interactively_uses_the_interactive_path(orchestrator_with_recording_auth) -> None:
+    """The one path allowed to call interactive=True — verifies it's wired
+    through, and that a failure there is reported rather than raised out
+    of the orchestrator (this runs from a UI button click, not something
+    with a try/except wrapped around it by the caller)."""
+    orchestrator, google_auth = orchestrator_with_recording_auth
+    try:
+        await orchestrator.start()
+        assert google_auth.calls == [False]  # start()'s own probe: always silent
+
+        await orchestrator.sign_in_interactively()  # must not raise, even though it fails
+
+        assert google_auth.calls == [False, True]
     finally:
         await orchestrator.stop()

@@ -34,6 +34,15 @@ class _NeverCalledDrive:
     def upload_file(self, *args, **kwargs):  # noqa: ANN002, ANN003
         raise AssertionError("Drive must never be reached for a video OCR can't even open")
 
+    def find_duplicate_by_hash(self, sha256: str):
+        # The cross-process dedup check legitimately runs at the hashing
+        # step, before OCR — a corrupted file can still be hashed, and
+        # checking dedup first avoids wasting an OCR pass on a video
+        # that's already a known duplicate. Only upload/folder creation
+        # (the calls above) must never be reached for a video OCR can't
+        # open.
+        return None
+
 
 class _NeverCalledSheets:
     def upsert_row(self, **kwargs):  # noqa: ANN003

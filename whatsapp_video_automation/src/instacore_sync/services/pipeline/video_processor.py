@@ -27,6 +27,7 @@ from instacore_sync.core.exceptions import (
     VideoReadError,
 )
 from instacore_sync.core.logging_setup import get_logger
+from instacore_sync.db.repositories.hashes_repository import UploadedHashRecord
 from instacore_sync.db.repositories.jobs_repository import JobsRepository
 from instacore_sync.db.repositories.logs_repository import LogsRepository
 from instacore_sync.domain.enums import JobStatus
@@ -127,6 +128,9 @@ class VideoProcessor:
             return
 
         duplicate = self._dedup.find_duplicate(file_hash)
+        if duplicate is None:
+            duplicate = self._find_remote_duplicate(job, file_hash)
+
         if duplicate is not None:
             job.status = JobStatus.DUPLICATE
             job.drive_link = duplicate.drive_link
@@ -144,6 +148,45 @@ class VideoProcessor:
         # catch it as a real duplicate.
         if not self._dedup.claim_for_upload(file_hash):
             raise DuplicateVideoError(file_hash, job.original_filename)
+
+    def _find_remote_duplicate(self, job: VideoJob, file_hash: str) -> UploadedHashRecord | None:
+        """Ask Drive itself whether this hash was already uploaded — the
+        cross-process check.
+
+        The local check above only knows about uploads *this* process has
+        made. When the destination is shared by many independent app
+        instances (every team member's own copy pointed at one Drive
+        folder/Sheet), the far more common case is that a video forwarded
+        to several people gets picked up by several different processes at
+        once, each with an empty local index for it. Drive's custom-
+        property search (tagged on every upload, see `DriveClient.
+        upload_file`) is the shared source of truth those independent
+        local caches can't be. A match found this way is backfilled into
+        the local `uploaded_hashes` table so this process's *own* local
+        check catches it directly next time, without a network round trip.
+
+        Deliberately fails open: a network hiccup here must never fail an
+        otherwise-good upload just because the extra dedup check couldn't
+        complete — worst case, a preventable duplicate slips through this
+        one time (still caught by the same check on every future upload of
+        that hash), which is a far smaller cost than losing today's video
+        entirely.
+        """
+        try:
+            match = self._drive.find_duplicate_by_hash(file_hash)
+        except DriveApiError as exc:
+            logger.warning(
+                "pipeline.remote_dedup_check_failed", job_id=job.job_id, error=str(exc)
+            )
+            return None
+        if match is None:
+            return None
+
+        logger.info(
+            "dedup.remote_duplicate_found", job_id=job.job_id, file_id=match.file_id, name=match.name
+        )
+        self._dedup.record_upload(file_hash, job.job_id, match.name, match.file_id, match.web_view_link)
+        return self._dedup.find_duplicate(file_hash)
 
     def _extract_device_id(self, job: VideoJob) -> None:
         if job.manually_confirmed and job.device_id:
@@ -210,6 +253,7 @@ class VideoProcessor:
             folder_id,
             chunk_size_mb=self._settings.uploads.chunk_size_mb,
             progress_callback=_on_progress,
+            sha256=job.file_hash_sha256,
         )
         job.drive_file_id = result.file_id
         job.drive_link = result.web_view_link

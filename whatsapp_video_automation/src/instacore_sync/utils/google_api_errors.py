@@ -50,12 +50,35 @@ def _error_reason(exc: Exception) -> str | None:
 
 
 def is_transient_google_api_error(exc: Exception) -> bool:
-    """True if retrying the same request later stands a real chance of succeeding."""
-    status = _http_status(exc)
-    if status in _TRANSIENT_STATUS_CODES:
-        return True
-    if status == 403:
-        return _error_reason(exc) in _TRANSIENT_403_REASONS
+    """True if retrying the same request later stands a real chance of succeeding.
+
+    Checks both `exc` and `exc.__cause__`. Every Drive/Sheets call site in
+    this codebase catches the raw `HttpError` and re-raises a typed
+    `DriveApiError`/`SheetsApiError` via `raise TypedError(...) from exc`
+    so callers further up the stack (`VideoProcessor`'s exception routing)
+    can pattern-match on our own exception hierarchy instead of a
+    third-party one. That's the right layering, but it has a sharp edge:
+    `@google_api_retry()` wraps the *whole* decorated method, so by the
+    time tenacity evaluates this predicate against an attempt that failed,
+    the exception it's holding is already the typed wrapper — the retry
+    decorator would never see the original HttpError's status code at all,
+    and every "genuinely transient, worth another attempt" 429/500 would
+    silently never be retried at the API-call level (this was in fact a
+    live bug here: retries were only ever happening at the much coarser
+    whole-video worker-pool level, re-uploading the entire file from byte
+    zero for something a few seconds' backoff on a single call would have
+    absorbed). `raise ... from exc` sets `__cause__` to the original
+    HttpError, so checking it here restores correct classification without
+    having to restructure every call site's exception handling.
+    """
+    for candidate in (exc, getattr(exc, "__cause__", None)):
+        if candidate is None:
+            continue
+        status = _http_status(candidate)
+        if status in _TRANSIENT_STATUS_CODES:
+            return True
+        if status == 403 and _error_reason(candidate) in _TRANSIENT_403_REASONS:
+            return True
     return False
 
 

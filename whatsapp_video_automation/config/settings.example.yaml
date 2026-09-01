@@ -16,7 +16,7 @@ failed_folder: "C:/InstacoreSync/Failed"
 drive:
   root_folder_id: ""            # Drive folder (or Shared Drive folder) that holds daily date folders
   shared_drive_id: ""           # Optional: set if root_folder_id lives inside a Shared Drive
-  date_folder_format: "%d %b"   # e.g. "31 Aug"
+  date_folder_format: "%d %b %Y"   # e.g. "31 Aug 2026" — keep the year, or folders collide every 365 days
   make_public_link: true        # "Anyone with the link" viewer access on upload
   credentials_file: "config/credentials.json"
   token_file: "config/token.json"

@@ -58,7 +58,7 @@ class _StubGoogleAuth:
     status = "signed_out"
     account_email = None
 
-    def get_credentials(self):
+    def get_credentials(self, *, interactive: bool = False):
         raise DriveAuthError("no credentials configured in this test")
 
 
@@ -77,7 +77,12 @@ class _FlakyDrive:
     def get_or_create_device_folder(self, date_label: str, device_id: str) -> str:
         return f"folder-{date_label}-{device_id}"
 
-    def upload_file(self, path: Path, folder_id: str, *, chunk_size_mb: int, progress_callback=None):
+    def find_duplicate_by_hash(self, sha256: str):
+        return None  # no cross-process duplicates in this single-process stress test
+
+    def upload_file(
+        self, path: Path, folder_id: str, *, chunk_size_mb: int, progress_callback=None, sha256: str | None = None
+    ):
         self.upload_attempts += 1
         if self._rng.random() < self._failure_rate:
             raise DriveApiError("simulated network interruption / Drive API timeout")

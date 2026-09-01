@@ -106,6 +106,20 @@ class UploadResult(BaseModel):
     duration_seconds: float
 
 
+class DriveHashMatch(BaseModel):
+    """A file already on Drive carrying a matching `sha256` custom
+    property — the cross-process dedup signal for a shared destination
+    written to by many independent app instances at once, where the local
+    SQLite `uploaded_hashes` index only knows what *this* process itself
+    uploaded (see `DriveClient.find_duplicate_by_hash`)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    file_id: str
+    name: str
+    web_view_link: str
+
+
 class SheetUpdateResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 

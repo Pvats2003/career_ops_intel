@@ -57,12 +57,14 @@ class SettingsView(QWidget):
         settings: AppSettings,
         theme_manager: ThemeManager,
         on_theme_changed: Callable[[str], None],
+        on_sign_in_clicked: Callable[[], None] | None = None,
         parent=None,  # noqa: ANN001
     ) -> None:
         super().__init__(parent)
         self._settings = settings
         self._theme_manager = theme_manager
         self._on_theme_changed = on_theme_changed
+        self._on_sign_in_clicked = on_sign_in_clicked
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -188,6 +190,15 @@ class SettingsView(QWidget):
         form.addRow("Date folder format", self._date_format_edit)
         form.addRow("Link sharing", self._public_link_check)
         form.addRow("credentials.json path", self._credentials_edit)
+
+        sign_in_button = QPushButton("Sign in with Google…")
+        sign_in_button.setToolTip(
+            "Opens a browser window to sign in (or switch accounts). InstaCore Sync never\n"
+            "opens this automatically — it only runs when you click this button, so it never\n"
+            "blocks startup waiting on a browser you didn't ask for."
+        )
+        sign_in_button.clicked.connect(self._on_sign_in)
+        form.addRow("Google account", sign_in_button)
         return widget
 
     def _build_sheets_tab(self) -> QWidget:
@@ -290,6 +301,19 @@ class SettingsView(QWidget):
         form.addRow("Duplicate detection", self._dedup_check)
         return widget
 
+    # -- Google sign-in -------------------------------------------------------
+
+    def _on_sign_in(self) -> None:
+        if self._on_sign_in_clicked is None:
+            return
+        self._on_sign_in_clicked()
+        QMessageBox.information(
+            self,
+            "Signing in",
+            "A browser window should open to complete Google sign-in. Watch the status "
+            "indicator at the top of the window — it updates once sign-in finishes.",
+        )
+
     # -- backup / restore ---------------------------------------------------------
 
     def _on_export_clicked(self) -> None:
@@ -360,7 +384,7 @@ class SettingsView(QWidget):
 
         s.drive.root_folder_id = self._root_folder_edit.text().strip()
         s.drive.shared_drive_id = self._shared_drive_edit.text().strip()
-        s.drive.date_folder_format = self._date_format_edit.text().strip() or "%d %b"
+        s.drive.date_folder_format = self._date_format_edit.text().strip() or "%d %b %Y"
         s.drive.make_public_link = self._public_link_check.isChecked()
         s.drive.credentials_file = self._credentials_edit.text().strip()
 

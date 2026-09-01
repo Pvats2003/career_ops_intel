@@ -59,3 +59,36 @@ def test_malformed_error_body_does_not_raise() -> None:
     exc = _FakeHttpError(403)
     exc.content = b"not json"
     assert is_transient_google_api_error(exc) is False  # fails safe, doesn't crash
+
+
+class _TypedWrapperError(Exception):
+    """Stands in for DriveApiError/SheetsApiError — every real call site
+    catches the raw HttpError and re-raises one of these via `raise ... from
+    exc`, which is what the __cause__ chain below is regression-testing."""
+
+
+def test_transient_error_is_detected_through_a_typed_wrapper_via_cause() -> None:
+    """Regression test for a real bug: every @google_api_retry()-decorated
+    method in this codebase catches HttpError and re-raises a typed
+    DriveApiError/SheetsApiError via `raise TypedError(...) from exc` — so
+    the exception tenacity's retry predicate actually evaluates is the
+    wrapper, not the original HttpError, unless this function also checks
+    __cause__. Before this fix, every transient 429/500/502/503/504 from
+    Drive or Sheets silently never retried at the API-call level."""
+    original = _FakeHttpError(429)
+    try:
+        raise _TypedWrapperError("Drive call failed: 429") from original
+    except _TypedWrapperError as wrapped:
+        assert is_transient_google_api_error(wrapped) is True
+
+
+def test_permanent_error_through_a_typed_wrapper_is_still_not_transient() -> None:
+    original = _FakeHttpError(404)
+    try:
+        raise _TypedWrapperError("not found") from original
+    except _TypedWrapperError as wrapped:
+        assert is_transient_google_api_error(wrapped) is False
+
+
+def test_wrapper_with_no_cause_is_not_transient() -> None:
+    assert is_transient_google_api_error(_TypedWrapperError("boom")) is False

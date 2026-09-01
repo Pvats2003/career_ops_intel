@@ -9,14 +9,25 @@ Row lookups are served from an in-memory `filename -> row number` cache
 built from a single read the first time it's needed, instead of one
 `values.get` API call per upload — at 200-500 uploads/day that's the
 difference between 200-500 lookup calls and effectively one. The cache is
-process-lifetime (rebuilt fresh on every app restart) and assumes this
-process is the sole writer to the sheet while it's running; call
-`invalidate_cache()` (wired to a future "Resync Sheet" action) if the sheet
-was edited by hand mid-session.
+process-lifetime (rebuilt fresh on every app restart) and reflects only
+what *this* process has seen; call `invalidate_cache()` (wired to a future
+"Resync Sheet" action) if the sheet was edited by hand mid-session.
+
+New-row placement deliberately does **not** use a client-computed "next
+empty row" — see `_append_row` for why: when this same spreadsheet is a
+shared destination for many independent app instances (e.g. every member
+of a team, each running their own copy against the same tracking sheet),
+two processes computing "next row" from their own local view can compute
+the *same* row number and one silently overwrites the other's log entry.
+`values.append` delegates that decision to Sheets itself, which serializes
+it server-side — the one part of this class that must be safe under
+concurrent writers from other processes, not just other threads in this
+one.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import datetime
 
@@ -33,6 +44,18 @@ from instacore_sync.utils.text_sanitize import sanitize_for_spreadsheet_cell
 
 logger = get_logger(__name__)
 
+# Matches the row number out of a values.append response's updatedRange,
+# e.g. "Uploads!A5:G5" or "'My Sheet'!A5:G5" -> "5".
+_ROW_FROM_RANGE_RE = re.compile(r"![A-Z]+(\d+)")
+
+
+def _column_letter_to_index(letter: str) -> int:
+    """'A' -> 0, 'B' -> 1, ..., 'Z' -> 25, 'AA' -> 26, ..."""
+    index = 0
+    for ch in letter.strip().upper():
+        index = index * 26 + (ord(ch) - ord("A") + 1)
+    return index - 1
+
 
 class SheetsClient:
     def __init__(
@@ -44,7 +67,7 @@ class SheetsClient:
         self._credentials_provider = credentials_provider
         self._service: Resource | None = None
         self._row_cache: dict[str, int] = {}
-        self._next_row_number: int | None = None
+        self._cache_primed = False
 
     def _sheets(self) -> Resource:
         if self._service is None:
@@ -58,7 +81,7 @@ class SheetsClient:
         the in-memory row index — use after an out-of-band edit to the
         sheet (e.g. a human manually reordered/deleted rows)."""
         self._row_cache = {}
-        self._next_row_number = None
+        self._cache_primed = False
 
     @google_api_retry()
     def upsert_row(
@@ -95,21 +118,18 @@ class SheetsClient:
                     created_new_row=False,
                 )
 
-            assert self._next_row_number is not None  # set by _ensure_row_cache
-            next_row = self._next_row_number
-            self._write_row(sheet, next_row, row_values)
-            self._row_cache[filename] = next_row
-            self._next_row_number += 1
+            row_number = self._append_row(sheet, row_values)
+            self._row_cache[filename] = row_number
             return SheetUpdateResult(
                 spreadsheet_id=self._settings.spreadsheet_id,
-                row_number=next_row,
+                row_number=row_number,
                 created_new_row=True,
             )
         except HttpError as exc:
             raise SheetsApiError(f"Failed to write sheet row for {filename}: {exc}") from exc
 
     def _ensure_row_cache(self) -> None:
-        if self._next_row_number is not None:
+        if self._cache_primed:
             return  # already primed this session
 
         cols = self._settings.columns
@@ -130,7 +150,7 @@ class SheetsClient:
         for offset, row in enumerate(values):
             if row and row[0]:
                 self._row_cache[row[0]] = self._settings.header_row + 1 + offset
-        self._next_row_number = self._settings.header_row + 1 + len(values)
+        self._cache_primed = True
         logger.info("sheets.row_cache.primed", known_rows=len(self._row_cache))
 
     def _write_row(self, sheet: str, row_number: int, values_by_column: dict[str, str]) -> None:
@@ -142,6 +162,55 @@ class SheetsClient:
             spreadsheetId=self._settings.spreadsheet_id,
             body={"valueInputOption": "USER_ENTERED", "data": data},
         ).execute()
+
+    def _append_row(self, sheet: str, values_by_column: dict[str, str]) -> int:
+        """Atomically place a brand-new row via Sheets' native append.
+
+        `values.append` finds "the next row after the table" and writes
+        there *as a single operation Sheets itself serializes* — unlike our
+        old approach of reading the sheet once, computing "next row = N"
+        locally, and writing to row N, which is safe for a single process
+        but not for many independent processes sharing one destination
+        sheet (a shared team tracker, for instance): two processes could
+        both compute N, and the second write would silently clobber the
+        first's row instead of landing on N+1. Handing row placement to
+        Sheets itself removes that race entirely, at the cost of needing to
+        parse the row Sheets actually chose out of its response instead of
+        knowing it upfront.
+
+        The row is built as one contiguous array from column A through the
+        rightmost configured column (arbitrary/gapped/reordered column
+        mapping is user-configurable via Settings -> Google Sheets), with
+        unmapped columns left as empty strings — `values.append` writes a
+        whole row per call, it can't target the same scattered per-column
+        ranges `_write_row`'s batchUpdate uses for in-place updates.
+        """
+        width = max(_column_letter_to_index(col) for col in values_by_column) + 1
+        row = [""] * width
+        for col, value in values_by_column.items():
+            row[_column_letter_to_index(col)] = value
+
+        range_ = f"{sheet}!A{self._settings.header_row + 1}"
+        response = (
+            self._sheets()
+            .spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=self._settings.spreadsheet_id,
+                range=range_,
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [row]},
+            )
+            .execute()
+        )
+        updated_range = response.get("updates", {}).get("updatedRange", "")
+        match = _ROW_FROM_RANGE_RE.search(updated_range)
+        if not match:
+            raise SheetsApiError(
+                f"Could not determine which row Sheets appended to (updatedRange={updated_range!r})"
+            )
+        return int(match.group(1))
 
     @google_api_retry()
     def ensure_header_row(self) -> None:
