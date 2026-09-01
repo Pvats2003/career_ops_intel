@@ -28,6 +28,7 @@ one.
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Callable
 from datetime import datetime
 
@@ -65,16 +66,30 @@ class SheetsClient:
     ) -> None:
         self._settings = settings
         self._credentials_provider = credentials_provider
-        self._service: Resource | None = None
+        # Same reasoning as DriveClient: one SheetsClient is shared across
+        # every upload worker thread, and googleapiclient's Resource is not
+        # thread-safe. Thread-local storage, exposed via the `_service`
+        # property so existing tests assigning `client._service = ...`
+        # keep working unchanged.
+        self._local = threading.local()
         self._row_cache: dict[str, int] = {}
         self._cache_primed = False
+        self._cache_lock = threading.Lock()
+
+    @property
+    def _service(self) -> Resource | None:
+        return getattr(self._local, "resource", None)
+
+    @_service.setter
+    def _service(self, value: Resource | None) -> None:
+        self._local.resource = value
 
     def _sheets(self) -> Resource:
-        if self._service is None:
-            self._service = build(
-                "sheets", "v4", credentials=self._credentials_provider(), cache_discovery=False
-            )
-        return self._service
+        service = self._service
+        if service is None:
+            service = build("sheets", "v4", credentials=self._credentials_provider(), cache_discovery=False)
+            self._service = service
+        return service
 
     def invalidate_cache(self) -> None:
         """Force the next lookup to re-read the sheet instead of trusting
@@ -148,26 +163,36 @@ class SheetsClient:
         if self._cache_primed:
             return  # already primed this session
 
-        cols = self._settings.columns
-        col = cols.filename
-        range_ = f"{self._settings.worksheet_name}!{col}{self._settings.header_row + 1}:{col}"
-        try:
-            result = (
-                self._sheets()
-                .spreadsheets()
-                .values()
-                .get(spreadsheetId=self._settings.spreadsheet_id, range=range_)
-                .execute()
-            )
-        except HttpError as exc:
-            raise SheetsApiError(f"Failed to read sheet column {col}: {exc}") from exc
+        # Multiple upload workers can hit an unprimed cache at once (e.g.
+        # several videos finishing their first Sheets write in quick
+        # succession right after startup) — without a lock, each would
+        # independently see `_cache_primed=False` and issue a redundant
+        # `values.get` before the first one finishes. Re-check inside the
+        # lock so only one thread actually primes it.
+        with self._cache_lock:
+            if self._cache_primed:
+                return
 
-        values = result.get("values", [])
-        for offset, row in enumerate(values):
-            if row and row[0]:
-                self._row_cache[row[0]] = self._settings.header_row + 1 + offset
-        self._cache_primed = True
-        logger.info("sheets.row_cache.primed", known_rows=len(self._row_cache))
+            cols = self._settings.columns
+            col = cols.filename
+            range_ = f"{self._settings.worksheet_name}!{col}{self._settings.header_row + 1}:{col}"
+            try:
+                result = (
+                    self._sheets()
+                    .spreadsheets()
+                    .values()
+                    .get(spreadsheetId=self._settings.spreadsheet_id, range=range_)
+                    .execute()
+                )
+            except HttpError as exc:
+                raise SheetsApiError(f"Failed to read sheet column {col}: {exc}") from exc
+
+            values = result.get("values", [])
+            for offset, row in enumerate(values):
+                if row and row[0]:
+                    self._row_cache[row[0]] = self._settings.header_row + 1 + offset
+            self._cache_primed = True
+            logger.info("sheets.row_cache.primed", known_rows=len(self._row_cache))
 
     def _write_row(self, sheet: str, row_number: int, values_by_column: dict[str, str]) -> None:
         data = [

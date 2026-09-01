@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -77,3 +78,38 @@ def test_move_to_folder_dedupes_name_collision(tmp_path: Path) -> None:
     assert moved.name == "clip (1).mp4"
     assert moved.read_bytes() == b"new content"
     assert existing.read_bytes() == b"already here"
+
+
+def test_move_to_folder_never_loses_a_file_under_concurrent_same_name_collisions(tmp_path: Path) -> None:
+    """WhatsApp's own auto-naming convention repeats often (different
+    chats/senders, same day), so several upload workers can legitimately
+    try to move different videos with the *same* name into the same
+    destination folder at the *same* time. A check-then-move approach has
+    a TOCTOU gap here: two threads can both see a candidate name is free
+    and both move into it, silently losing whichever moved second. Every
+    one of N concurrently-moved same-named files must survive, each under
+    its own distinct final name, with its own distinct content intact."""
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+
+    n = 12
+    sources = []
+    for i in range(n):
+        f = source_dir / f"src_{i}.mp4"  # distinct source names...
+        f.write_bytes(f"content-{i}".encode())
+        sources.append(f)
+
+    def _move(source: Path) -> Path:
+        # ...but every worker moves it under the SAME destination name,
+        # exactly like several different videos named identically by
+        # WhatsApp all landing in Needs Review/Processed together.
+        return move_to_folder(source, dest_dir, forced_name="clip.mp4")
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        results = list(pool.map(_move, sources))
+
+    assert len(set(results)) == n, f"two workers collided on the same destination path: {results}"
+    contents = {p.read_bytes() for p in results}
+    assert contents == {f"content-{i}".encode() for i in range(n)}, "a file's content was lost/overwritten"

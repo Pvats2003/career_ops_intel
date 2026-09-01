@@ -113,18 +113,26 @@ class SheetsSettings(BaseModel):
 class OcrSettings(BaseModel):
     engine: OcrEngineName = OcrEngineName.TESSERACT
     tesseract_cmd: str = ""
-    min_confidence: float = 0.55
-    max_seconds_scanned: float = 6.0
-    frame_interval_seconds: float = 0.5
+    # 0.0-1.0: below this, a match is routed to Needs Review instead of
+    # trusted as a real Device ID read.
+    min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    # Must be positive: 0 would give every scan window zero frames to
+    # examine, and OcrEngineFactory/DeviceIdExtractor never guard against
+    # that upstream.
+    max_seconds_scanned: float = Field(default=6.0, gt=0.0)
+    frame_interval_seconds: float = Field(default=0.5, gt=0.0)
     device_id_pattern: str = DEVICE_ID_REGEX_DEFAULT
     full_scan_on_low_confidence: bool = True
 
 
 class UploadSettings(BaseModel):
-    max_concurrent: int = 12
-    retry_count: int = 5
-    retry_backoff_seconds: float = 2.0
-    chunk_size_mb: int = 8
+    # Must be at least 1: UploadWorkerPool spawns exactly this many worker
+    # tasks (`range(max_concurrent)`) — 0 would silently start zero
+    # workers, so every discovered video queues forever with no error.
+    max_concurrent: int = Field(default=12, ge=1)
+    retry_count: int = Field(default=5, ge=0)
+    retry_backoff_seconds: float = Field(default=2.0, gt=0.0)
+    chunk_size_mb: int = Field(default=8, ge=1)
     duplicate_check: bool = True
 
 
@@ -133,7 +141,7 @@ class AppUiSettings(BaseModel):
     auto_start_with_windows: bool = False
     notifications_enabled: bool = True
     minimize_to_tray: bool = True
-    poll_interval_seconds: float = 2.0
+    poll_interval_seconds: float = Field(default=2.0, gt=0.0)
     log_level: str = "INFO"
     # How long a COMPLETED/DUPLICATE job stays in the `jobs` working table
     # before being pruned on startup. The durable audit trail (`upload_logs`,
@@ -141,13 +149,17 @@ class AppUiSettings(BaseModel):
     # live working table, which has no reason to keep growing forever across
     # months of 150-500 videos/day. FAILED and NEEDS_REVIEW rows are never
     # auto-pruned; they stay until a human resolves them.
-    jobs_retention_days: int = 30
+    # Must be at least 1: JobsRepository.prune_terminal_jobs_older_than
+    # computes its cutoff as `now - timedelta(days=jobs_retention_days)` —
+    # zero or negative would push the cutoff to today or the future,
+    # pruning rows that just completed instead of ones 30 days old.
+    jobs_retention_days: int = Field(default=30, ge=1)
     # A full backup (settings + database + logs) is checked on every app
     # start and taken automatically if the last one is older than this —
     # 0 disables automatic backups (manual "Backup Now" in Settings still
     # works). See services/backup/backup_service.py.
-    auto_backup_interval_days: int = 7
-    auto_backup_keep_count: int = 5
+    auto_backup_interval_days: int = Field(default=7, ge=0)
+    auto_backup_keep_count: int = Field(default=5, ge=1)
 
 
 class _YamlSettingsSource(PydanticBaseSettingsSource):

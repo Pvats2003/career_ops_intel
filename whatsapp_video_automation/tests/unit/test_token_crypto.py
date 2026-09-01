@@ -59,6 +59,13 @@ def test_key_file_permissions_are_restricted(tmp_path: Path) -> None:
 
 
 def test_decrypting_garbage_raises(tmp_path: Path) -> None:
+    """Must raise specifically because the ciphertext is invalid — not
+    just "raises something," which would pass just as well for an
+    unrelated bug (e.g. an AttributeError from broken error handling) as
+    for the real, intended failure mode."""
+    from cryptography.fernet import InvalidToken
+
     protector = CredentialProtector(tmp_path / "token.key")
-    with pytest.raises(Exception):  # noqa: B017 - backend-specific (Fernet InvalidToken)
+    assert protector.backend == "fernet", "this test assumes the Fernet fallback (no DPAPI on this platform)"
+    with pytest.raises(InvalidToken):
         protector.decrypt(b"not a real ciphertext")

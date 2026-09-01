@@ -50,7 +50,14 @@ class FolderWatcher:
         self._callback = on_video_discovered
         self._observer: Observer | None = None
         self._status = WatcherStatus.STOPPED
+        # `_seen`: paths the discovery callback has *successfully* handled —
+        # permanently skipped from then on. `_pending`: paths currently
+        # queued or mid-callback, tracked separately so a callback failure
+        # (a transient DB error, say) never gets baked into `_seen` — the
+        # path stays eligible for the next reconciliation sweep to retry,
+        # instead of being silently and permanently skipped.
         self._seen: set[str] = set()
+        self._pending: set[str] = set()
         self._seen_lock = threading.Lock()
         self._candidate_queue: queue.Queue[Path] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
@@ -112,9 +119,9 @@ class FolderWatcher:
             return
         key = str(path)
         with self._seen_lock:
-            if key in self._seen:
+            if key in self._seen or key in self._pending:
                 return
-            self._seen.add(key)
+            self._pending.add(key)
         self._candidate_queue.put(path)
 
     def _process_queue(self) -> None:
@@ -122,10 +129,23 @@ class FolderWatcher:
             path = self._candidate_queue.get()
             if path is None:
                 break
+            key = str(path)
             try:
                 self._callback(path)
             except Exception:  # noqa: BLE001 - never let one bad file kill the watcher
                 logger.exception("watcher.callback_failed", path=str(path))
+                # Deliberately NOT added to `_seen` — a callback failure is
+                # expected to be transient (e.g. the DB momentarily busy
+                # under concurrent writers), and the file is still sitting
+                # in the watch folder. Leaving it out of both `_seen` and
+                # `_pending` lets the next reconciliation sweep re-enqueue
+                # and retry it, instead of losing it silently forever.
+                with self._seen_lock:
+                    self._pending.discard(key)
+            else:
+                with self._seen_lock:
+                    self._pending.discard(key)
+                    self._seen.add(key)
 
     def _reconcile_loop(self) -> None:
         while not self._stop_event.wait(self._reconcile_interval_seconds):
@@ -151,6 +171,13 @@ class FolderWatcher:
         folded into a pass we're already paying for.
         """
         with self._seen_lock:
-            stale = {p for p in self._seen if not Path(p).exists()}
-            if stale:
-                self._seen -= stale
+            stale_seen = {p for p in self._seen if not Path(p).exists()}
+            if stale_seen:
+                self._seen -= stale_seen
+            # `_pending` should normally clear itself as each callback
+            # finishes, but drop any stray entry whose file is gone too —
+            # defensive cleanup so a future edge case can't wedge a path out
+            # of consideration forever.
+            stale_pending = {p for p in self._pending if not Path(p).exists()}
+            if stale_pending:
+                self._pending -= stale_pending

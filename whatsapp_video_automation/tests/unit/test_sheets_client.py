@@ -256,15 +256,17 @@ def test_concurrent_new_rows_from_independent_clients_never_collide() -> None:
     settings = SheetsSettings(spreadsheet_id="shared-sheet", worksheet_name="Uploads", header_row=1)
     backend = _FakeSharedSpreadsheet(header_row=1)
 
-    clients = []
-    for _ in range(20):
-        c = SheetsClient(settings, credentials_provider=lambda: None)
-        c._service = MagicMock()
-        _wire_fake_shared_backend(c, backend)
-        clients.append(c)
+    clients = [SheetsClient(settings, credentials_provider=lambda: None) for _ in range(20)]
 
     def _upsert(index: int) -> int:
-        result = clients[index].upsert_row(
+        # `_service` is thread-local (each real worker thread gets its own
+        # googleapiclient Resource — see SheetsClient._sheets), so the mock
+        # must be wired up from the same thread that then uses it, not from
+        # the main thread that constructed the client.
+        client = clients[index]
+        client._service = MagicMock()
+        _wire_fake_shared_backend(client, backend)
+        result = client.upsert_row(
             date_label="1 Sep",
             device_id="IC-1",
             filename=f"video_{index}.mp4",
@@ -281,3 +283,37 @@ def test_concurrent_new_rows_from_independent_clients_never_collide() -> None:
     assert len(backend.rows) == 20, "a row was silently overwritten by a concurrent writer"
     recovered_filenames = {row[2] for row in backend.rows.values()}  # column C
     assert recovered_filenames == {f"video_{i}.mp4" for i in range(20)}
+
+
+def test_sheets_resource_is_thread_local_not_shared(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`googleapiclient`'s Resource is backed by an httplib2.Http instance,
+    which is not thread-safe. One SheetsClient is shared across every
+    upload worker thread, so `_sheets()` must hand each thread its own
+    Resource instead of racing many threads over one shared object —
+    regression test for that fix."""
+    built_count = 0
+
+    def _fake_build(*_args, **_kwargs):
+        nonlocal built_count
+        built_count += 1
+        return MagicMock()
+
+    monkeypatch.setattr("instacore_sync.services.sheets.sheets_client.build", _fake_build)
+
+    settings = SheetsSettings(spreadsheet_id="sheet-123", worksheet_name="Uploads", header_row=1)
+    c = SheetsClient(settings, credentials_provider=lambda: None)
+
+    seen_ids: set[int] = set()
+
+    def _use_from_thread() -> None:
+        seen_ids.add(id(c._sheets()))
+        seen_ids.add(id(c._sheets()))  # same thread, must reuse
+
+    threads = [threading.Thread(target=_use_from_thread) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert built_count == 8, "expected exactly one Resource built per thread, not shared/rebuilt"
+    assert len(seen_ids) == 8, "each thread must see its own distinct Resource object"

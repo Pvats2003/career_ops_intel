@@ -9,6 +9,7 @@ Supports both a normal "My Drive" folder tree and a Shared Drive (set
 from __future__ import annotations
 
 import re
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -45,14 +46,32 @@ class DriveClient:
         self._settings = settings
         self._folder_cache = folder_cache
         self._credentials_provider = credentials_provider
-        self._service: Resource | None = None
+        # One DriveClient is shared across every upload worker thread (up to
+        # `uploads.max_concurrent`, default 12). `googleapiclient`'s Resource
+        # is backed by an httplib2.Http instance, which is NOT thread-safe —
+        # sharing one across concurrent threads risks corrupted requests
+        # under real concurrent upload load. A `threading.local` gives each
+        # worker thread its own Resource (built once, reused across that
+        # thread's jobs), matching Google's own client-library guidance.
+        # Exposed as the `_service` property (rather than a plain attribute)
+        # so existing tests that assign `client._service = MagicMock()` keep
+        # working unchanged.
+        self._local = threading.local()
+
+    @property
+    def _service(self) -> Resource | None:
+        return getattr(self._local, "resource", None)
+
+    @_service.setter
+    def _service(self, value: Resource | None) -> None:
+        self._local.resource = value
 
     def _drive(self) -> Resource:
-        if self._service is None:
-            self._service = build(
-                "drive", "v3", credentials=self._credentials_provider(), cache_discovery=False
-            )
-        return self._service
+        service = self._service
+        if service is None:
+            service = build("drive", "v3", credentials=self._credentials_provider(), cache_discovery=False)
+            self._service = service
+        return service
 
     # -- Health check -----------------------------------------------------------
 

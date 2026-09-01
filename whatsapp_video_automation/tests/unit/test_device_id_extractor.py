@@ -168,6 +168,70 @@ def test_extract_returns_no_match_when_nothing_found() -> None:
     assert result.device_id is None
 
 
+def test_extract_matches_device_id_with_hyphen_erased_by_preprocessing() -> None:
+    """The banner's thin '-' glyph can be erased by denoising/thresholding
+    on a small cropped region, so real OCR output can legibly read
+    "IC188" with no separator at all. The strict device_id_pattern
+    (requiring a literal hyphen) would never match that text — extraction
+    must tolerate the missing hyphen and `_normalize` restores the
+    canonical "IC-188" form."""
+    settings = OcrSettings(min_confidence=0.5)
+    engine = _FakeEngine(
+        OcrEngineName.TESSERACT,
+        overrides={0: OcrReadResult(text="Device: IC188 ready", confidence=0.95)},
+    )
+    extractor = DeviceIdExtractor(settings, _FakeFrameExtractor(frame_count=1), _FakeEngineFactory([engine]))
+
+    result = extractor.extract(video_path=__file__)
+
+    assert result.succeeded
+    assert result.device_id == "IC-188"
+
+
+def test_full_scan_cap_counts_blank_frames_too() -> None:
+    """`OCR_FULL_SCAN_MAX_FRAMES` must bound total frames pulled from the
+    video, including ones skipped as blank — not just the ones actually
+    OCR'd. Without this, a video with a long blank/loading-screen lead-in
+    could churn through far more than the intended cap before the cap
+    ever triggered, since blank frames previously didn't count toward it
+    at all."""
+
+    class _MostlyBlankFrameExtractor:
+        """200 frames: the first 150 are blank, the rest are real content
+        with no match — if the cap only counted non-blank frames, all 50
+        non-blank frames (well under any reasonable max_frames) would get
+        examined despite 200 total frames being pulled."""
+
+        def __init__(self) -> None:
+            self.frames_yielded = 0
+
+        def iter_frames(self, video_path, *, interval_seconds, max_seconds, full_video=False):
+            for i in range(200):
+                self.frames_yielded += 1
+                if i < 150:
+                    yield Frame(timestamp_seconds=i * 0.5, image_bgr=np.zeros((40, 40, 3), dtype=np.uint8))
+                else:
+                    yield Frame(timestamp_seconds=i * 0.5, image_bgr=_non_blank_frame(seed=i))
+
+    settings = OcrSettings(min_confidence=0.9)
+    engine = _FakeEngine(OcrEngineName.TESSERACT, default=_NO_MATCH)
+    fake_frames = _MostlyBlankFrameExtractor()
+    extractor = DeviceIdExtractor(settings, fake_frames, _FakeEngineFactory([engine]))
+
+    # Exercise the full-scan path directly (as `extract()` does on a
+    # failed initial scan), isolating exactly the cap behavior under test.
+    from instacore_sync.core.constants import OCR_FULL_SCAN_MAX_FRAMES
+
+    extractor._scan(video_path=__file__, full_video=True, max_frames=OCR_FULL_SCAN_MAX_FRAMES)
+
+    # Must have stopped pulling frames at (essentially) the cap, not
+    # continued through all 200 just because most of them were blank. +1
+    # because a `for` loop always pulls the next item before the cap
+    # check in the loop body runs, so exactly one frame beyond the cap is
+    # unavoidably decoded before the break fires.
+    assert fake_frames.frames_yielded <= OCR_FULL_SCAN_MAX_FRAMES + 1
+
+
 def test_extract_skips_blank_frames_without_calling_engine() -> None:
     """A near-uniform (blank/loading-screen) frame should never reach the
     OCR engine at all — this is the "dynamic frame selection" optimization."""

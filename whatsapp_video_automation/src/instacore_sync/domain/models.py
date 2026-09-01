@@ -64,6 +64,18 @@ class VideoJob(BaseModel):
 
     attempt_count: int = 0
     last_error: str | None = None
+    # Set by VideoProcessor when a Drive/Sheets failure is classified as
+    # permanent (403 permission-denied, 404 not-found, 400 bad-request —
+    # see utils.google_api_errors.is_transient_google_api_error) rather
+    # than a transient condition that exhausted its API-level retries.
+    # UploadWorkerPool checks this to skip the remaining job-level retry
+    # attempts instead of repeating OCR/hashing/upload work `retry_count`
+    # times for a failure that can never succeed. Deliberately not
+    # persisted to the `jobs` table (in-memory only for this one retry
+    # decision) — a restart naturally re-attempts once via the normal
+    # startup requeue, which is the same behavior an unclassified failure
+    # already had.
+    permanent_failure: bool = False
 
     bytes_uploaded: int = 0
     upload_speed_bps: float = 0.0

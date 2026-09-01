@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
+from pydantic import ValidationError
 
-from instacore_sync.core.config import AppSettings
+from instacore_sync.core.config import AppSettings, AppUiSettings, OcrSettings, UploadSettings
 
 
 def test_settings_round_trip_through_yaml(tmp_path: Path, monkeypatch) -> None:
@@ -163,3 +165,39 @@ def test_example_settings_path_uses_meipass_when_frozen(tmp_path: Path, monkeypa
     monkeypatch.setattr(sys, "executable", str(tmp_path / "App.exe"))
 
     assert config_module._example_settings_path() == meipass_dir / "config" / "settings.example.yaml"
+
+
+def test_max_concurrent_zero_is_rejected() -> None:
+    """`max_concurrent=0` used to pass validation silently and make
+    UploadWorkerPool spawn zero workers — every discovered video would
+    queue forever with no error anywhere. Must be rejected up front."""
+    with pytest.raises(ValidationError):
+        UploadSettings(max_concurrent=0)
+
+
+def test_jobs_retention_days_zero_or_negative_is_rejected() -> None:
+    """A zero/negative retention window used to push the prune cutoff to
+    today or the future, pruning jobs that had just completed instead of
+    ones 30 days old — must be rejected up front."""
+    with pytest.raises(ValidationError):
+        AppUiSettings(jobs_retention_days=0)
+    with pytest.raises(ValidationError):
+        AppUiSettings(jobs_retention_days=-5)
+
+
+def test_ocr_min_confidence_out_of_range_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        OcrSettings(min_confidence=1.5)
+    with pytest.raises(ValidationError):
+        OcrSettings(min_confidence=-0.1)
+
+
+def test_ocr_and_upload_non_positive_durations_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        OcrSettings(max_seconds_scanned=0)
+    with pytest.raises(ValidationError):
+        OcrSettings(frame_interval_seconds=0)
+    with pytest.raises(ValidationError):
+        UploadSettings(retry_backoff_seconds=0)
+    with pytest.raises(ValidationError):
+        AppUiSettings(poll_interval_seconds=0)

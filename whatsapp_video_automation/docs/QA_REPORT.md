@@ -5,10 +5,24 @@ open. Written from a Linux sandbox with no access to a Windows machine —
 that constraint shapes what's below, and it's called out explicitly
 wherever it matters rather than glossed over.
 
+## Post-release hardening pass (concurrency/OCR/security review)
+
+After the initial v1.0.0 QA below, a second, adversarial review pass
+specifically targeted concurrency, security, and robustness defects the
+first pass's functional testing wouldn't surface. Five parallel reviews
+covered every subsystem (core/DB/config, OCR/video/watcher, Drive/Sheets/
+upload/pipeline, Qt UI/workers, tests/packaging); every finding was
+independently verified against the real code before being fixed — several
+initial fix attempts themselves had bugs that were only caught by writing
+a real regression test for them (see `RELEASE_NOTES.md`/`CHANGELOG.md`
+for the full list). Test count grew 227 → 254; full details, file list,
+and honest scoring are in the Engineering Review Report delivered
+alongside this release.
+
 ## Automated test suite
 
 ```
-227 passed in ~6.5s   (pytest, tests/unit/ + tests/integration/)
+254 passed in ~6.5s   (pytest, tests/unit/ + tests/integration/)
 ruff check .          All checks passed
 ```
 
@@ -164,10 +178,40 @@ limitations in this release" for the user-facing summary. In full:
 6. **Unsigned installer.** No paid code-signing certificate is applied,
    so Windows SmartScreen will show a warning on first run
    (`docs/TROUBLESHOOTING.md` documents the click-through).
+7. **A rare Drive folder-reconciliation race can trash a folder still
+   receiving an upload.** Under the specific timing of three-plus
+   concurrent installs racing to create the same date/device folder,
+   the cleanup step that trashes a losing duplicate folder can — in a
+   narrow window — trash one a *different* process just started
+   uploading into, because the "is it empty" children check and the
+   trash call are two separate API round-trips. Identified during the
+   post-release hardening pass; not fixed here because a rushed
+   concurrency change to this exact code path (which the earlier audit
+   already hardened once) is higher-risk than the defect itself, which
+   requires an unlikely three-way timing coincidence to trigger. Needs a
+   proper fix (e.g. a lock service or an atomic check-and-trash) before
+   very-high-concurrency shared-destination deployments (see
+   `docs/DEPLOYMENT_AT_SCALE.md`).
+8. **`UploadWorkerPool.stop()` doesn't wait for in-flight uploads to
+   actually finish.** It cancels queued/waiting work immediately, but a
+   video already uploading inside a worker thread keeps running to
+   completion in the background even after `stop()` returns — if the
+   pipeline is restarted shortly after (app restart), the orphaned
+   thread and the fresh restart's requeue could both act on the same
+   job. Low real-world impact (a normal app quit doesn't restart the
+   pipeline moments later) but a real gap under rapid restart-for-testing
+   or a crash-loop scenario.
+9. **Searching Logs by device ID or filename does a full table scan.**
+   `upload_logs` is never pruned by design (it's the durable audit
+   trail) and its search uses `LIKE '%...%'`, which can't use the
+   existing indexes. Fine at today's volume; worth an FTS5 index or
+   similar if a single install accumulates years of daily 150-500-video
+   history and search starts to feel slow.
 
 None of these block a v1.0.0 release for internal/team use where #1 is
 completed first; #3 only matters past ~100 concurrent users on a shared
-destination.
+destination; #7-9 only matter at meaningfully higher scale/concurrency
+than a typical team deployment.
 
 ## Future improvements (not required for v1.0.0)
 

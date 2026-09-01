@@ -57,6 +57,15 @@ _PREPROCESS_VARIANTS: list[tuple[str, Callable[[np.ndarray], np.ndarray]]] = [
 ]
 
 
+def _lenient_extraction_pattern(pattern: str) -> str:
+    """Best-effort: make the literal "IC-" in the well-known default
+    pattern shape tolerate a missing hyphen when searching raw OCR text
+    (see `DeviceIdExtractor.__init__` for why). A custom pattern that
+    doesn't contain "IC-" is returned unchanged — degrading gracefully to
+    today's behavior rather than guessing where else to loosen it."""
+    return pattern.replace("IC-", "IC-?", 1) if "IC-" in pattern else pattern
+
+
 class DeviceIdExtractor:
     def __init__(
         self,
@@ -67,7 +76,19 @@ class DeviceIdExtractor:
         self._settings = settings
         self._frames = frame_extractor or FrameExtractor()
         self._engines = engine_factory or OcrEngineFactory(settings)
-        self._pattern = re.compile(settings.device_id_pattern, re.IGNORECASE)
+        # Searches raw OCR text with a LENIENT version of the configured
+        # pattern (hyphen optional): the banner's thin "-" glyph can be
+        # erased by denoising/thresholding on a small cropped region,
+        # producing legible text like "IC188" with no separator at all —
+        # the strict pattern would never match that and would send an
+        # otherwise-readable video to Needs Review for nothing.
+        # `_normalize()` restores the canonical "IC-188" form afterward.
+        # This is purely an extraction-time concern: `is_valid_device_id`
+        # (Needs Review manual entry, Drive folder naming) still validates
+        # against the original strict `settings.device_id_pattern`
+        # unchanged, so what counts as a valid *stored* Device ID never
+        # loosens — only what OCR is willing to consider a candidate match.
+        self._pattern = re.compile(_lenient_extraction_pattern(settings.device_id_pattern), re.IGNORECASE)
 
     def extract(self, video_path: Path) -> DeviceIdExtraction:
         result = self._scan(video_path, full_video=False)
@@ -86,6 +107,7 @@ class DeviceIdExtractor:
         self, video_path: Path, *, full_video: bool, max_frames: int | None = None
     ) -> DeviceIdExtraction:
         best: DeviceIdExtraction | None = None
+        frames_considered = 0
         frames_examined = 0
         frames_skipped_blank = 0
 
@@ -95,13 +117,22 @@ class DeviceIdExtractor:
             max_seconds=self._settings.max_seconds_scanned,
             full_video=full_video,
         ):
-            if max_frames is not None and frames_examined >= max_frames:
+            # Counts every frame pulled from the video toward the cap —
+            # including ones about to be skipped as blank — not just the
+            # ones actually OCR'd. A long blank/loading-screen stretch
+            # previously let `frames_examined` (which only counted
+            # non-blank frames) never reach `max_frames`, so the intended
+            # "last resort" scan's cost bound didn't actually bound
+            # anything: a long video with a long blank lead-in could churn
+            # through far more than `max_frames` iterations.
+            if max_frames is not None and frames_considered >= max_frames:
                 logger.warning(
                     "ocr.device_id.full_scan_cap_reached",
                     video=str(video_path),
                     max_frames=max_frames,
                 )
                 break
+            frames_considered += 1
 
             if is_frame_likely_blank(frame.image_bgr):
                 frames_skipped_blank += 1

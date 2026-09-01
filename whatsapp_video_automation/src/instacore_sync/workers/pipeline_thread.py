@@ -17,6 +17,8 @@ import threading
 from PySide6.QtCore import QThread
 
 from instacore_sync.core.logging_setup import get_logger
+from instacore_sync.domain.enums import HealthStatus
+from instacore_sync.domain.models import HealthCheckResult
 from instacore_sync.services.pipeline.pipeline_orchestrator import PipelineOrchestrator
 from instacore_sync.workers.signals import PipelineSignalBus
 
@@ -115,8 +117,17 @@ class PipelineThread(QThread):
         """Thread-safe: Settings' "Sign in with Google" button — the only
         path allowed to open an interactive browser consent screen."""
         loop = self._loop
-        if loop is not None and loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._orchestrator.sign_in_interactively(), loop)
+        if loop is None or not loop.is_running():
+            return
+
+        async def _run() -> None:
+            try:
+                await self._orchestrator.sign_in_interactively()
+            except Exception:  # noqa: BLE001 - see _run_wizard_check for why this must never propagate silently
+                logger.exception("pipeline_thread.sign_in_failed")
+                self._signals.on_log_message("ERROR", "Google sign-in failed unexpectedly. Check logs.")
+
+        asyncio.run_coroutine_threadsafe(_run(), loop)
 
     def request_health_check(self) -> None:
         """Thread-safe: run the Health Check page's checks and publish
@@ -129,7 +140,17 @@ class PipelineThread(QThread):
             return
 
         async def _run() -> None:
-            results = await self._orchestrator.run_health_check()
+            try:
+                results = await self._orchestrator.run_health_check()
+            except Exception as exc:  # noqa: BLE001 - see _run_wizard_check for why this must never propagate silently
+                logger.exception("pipeline_thread.health_check_failed")
+                results = [
+                    HealthCheckResult(
+                        name="Health Check",
+                        status=HealthStatus.FAILED,
+                        message=f"Unexpected error running health checks: {exc}",
+                    )
+                ]
             self._signals.health_check_completed.emit(results)
 
         asyncio.run_coroutine_threadsafe(_run(), loop)
@@ -160,7 +181,24 @@ class PipelineThread(QThread):
             return
 
         async def _run() -> None:
-            result = await coro
+            try:
+                result = await coro
+            except Exception as exc:  # noqa: BLE001
+                # `asyncio.run_coroutine_threadsafe`'s returned Future is
+                # deliberately never awaited (fire-and-forget) — nothing
+                # else would ever retrieve or log an exception raised in
+                # here, and the wizard page's button/spinner would be
+                # stuck on "Checking..." forever with no way to know it
+                # failed short of restarting the app. None of the
+                # orchestrator's wizard-check methods catch every possible
+                # exception internally (only the Google API/auth ones they
+                # know about), so this is the one place that must.
+                logger.exception("pipeline_thread.wizard_check_failed", check=check_name)
+                result = HealthCheckResult(
+                    name=check_name,
+                    status=HealthStatus.FAILED,
+                    message=f"Unexpected error: {exc}",
+                )
             self._signals.wizard_check_result.emit(check_name, result)
 
         asyncio.run_coroutine_threadsafe(_run(), loop)

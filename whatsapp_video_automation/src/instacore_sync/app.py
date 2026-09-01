@@ -155,7 +155,13 @@ class InstacoreSyncApp:
             theme_manager=c.resolve(ThemeManager),
         )
 
-        stats_timer = QTimer()
+        # Parented to main_window (not a bare local) so the timer's
+        # lifetime is tied to a real Qt object instead of surviving only
+        # because `run()` happens to stay on this stack frame until
+        # `qt_app.exec()` returns — a future refactor that returns early
+        # (e.g. a non-blocking startup path) would otherwise let this get
+        # garbage-collected and silently kill stats polling with no error.
+        stats_timer = QTimer(main_window)
         stats_timer.timeout.connect(pipeline_thread.request_stats_refresh)
         stats_timer.start(_STATS_POLL_INTERVAL_MS)
 

@@ -9,8 +9,22 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 
+from instacore_sync.domain.enums import JobStatus
 from instacore_sync.domain.models import DailyStats, VideoJob
 from instacore_sync.workers.signals import PipelineSignalBus
+
+# Mirrors DashboardView._on_job_updated's own terminal-status set: once a
+# job reaches one of these, it's done needing display here and must be
+# dropped, or `_jobs_by_id` grows without bound for the life of the
+# process — this app processes 150-500 videos/day continuously, and
+# "minimize to tray" instead of quitting actively encourages long-running
+# sessions where that growth would actually matter.
+_TERMINAL_STATUSES = {
+    JobStatus.COMPLETED,
+    JobStatus.FAILED,
+    JobStatus.NEEDS_REVIEW,
+    JobStatus.DUPLICATE,
+}
 
 
 def format_bytes_per_second(bps: float) -> str:
@@ -55,8 +69,6 @@ class DashboardViewModel(QObject):
         return self._latest_stats
 
     def active_jobs(self) -> list[VideoJob]:
-        from instacore_sync.domain.enums import JobStatus
-
         active_statuses = {
             JobStatus.DISCOVERED,
             JobStatus.QUEUED,
@@ -75,5 +87,11 @@ class DashboardViewModel(QObject):
         self.stats_updated.emit(stats)
 
     def _on_job_updated(self, job: VideoJob) -> None:
-        self._jobs_by_id[job.job_id] = job
+        if job.status in _TERMINAL_STATUSES:
+            # Drop rather than cache: a terminal job never needs to be
+            # looked up here again, and keeping it would leak memory for
+            # the lifetime of the process (see `_TERMINAL_STATUSES`).
+            self._jobs_by_id.pop(job.job_id, None)
+        else:
+            self._jobs_by_id[job.job_id] = job
         self.job_changed.emit(job)

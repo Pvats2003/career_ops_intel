@@ -18,7 +18,7 @@ import json
 import threading
 from pathlib import Path
 
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -109,6 +109,23 @@ class GoogleAuthService:
             except RefreshError as exc:
                 logger.warning("drive_auth.refresh_failed", error=str(exc))
                 self._status = GoogleAuthStatus.EXPIRED
+            except TransportError as exc:
+                # A network hiccup during refresh (Wi-Fi reconnecting, a
+                # VPN flapping — an entirely realistic condition right at
+                # app startup) is not the same as an actually-invalid
+                # refresh token. `TransportError` is a SIBLING of
+                # `RefreshError` in google.auth.exceptions (both subclass
+                # GoogleAuthError; neither subclasses the other), so it was
+                # previously left uncaught here and would crash startup
+                # outright instead of falling back to a clear "couldn't
+                # reach Google" error like every other auth failure path
+                # in this app.
+                logger.warning("drive_auth.refresh_transport_error", error=str(exc))
+                self._status = GoogleAuthStatus.ERROR
+                raise DriveAuthError(
+                    f"Couldn't reach Google to refresh your sign-in — check your internet "
+                    f"connection and try again: {exc}"
+                ) from exc
 
         if not interactive:
             self._status = (

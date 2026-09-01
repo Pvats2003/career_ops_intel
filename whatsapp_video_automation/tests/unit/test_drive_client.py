@@ -383,18 +383,56 @@ def test_concurrent_folder_creation_from_independent_clients_converges_to_one_fo
     parent_id = "date-folder-id"
     folder_name = "IC-188"
 
-    clients = []
-    for _ in range(15):
-        c = DriveClient(settings, _FakeFolderCache(), credentials_provider=lambda: None)
-        c._service = MagicMock()
-        _wire_fake_shared_drive(c, backend, parent_id, folder_name)
-        clients.append(c)
+    clients = [DriveClient(settings, _FakeFolderCache(), credentials_provider=lambda: None) for _ in range(15)]
 
     def _get_or_create(index: int) -> str:
-        return clients[index]._find_or_create_folder(folder_name, parent_id)
+        # `_service` is thread-local (each real worker thread gets its own
+        # googleapiclient Resource — see DriveClient._drive), so the mock
+        # must be wired up from the same thread that then uses it, not from
+        # the main thread that constructed the client.
+        client = clients[index]
+        client._service = MagicMock()
+        _wire_fake_shared_drive(client, backend, parent_id, folder_name)
+        return client._find_or_create_folder(folder_name, parent_id)
 
     with ThreadPoolExecutor(max_workers=15) as pool:
         resolved_ids = list(pool.map(_get_or_create, range(15)))
 
     assert len(set(resolved_ids)) == 1, f"clients disagreed on the canonical folder: {set(resolved_ids)}"
     assert backend.live_folders_named(folder_name, parent_id) == list(set(resolved_ids))
+
+
+def test_drive_resource_is_thread_local_not_shared(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`googleapiclient`'s Resource is backed by an httplib2.Http instance,
+    which is not thread-safe. One DriveClient is shared across every upload
+    worker thread, so `_drive()` must hand each thread its own Resource
+    instead of racing many threads over one shared object — regression
+    test for that fix."""
+    built_count = 0
+
+    def _fake_build(*_args, **_kwargs):
+        nonlocal built_count
+        built_count += 1
+        return MagicMock()
+
+    monkeypatch.setattr("instacore_sync.services.drive.drive_client.build", _fake_build)
+
+    settings = DriveSettings(root_folder_id="root-123")
+    client = DriveClient(settings, _FakeFolderCache(), credentials_provider=lambda: None)
+
+    seen_ids: set[int] = set()
+
+    def _use_from_thread() -> None:
+        seen_ids.add(id(client._drive()))
+        # Calling again from the same thread must reuse that thread's
+        # Resource, not build a fresh one every time.
+        seen_ids.add(id(client._drive()))
+
+    threads = [threading.Thread(target=_use_from_thread) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert built_count == 8, "expected exactly one Resource built per thread, not shared/rebuilt"
+    assert len(seen_ids) == 8, "each thread must see its own distinct Resource object"

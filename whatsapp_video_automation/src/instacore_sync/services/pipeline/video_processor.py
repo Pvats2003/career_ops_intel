@@ -38,6 +38,7 @@ from instacore_sync.services.ocr.device_id_extractor import DeviceIdExtractor
 from instacore_sync.services.pipeline.events import NullEventSink, PipelineEventSink
 from instacore_sync.services.sheets.sheets_client import SheetsClient
 from instacore_sync.utils.file_utils import move_to_folder, wait_until_stable
+from instacore_sync.utils.google_api_errors import is_permanent_google_api_error
 from instacore_sync.utils.text_sanitize import is_valid_device_id
 
 logger = get_logger(__name__)
@@ -94,6 +95,20 @@ class VideoProcessor:
         except VideoReadError as exc:
             return self._fail(job, str(exc), route_to_needs_review=True)
         except (DriveApiError, SheetsApiError) as exc:
+            # A permission-denied (403) or not-found (404) folder/sheet
+            # will never succeed no matter how many times it's retried —
+            # `is_permanent_google_api_error` (checking exc.__cause__, the
+            # original HttpError `raise ... from exc` preserved) tells a
+            # confirmed-permanent failure apart from one that's merely
+            # unclassifiable (e.g. a plain timeout that never reached
+            # Google as an HttpError) or transient-but-retry-exhausted —
+            # both of the latter must still get the normal job-level retry
+            # treatment. Without this, the job-level retry in
+            # UploadWorkerPool would repeat OCR/hashing/upload work up to
+            # `retry_count` times for a video whose destination
+            # permissions were revoked, delaying the FAILED status a human
+            # would want to see immediately.
+            job.permanent_failure = is_permanent_google_api_error(exc)
             return self._fail(job, str(exc), route_to_failed=True)
         except InstacoreSyncError as exc:
             return self._fail(job, str(exc), route_to_failed=True)

@@ -171,3 +171,30 @@ def test_non_interactive_silent_refresh_succeeds_without_ever_needing_interactiv
 
     assert result is stale
     assert service.status == GoogleAuthStatus.AUTHENTICATED
+
+
+def test_transport_error_during_refresh_raises_drive_auth_error_not_crash(tmp_path: Path, monkeypatch) -> None:
+    """A network hiccup during token refresh (Wi-Fi reconnecting, VPN
+    flapping — realistic right at app startup) must surface as a
+    DriveAuthError like every other auth failure path, not crash the
+    whole app. `TransportError` is a SIBLING of `RefreshError` in
+    google.auth.exceptions (neither subclasses the other), so a bare
+    `except RefreshError` does not catch it — regression test for that."""
+    from google.auth.exceptions import TransportError
+
+    token_path = tmp_path / "token.json"
+    service = GoogleAuthService(tmp_path / "credentials.json", token_path)
+
+    stale = MagicMock()
+    stale.valid = False
+    stale.expired = True
+    stale.refresh_token = "refresh-token-secret"
+    stale.refresh.side_effect = TransportError("DNS resolution failed")
+    monkeypatch.setattr(service, "_load_encrypted_token", lambda: stale)
+
+    token_path.write_bytes(b"placeholder-ciphertext")
+
+    with pytest.raises(DriveAuthError):
+        service.get_credentials(interactive=False)
+
+    assert service.status == GoogleAuthStatus.ERROR

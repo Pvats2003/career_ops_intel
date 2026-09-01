@@ -116,6 +116,54 @@ async def test_failed_job_stops_after_retry_count_exhausted(database: Database) 
 
 
 @pytest.mark.asyncio
+async def test_permanent_failure_is_not_retried(database: Database) -> None:
+    """A job VideoProcessor classified as a confirmed-permanent failure
+    (e.g. a 403 permission-denied on the Drive folder) must go straight
+    to FAILED without burning `retry_count` more attempts repeating
+    OCR/hashing/upload work that can never succeed."""
+
+    class _PermanentFailureProcessor:
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        def process(self, job: VideoJob, progress_callback=None) -> VideoJob:  # noqa: ANN001
+            self.call_count += 1
+            job.attempt_count += 1
+            job.status = JobStatus.FAILED
+            job.permanent_failure = True
+            return job
+
+    processor = _PermanentFailureProcessor()
+    settings = UploadSettings(max_concurrent=1, retry_count=5, retry_backoff_seconds=0.01)
+    queue = UploadQueue()
+    pool = UploadWorkerPool(settings, queue, processor, JobsRepository(database))
+
+    pool.start()
+    await queue.put(_job())
+    await asyncio.wait_for(queue.join(), timeout=2.0)
+    await asyncio.sleep(0.05)  # make sure no delayed re-queue was scheduled
+    await pool.stop()
+
+    assert processor.call_count == 1  # never retried, despite retry_count=5
+
+
+def test_backoff_is_jittered_and_capped(database: Database) -> None:
+    """Job-level retry backoff must have jitter (so many independent
+    installs failing at the same moment don't retry in lockstep waves
+    against the same shared destination) and a cap (an uncapped
+    exponential would otherwise grow to hours near retry_count)."""
+    settings = UploadSettings(max_concurrent=1, retry_count=20, retry_backoff_seconds=2.0)
+    pool = UploadWorkerPool(settings, UploadQueue(), _ScriptedProcessor([]), JobsRepository(database))
+
+    # A high attempt_count would make the raw exponential (2.0 * 2**19)
+    # enormous — must be capped, and jittered rather than a fixed value.
+    samples = {pool._next_backoff_seconds(20) for _ in range(50)}
+
+    assert len(samples) > 1, "expected jitter to produce varying values, not one fixed backoff"
+    assert all(30.0 <= s <= 60.0 for s in samples), f"backoff not capped correctly: {samples}"
+
+
+@pytest.mark.asyncio
 async def test_needs_review_status_is_not_retried(database: Database) -> None:
     processor = _ScriptedProcessor([JobStatus.NEEDS_REVIEW])
     settings = UploadSettings(max_concurrent=1, retry_count=5, retry_backoff_seconds=0.01)

@@ -60,3 +60,33 @@ def test_open_missing_file_raises_video_read_error(tmp_path: Path) -> None:
     missing = tmp_path / "does_not_exist.mp4"
     with pytest.raises(VideoReadError):
         list(extractor.iter_frames(missing))
+
+
+def test_full_video_scan_does_not_collapse_when_fps_metadata_is_unreliable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a video's fps/frame_count metadata can't be trusted (0 or
+    missing — realistic for remuxed/streamed files or certain Android
+    screen-recorder outputs), the full-video fallback scan must not
+    silently collapse to the same narrow `max_seconds` window the initial
+    scan already failed on — that defeats the entire point of it being a
+    'last resort' pass that looks further into the video."""
+    video_path = tmp_path / "long.mp4"
+    if not _write_synthetic_video(video_path, fps=10.0, seconds=8.0):
+        pytest.skip("OpenCV build in this environment cannot encode mp4v video")
+
+    real_get = cv2.VideoCapture.get
+
+    def _unreliable_get(self, prop_id):  # noqa: ANN001
+        if prop_id in (cv2.CAP_PROP_FPS, cv2.CAP_PROP_FRAME_COUNT):
+            return 0.0
+        return real_get(self, prop_id)
+
+    monkeypatch.setattr(cv2.VideoCapture, "get", _unreliable_get)
+
+    extractor = FrameExtractor()
+    frames = list(extractor.iter_frames(video_path, interval_seconds=0.5, max_seconds=6.0, full_video=True))
+
+    assert any(
+        f.timestamp_seconds > 6.0 for f in frames
+    ), "full-video fallback scan collapsed to the same narrow max_seconds window"

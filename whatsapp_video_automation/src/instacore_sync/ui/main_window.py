@@ -322,6 +322,10 @@ class MainWindow(QMainWindow):
         self._settings.app.theme = theme
         self._theme.apply(self.centralWidget(), theme)
         self._settings.save()
+        # Keep a reference so the animation (parented to centralWidget(),
+        # per `ThemeManager.fade_in`) isn't GC'd by Python mid-flight even
+        # though Qt's DeleteWhenStopped policy owns its actual lifetime.
+        self._theme_fade_animation = self._theme.fade_in(self.centralWidget())
 
     def _on_rerun_wizard_clicked(self) -> None:
         """Settings -> "Run Setup Wizard Again" — independent of the

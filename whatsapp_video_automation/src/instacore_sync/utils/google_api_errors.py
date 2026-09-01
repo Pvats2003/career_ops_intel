@@ -82,6 +82,35 @@ def is_transient_google_api_error(exc: Exception) -> bool:
     return False
 
 
+_PERMANENT_STATUS_CODES = frozenset({400, 404})
+
+
+def is_permanent_google_api_error(exc: Exception) -> bool:
+    """True only when the API explicitly told us this will never succeed
+    on retry: a 400 bad request, a 404 not found, or a 403 whose `reason`
+    is a genuine permission denial (not one of the rate-limit reasons).
+
+    Deliberately NOT the same as `not is_transient_google_api_error(exc)`
+    — that would also be true for any *unclassifiable* error (a plain
+    connection reset or timeout that never reached Google as an HttpError
+    at all), wrongly treating "we don't know" as "this will never work."
+    Callers deciding whether to skip further retries (see
+    `VideoProcessor`/`UploadWorkerPool`) need the conservative case:
+    retry as normal unless the API has positively confirmed it's futile.
+    """
+    for candidate in (exc, getattr(exc, "__cause__", None)):
+        if candidate is None:
+            continue
+        status = _http_status(candidate)
+        if status is None:
+            continue
+        if status in _PERMANENT_STATUS_CODES:
+            return True
+        if status == 403 and _error_reason(candidate) not in _TRANSIENT_403_REASONS:
+            return True
+    return False
+
+
 def is_not_found_error(exc: Exception) -> bool:
     """True if the API reported the target resource (e.g. a Drive folder) doesn't exist."""
     return _http_status(exc) == 404

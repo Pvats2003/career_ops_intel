@@ -5,6 +5,7 @@ import json
 from instacore_sync.utils.google_api_errors import (
     is_auth_error,
     is_not_found_error,
+    is_permanent_google_api_error,
     is_transient_google_api_error,
 )
 
@@ -92,3 +93,40 @@ def test_permanent_error_through_a_typed_wrapper_is_still_not_transient() -> Non
 
 def test_wrapper_with_no_cause_is_not_transient() -> None:
     assert is_transient_google_api_error(_TypedWrapperError("boom")) is False
+
+
+def test_permission_denied_403_is_permanent() -> None:
+    assert is_permanent_google_api_error(_FakeHttpError(403, reason="forbidden")) is True
+
+
+def test_not_found_404_is_permanent() -> None:
+    assert is_permanent_google_api_error(_FakeHttpError(404)) is True
+
+
+def test_bad_request_400_is_permanent() -> None:
+    assert is_permanent_google_api_error(_FakeHttpError(400)) is True
+
+
+def test_rate_limited_403_is_not_permanent() -> None:
+    assert is_permanent_google_api_error(_FakeHttpError(403, reason="userRateLimitExceeded")) is False
+
+
+def test_server_error_5xx_is_not_permanent() -> None:
+    assert is_permanent_google_api_error(_FakeHttpError(503)) is False
+
+
+def test_unclassifiable_error_is_not_assumed_permanent() -> None:
+    """A plain error with no HTTP status at all (a timeout, a connection
+    reset — never even reached Google as an HttpError) must NOT be
+    treated as permanent by default. `is_permanent_google_api_error`
+    only says True when the API has positively confirmed it's futile —
+    'unknown' must fall back to the normal retry treatment, not skip it."""
+    assert is_permanent_google_api_error(RuntimeError("connection reset")) is False
+
+
+def test_permanent_error_through_a_typed_wrapper_is_detected_via_cause() -> None:
+    original = _FakeHttpError(404)
+    try:
+        raise _TypedWrapperError("not found") from original
+    except _TypedWrapperError as wrapped:
+        assert is_permanent_google_api_error(wrapped) is True

@@ -11,6 +11,7 @@ Qt UI thread. Failures are retried with exponential backoff up to
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -26,6 +27,12 @@ from instacore_sync.services.pipeline.video_processor import VideoProcessor
 from instacore_sync.services.upload.upload_queue import UploadQueue
 
 logger = get_logger(__name__)
+
+# Caps the job-level retry backoff the same way utils.retry's
+# google_api_retry/network_retry cap the single-API-call layer (both use
+# wait_exponential_jitter(..., max=60.0)) — an unbounded exponential here
+# would otherwise grow to hours for a job stuck near retry_count.
+_MAX_JOB_RETRY_BACKOFF_SECONDS = 60.0
 
 
 class UploadWorkerPool:
@@ -152,6 +159,21 @@ class UploadWorkerPool:
         if job.status != JobStatus.FAILED:
             return  # COMPLETED / DUPLICATE / NEEDS_REVIEW are all terminal
 
+        if job.permanent_failure:
+            # Classified by VideoProcessor as unrecoverable (e.g. a 403
+            # permission-denied or 404 not-found on the Drive folder/Sheet)
+            # — no number of retries will ever succeed, so don't repeat
+            # OCR/hashing/upload work for nothing before landing on FAILED.
+            logger.error(
+                "upload_pool.permanent_failure",
+                job_id=job.job_id,
+                filename=job.original_filename,
+                attempts=job.attempt_count,
+                error=job.last_error,
+            )
+            self._events.on_job_updated(job)
+            return
+
         if job.attempt_count >= self._settings.retry_count:
             logger.error(
                 "upload_pool.retries_exhausted",
@@ -163,7 +185,7 @@ class UploadWorkerPool:
             self._events.on_job_updated(job)
             return
 
-        backoff = self._settings.retry_backoff_seconds * (2 ** (job.attempt_count - 1))
+        backoff = self._next_backoff_seconds(job.attempt_count)
         logger.warning(
             "upload_pool.retrying",
             job_id=job.job_id,
@@ -186,6 +208,24 @@ class UploadWorkerPool:
         self._jobs_repo.upsert(job)
         self._events.on_job_updated(job)
         loop.call_later(backoff, self._requeue_after_backoff, job)
+
+    def _next_backoff_seconds(self, attempt_count: int) -> float:
+        """Exponential backoff with jitter, capped at
+        `_MAX_JOB_RETRY_BACKOFF_SECONDS` — mirrors the shape
+        `utils.retry`'s `google_api_retry`/`network_retry` already use at
+        the single-API-call layer. Without jitter here, a shared-side
+        outage (Drive/Sheets briefly unavailable) failing uploads across
+        many independent installs at roughly the same moment would have
+        every install's job-level retry wait the exact same deterministic
+        sequence and re-converge in lockstep waves against the same
+        endpoint when it recovers — the same thundering-herd pattern the
+        API-call layer already avoids, just one layer up.
+        """
+        capped = min(
+            self._settings.retry_backoff_seconds * (2 ** (attempt_count - 1)),
+            _MAX_JOB_RETRY_BACKOFF_SECONDS,
+        )
+        return random.uniform(capped * 0.5, capped)
 
     def _requeue_after_backoff(self, job: VideoJob) -> None:
         if not self._running:
