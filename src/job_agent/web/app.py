@@ -15,7 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from job_agent.web.routers import candidate, dashboard, jobs, pipeline
+from job_agent.web.routers import (
+    candidate,
+    companies,
+    dashboard,
+    jobs,
+    notifications,
+    pipeline,
+    settings,
+    watchlist,
+)
 
 _FRONTEND_DIST = Path(__file__).resolve().parents[3] / "web-ui" / "dist"
 
@@ -38,6 +47,10 @@ def create_app() -> FastAPI:
     app.include_router(candidate.router)
     app.include_router(jobs.router)
     app.include_router(pipeline.router)
+    app.include_router(companies.router)
+    app.include_router(watchlist.router)
+    app.include_router(notifications.router)
+    app.include_router(settings.router)
 
     @app.get("/api/health")
     def health() -> dict:

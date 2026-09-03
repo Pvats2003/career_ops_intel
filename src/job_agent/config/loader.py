@@ -58,6 +58,13 @@ class EnvSettings(BaseSettings):
     llm_provider: str | None = None
     llm_model: str | None = None
 
+    # Adzuna Jobs API (Phase 8's multi-country search_api source) — free
+    # credentials from https://developer.adzuna.com/. Left unset means the
+    # `adzuna` source, even if `enabled: true` in sources.yaml, is skipped
+    # with a logged reason rather than making an unauthenticated call.
+    adzuna_app_id: str | None = None
+    adzuna_app_key: str | None = None
+
 
 def _load_yaml(path: Path) -> dict:
     if not path.exists():

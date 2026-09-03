@@ -39,6 +39,9 @@ export interface JobOut {
   match: MatchOut | null
   pipeline_stage: string | null
   application_id: number | null
+  lifecycle_status: string
+  also_seen_on: string[]
+  duplicate_count: number
 }
 
 export interface JobDetailOut extends JobOut {
@@ -179,4 +182,186 @@ export interface AnalyticsOut {
   interview_rate: number
   offer_rate: number
   by_company: CareerPathAnalyticsOut[]
+}
+
+// --------------------------------------------------------------------------
+// Resume tailoring / cover letter / application assistant (Phase 9)
+// --------------------------------------------------------------------------
+
+export interface TailoredResumeOut {
+  job_id: number
+  professional_summary: string
+  relevant_skills: string[]
+  emphasized_experience: Record<string, unknown>[]
+  relevant_projects: Record<string, unknown>[]
+  ats_keywords: string[]
+  notes: string[]
+  generated_by: 'llm' | 'deterministic'
+}
+
+export interface CoverLetterOut {
+  job_id: number
+  body: string
+  notes: string[]
+  generated_by: 'llm' | 'deterministic'
+}
+
+export interface AssistantAnswerOut {
+  question: string
+  category: string
+  answer: string | null
+  confidence: number
+  source: string
+  requires_human: boolean
+  validation_notes: string[]
+}
+
+export interface AssistantResponseOut {
+  job_id: number
+  answers: AssistantAnswerOut[]
+}
+
+// --------------------------------------------------------------------------
+// Career paths (Phase 8 section 5)
+// --------------------------------------------------------------------------
+
+export interface CareerPathOut {
+  label: string
+  fit_score: number
+  evidence: string[]
+  relevant_skills: string[]
+  relevant_experience: string[]
+  missing_skills: string[]
+  typical_titles: string[]
+  career_upside: string
+  recommended_priority: string
+}
+
+// --------------------------------------------------------------------------
+// Search runs / ranking (Phase 8)
+// --------------------------------------------------------------------------
+
+export interface SearchRunOut {
+  id: number
+  started_at: string
+  completed_at: string | null
+  sources: string[]
+  queries: string[]
+  jobs_found: number
+  duplicates_removed: number
+  expired_removed: number
+  qualified: number
+  errors: string[]
+  status: string
+}
+
+export interface RankedJobOut {
+  job: JobOut
+  rank_score: number
+  why: string[]
+  gaps: string[]
+  recommendation: string
+}
+
+// --------------------------------------------------------------------------
+// Company intelligence (Phase 10)
+// --------------------------------------------------------------------------
+
+export interface CompanyOut {
+  id: number
+  name: string
+  industry: string | null
+  size: string | null
+  website: string | null
+  career_page_url: string | null
+  notes: string | null
+  open_roles: number
+  matching_jobs: JobOut[]
+  company_fit: number | null
+  company_fit_reasons: string[]
+}
+
+// --------------------------------------------------------------------------
+// Watchlist (Phase 11 section 19)
+// --------------------------------------------------------------------------
+
+export const WATCHLIST_KINDS = ['COMPANY', 'ROLE', 'LOCATION'] as const
+export type WatchlistKind = (typeof WATCHLIST_KINDS)[number]
+
+export interface WatchlistEntryOut {
+  id: number
+  kind: WatchlistKind
+  value: string
+  created_at: string
+}
+
+export interface WatchlistEntryIn {
+  kind: WatchlistKind
+  value: string
+}
+
+// --------------------------------------------------------------------------
+// Notifications (Phase 11 section 20)
+// --------------------------------------------------------------------------
+
+export interface NotificationOut {
+  id: number
+  event_type: string
+  title: string
+  message: string
+  related_job_id: number | null
+  related_application_id: number | null
+  read_at: string | null
+  created_at: string
+}
+
+// --------------------------------------------------------------------------
+// Search preferences / settings (Phase 15)
+// --------------------------------------------------------------------------
+
+export interface SearchPreferencesOut {
+  target_roles: string[]
+  target_countries: string[]
+  target_cities: string[]
+  remote_preference: string | null
+  min_salary: number | null
+  max_experience_gap_years: number | null
+  industries: string[]
+  companies_priority: string[]
+  companies_excluded: string[]
+  min_match_score: number
+  search_frequency_hours: number
+  notification_min_score: number
+  notification_frequency: string
+}
+
+export type SearchPreferencesIn = Partial<SearchPreferencesOut>
+
+// --------------------------------------------------------------------------
+// Follow-up intelligence (Phase 13)
+// --------------------------------------------------------------------------
+
+export interface FollowUpRecommendationOut {
+  application_id: number
+  job: JobOut
+  applied_days_ago: number
+  suggested_action: string
+}
+
+// --------------------------------------------------------------------------
+// Learning / insights (Phase 12)
+// --------------------------------------------------------------------------
+
+export interface CategoryInsightOut {
+  category: string
+  saved: number
+  ignored: number
+  applied: number
+  save_rate: number
+  explanation: string
+}
+
+export interface InsightsOut {
+  categories: CategoryInsightOut[]
+  summary: string[]
 }

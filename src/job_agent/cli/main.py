@@ -85,8 +85,10 @@ from job_agent.db.models import Job as JobRow
 from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.jobs.repository import get_or_create_job_source, upsert_job
+from job_agent.jobs.scheduler import build_scheduler
 from job_agent.jobs.schema import FreshnessStatus
 from job_agent.jobs.schema import Job as JobTargetSchema
+from job_agent.jobs.search_run import execute_search_run
 from job_agent.jobs.service import run_scan
 from job_agent.llm.provider import NullLLMProvider, build_llm_provider
 from job_agent.logging.setup import configure_logging, get_logger, log_event, redact_text
@@ -499,6 +501,51 @@ def jobs_match() -> None:
         jobs_matched=len(outcomes),
         semantic_calls=sum(1 for o in outcomes if o.semantic_call_made),
     )
+
+
+@jobs_app.command("search-run")
+def jobs_search_run() -> None:
+    """One end-to-end discovery run (Phase 8): generate a search-query
+    portfolio from the candidate profile, scan every enabled source
+    (query-based sources get the generated queries), mark stale jobs
+    EXPIRED, match everything against the candidate, and record a
+    `SearchRun` row. Equivalent to running `jobs scan` + `jobs match`
+    together, plus query generation and lifecycle sweeping neither of
+    those commands does on their own."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    try:
+        profile = parse_candidate_profile(cfg)
+    except CandidateParseError as exc:
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
+        raise typer.Exit(code=1) from exc
+
+    llm = build_llm_provider(cfg)
+
+    with session_factory() as session:
+        candidate_id = save_candidate_profile(session, profile)
+        run = execute_search_run(session, cfg, profile, candidate_id, llm=llm)
+
+    console.print(f"[bold]Search run #{run.id}[/bold] — {run.status}")
+    console.print(f"  Sources scanned: {', '.join(run.sources) or '(none enabled)'}")
+    console.print(f"  Queries used: {len(run.queries)}")
+    console.print(f"  Jobs found: {run.jobs_found}")
+    console.print(f"  Duplicates detected: {run.duplicates_removed}")
+    console.print(f"  Expired jobs swept: {run.expired_removed}")
+    console.print(f"  Qualified (APPLY/REVIEW): {run.qualified}")
+    if run.errors:
+        console.print(f"  [yellow]{len(run.errors)} error(s):[/yellow]")
+        for err in run.errors:
+            console.print(f"    {err}")
+    if not run.sources:
+        console.print(
+            "[yellow]No job source is enabled.[/yellow] Edit config/sources.yaml "
+            "(set enabled: true for greenhouse/lever/remotive/arbeitnow/adzuna) to "
+            "actually discover jobs."
+        )
 
 
 @applications_app.command("prepare")
@@ -1790,6 +1837,13 @@ def serve(
     reload: bool = typer.Option(
         False, "--reload", help="Auto-reload on source changes (development only)."
     ),
+    scheduler: bool = typer.Option(
+        True,
+        "--scheduler/--no-scheduler",
+        help="Run the autonomous scheduled search (Phase 11) alongside the dashboard. "
+        "Frequency comes from each candidate's Settings page (search_frequency_hours, "
+        "default 24h) — never fires more often than that, whatever this poll interval is.",
+    ),
 ) -> None:
     """Launch the Career OS web dashboard (Phase 7) — a FastAPI server
     exposing the exact same candidate/job/matching/pipeline services every
@@ -1804,7 +1858,19 @@ def serve(
         f"[green]Career OS dashboard starting at[/green] http://{host}:{port} "
         "(Ctrl+C to stop)"
     )
-    uvicorn.run("job_agent.web.app:app", host=host, port=port, reload=reload)
+
+    background_scheduler = None
+    if scheduler:
+        cfg = load_config()
+        background_scheduler = build_scheduler(cfg)
+        background_scheduler.start()
+        console.print("[green]Autonomous scheduled search enabled.[/green]")
+
+    try:
+        uvicorn.run("job_agent.web.app:app", host=host, port=port, reload=reload)
+    finally:
+        if background_scheduler is not None:
+            background_scheduler.shutdown(wait=False)
 
 
 if __name__ == "__main__":

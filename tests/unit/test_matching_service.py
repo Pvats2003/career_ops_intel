@@ -180,3 +180,56 @@ def test_run_matching_survives_one_bad_job_in_the_batch(
 
     assert {o.job_id for o in outcomes} == {job1.id, job3.id}
     assert db_session.query(JobMatch).count() == 2
+
+
+def test_run_matching_reuses_cached_match_no_llm_call_when_nothing_changed(
+    db_session, source_row, candidate_row, real_profile, real_config
+):
+    """Career OS Phase 16 cost control: an unchanged job + unchanged
+    profile + unchanged scoring config on a second run must reuse the
+    first run's JobMatch, never pay for a second LLM call."""
+    job = _job_row(source_row)
+    db_session.add(job)
+    db_session.flush()
+
+    llm = _StubLLM()
+    run_matching(
+        db_session, real_config, real_profile, candidate_id=candidate_row.id, llm=llm,
+        job_ids=[job.id],
+    )
+    calls_after_first_run = llm.calls
+    assert calls_after_first_run == 1
+    assert db_session.query(JobMatch).count() == 1
+
+    outcomes = run_matching(
+        db_session, real_config, real_profile, candidate_id=candidate_row.id, llm=llm,
+        job_ids=[job.id],
+    )
+    assert llm.calls == calls_after_first_run
+    assert db_session.query(JobMatch).count() == 1
+    assert outcomes[0].semantic_call_made is False
+
+
+def test_run_matching_recomputes_when_job_description_changes(
+    db_session, source_row, candidate_row, real_profile, real_config
+):
+    job = _job_row(source_row)
+    db_session.add(job)
+    db_session.flush()
+
+    llm = _StubLLM()
+    run_matching(
+        db_session, real_config, real_profile, candidate_id=candidate_row.id, llm=llm,
+        job_ids=[job.id],
+    )
+    assert llm.calls == 1
+
+    job.description = "Completely different posting text now, still promising."
+    db_session.flush()
+
+    run_matching(
+        db_session, real_config, real_profile, candidate_id=candidate_row.id, llm=llm,
+        job_ids=[job.id],
+    )
+    assert llm.calls == 2
+    assert db_session.query(JobMatch).count() == 2

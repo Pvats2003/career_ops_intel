@@ -97,11 +97,20 @@ class BoardIdentifier(StrictModel):
 
 class SourceConfig(StrictModel):
     enabled: bool = False
-    kind: Literal["ats_api", "scrape", "restricted"] = "restricted"
+    kind: Literal["ats_api", "search_api", "scrape", "restricted"] = "restricted"
     poll_interval_minutes: int | None = None
     rate_limit_per_minute: int | None = None
     notes: str = ""
     boards: list[BoardIdentifier] = Field(default_factory=list)
+    # search_api sources only (Phase 8's Remotive/Arbeitnow/Adzuna
+    # adapters) — ISO 3166-1 alpha-2 country codes to query, e.g. ["gb",
+    # "in", "sg"]. Ignored by ats_api/scrape/restricted sources.
+    countries: list[str] = Field(default_factory=list)
+    # Maximum queries from the candidate's generated search-query
+    # portfolio (job_agent.jobs.query_generator) to actually issue per
+    # scan for this source — bounds request volume/cost regardless of
+    # how large the portfolio grows.
+    max_queries: int = 3
 
 
 class GlobalLimits(StrictModel):

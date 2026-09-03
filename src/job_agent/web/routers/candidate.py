@@ -16,13 +16,25 @@ that for consistency.
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, UploadFile
+from sqlalchemy import select
 
+from job_agent.candidate.career_paths import discover_career_paths
+from job_agent.candidate.learning import discover_insights
 from job_agent.candidate.schema import CandidateProfile
+from job_agent.db.models import Application as ApplicationRow
+from job_agent.db.models import Job as JobRow
+from job_agent.db.models import JobMatch as JobMatchRow
 from job_agent.resume.errors import ResumeExtractionError
 from job_agent.resume.repository import list_versions
 from job_agent.resume.service import create_profile_version
 from job_agent.web.deps import CandidateDep, ConfigDep, SessionDep
-from job_agent.web.schemas import CandidateProfileOut, ResumeUploadResult
+from job_agent.web.schemas import (
+    CandidateProfileOut,
+    CareerPathOut,
+    CategoryInsightOut,
+    InsightsOut,
+    ResumeUploadResult,
+)
 
 router = APIRouter(prefix="/api/candidate", tags=["candidate"])
 
@@ -131,6 +143,61 @@ async def upload_resume(
         profile_version_id=result.version.id if result.version else None,
         validation_status=result.version.validation_status if result.version else "UNKNOWN",
         issues=[f"{issue.field}: {issue.detail}" for issue in result.issues],
+    )
+
+
+@router.get("/career-paths", response_model=list[CareerPathOut])
+def get_career_paths(candidate: CandidateDep) -> list[CareerPathOut]:
+    profile, _ = candidate
+    results = discover_career_paths(profile)
+    return [
+        CareerPathOut(
+            label=r.label, fit_score=r.fit_score, evidence=list(r.evidence),
+            relevant_skills=list(r.relevant_skills),
+            relevant_experience=list(r.relevant_experience),
+            missing_skills=list(r.missing_skills), typical_titles=list(r.typical_titles),
+            career_upside=r.career_upside, recommended_priority=r.recommended_priority,
+        )
+        for r in results
+    ]
+
+
+@router.get("/insights", response_model=InsightsOut)
+def get_insights(session: SessionDep, candidate: CandidateDep) -> InsightsOut:
+    """Phase 12 section 21 — explainable behavioral patterns over jobs the
+    candidate has actually been matched against: which ones they engaged
+    with (saved/shortlisted/applied, tracked via `Application`) vs. left
+    untouched, broken down by real job attributes. See `job_agent.
+    candidate.learning` for how "notable" is decided — never a vague or
+    overconfident claim from a handful of jobs."""
+    _, candidate_id = candidate
+    matched_job_ids = list(
+        session.execute(
+            select(JobMatchRow.job_id).where(JobMatchRow.candidate_id == candidate_id).distinct()
+        ).scalars()
+    )
+    jobs_with_applications: list[tuple[JobRow, ApplicationRow | None]] = []
+    for job_id in matched_job_ids:
+        job = session.get(JobRow, job_id)
+        if job is None:
+            continue
+        application = session.execute(
+            select(ApplicationRow).where(
+                ApplicationRow.job_id == job_id, ApplicationRow.candidate_id == candidate_id
+            )
+        ).scalar_one_or_none()
+        jobs_with_applications.append((job, application))
+
+    categories, summary = discover_insights(jobs_with_applications)
+    return InsightsOut(
+        categories=[
+            CategoryInsightOut(
+                category=c.category, saved=c.saved, ignored=c.ignored, applied=c.applied,
+                save_rate=c.save_rate, explanation=c.explanation,
+            )
+            for c in categories
+        ],
+        summary=summary,
     )
 
 

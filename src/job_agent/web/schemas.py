@@ -89,6 +89,13 @@ class JobOut(BaseModel):
     match: MatchOut | None
     pipeline_stage: str | None
     application_id: int | None
+    lifecycle_status: str
+    # Cross-source duplicate canonicalization (section 8): this JobOut is
+    # the ONE canonical representative for every Job row sharing its
+    # content fingerprint. also_seen_on lists the OTHER sources that also
+    # carried this same posting — never a separate card in the UI.
+    also_seen_on: list[str]
+    duplicate_count: int
 
 
 class JobDetailOut(JobOut):
@@ -231,3 +238,207 @@ class AssistantAnswerOut(BaseModel):
 class AssistantResponseOut(BaseModel):
     job_id: int
     answers: list[AssistantAnswerOut]
+
+
+class AssistantQuestionsIn(BaseModel):
+    questions: list[str] = Field(min_length=1, max_length=20)
+
+
+# --------------------------------------------------------------------------
+# Career path discovery (section 5)
+# --------------------------------------------------------------------------
+
+
+class CareerPathOut(BaseModel):
+    label: str
+    fit_score: int
+    evidence: list[str]
+    relevant_skills: list[str]
+    relevant_experience: list[str]
+    missing_skills: list[str]
+    typical_titles: list[str]
+    career_upside: str
+    recommended_priority: str
+
+
+# --------------------------------------------------------------------------
+# Resume tailoring / cover letter / (assistant is above)
+# --------------------------------------------------------------------------
+
+
+class TailoredResumeOut(BaseModel):
+    job_id: int
+    professional_summary: str
+    relevant_skills: list[str]
+    emphasized_experience: list[dict]
+    relevant_projects: list[dict]
+    ats_keywords: list[str]
+    notes: list[str]
+    generated_by: str  # "llm" | "deterministic"
+
+
+class CoverLetterOut(BaseModel):
+    job_id: int
+    body: str
+    notes: list[str]
+    generated_by: str  # "llm" | "deterministic"
+
+
+# --------------------------------------------------------------------------
+# Company intelligence (Phase 10)
+# --------------------------------------------------------------------------
+
+
+class CompanyOut(BaseModel):
+    id: int
+    name: str
+    industry: str | None
+    size: str | None
+    website: str | None
+    career_page_url: str | None
+    notes: str | None
+    open_roles: int
+    matching_jobs: list[JobOut]
+    company_fit: int | None
+    company_fit_reasons: list[str]
+
+
+# --------------------------------------------------------------------------
+# Watchlist (Phase 11 section 19)
+# --------------------------------------------------------------------------
+
+WATCHLIST_KINDS: tuple[str, ...] = ("COMPANY", "ROLE", "LOCATION")
+
+
+class WatchlistEntryOut(BaseModel):
+    id: int
+    kind: str
+    value: str
+    created_at: datetime
+
+
+class WatchlistEntryIn(BaseModel):
+    kind: str
+    value: str
+
+
+# --------------------------------------------------------------------------
+# Notifications (Phase 11 section 20)
+# --------------------------------------------------------------------------
+
+
+class NotificationOut(BaseModel):
+    id: int
+    event_type: str
+    title: str
+    message: str
+    related_job_id: int | None
+    related_application_id: int | None
+    read_at: datetime | None
+    created_at: datetime
+
+
+# --------------------------------------------------------------------------
+# Search preferences (Phase 15 settings page)
+# --------------------------------------------------------------------------
+
+
+class SearchPreferencesOut(BaseModel):
+    target_roles: list[str]
+    target_countries: list[str]
+    target_cities: list[str]
+    remote_preference: str | None
+    min_salary: float | None
+    max_experience_gap_years: float | None
+    industries: list[str]
+    companies_priority: list[str]
+    companies_excluded: list[str]
+    min_match_score: int
+    search_frequency_hours: int
+    notification_min_score: int
+    notification_frequency: str
+
+
+class SearchPreferencesIn(BaseModel):
+    target_roles: list[str] | None = None
+    target_countries: list[str] | None = None
+    target_cities: list[str] | None = None
+    remote_preference: str | None = None
+    min_salary: float | None = None
+    max_experience_gap_years: float | None = None
+    industries: list[str] | None = None
+    companies_priority: list[str] | None = None
+    companies_excluded: list[str] | None = None
+    min_match_score: int | None = None
+    search_frequency_hours: int | None = None
+    notification_min_score: int | None = None
+    notification_frequency: str | None = None
+
+
+SUPPORTED_COUNTRIES: tuple[str, ...] = (
+    "India", "USA", "Canada", "UK", "Germany", "Netherlands", "Ireland",
+    "Singapore", "UAE", "Australia", "Remote", "Worldwide",
+)
+
+
+# --------------------------------------------------------------------------
+# Search runs (Phase 8 section 3)
+# --------------------------------------------------------------------------
+
+
+class SearchRunOut(BaseModel):
+    id: int
+    started_at: datetime
+    completed_at: datetime | None
+    sources: list[str]
+    queries: list[str]
+    jobs_found: int
+    duplicates_removed: int
+    expired_removed: int
+    qualified: int
+    errors: list[str]
+    status: str
+
+
+# --------------------------------------------------------------------------
+# Ranking: Today's Top 10 / Apply Now (section 9-10)
+# --------------------------------------------------------------------------
+
+
+class RankedJobOut(BaseModel):
+    job: JobOut
+    rank_score: float
+    why: list[str]
+    gaps: list[str]
+    recommendation: str
+
+
+# --------------------------------------------------------------------------
+# Follow-up intelligence (Phase 13)
+# --------------------------------------------------------------------------
+
+
+class FollowUpRecommendationOut(BaseModel):
+    application_id: int
+    job: JobOut
+    applied_days_ago: int
+    suggested_action: str
+
+
+# --------------------------------------------------------------------------
+# Learning / insights (Phase 12)
+# --------------------------------------------------------------------------
+
+
+class CategoryInsightOut(BaseModel):
+    category: str
+    saved: int
+    ignored: int
+    applied: int
+    save_rate: float
+    explanation: str
+
+
+class InsightsOut(BaseModel):
+    categories: list[CategoryInsightOut]
+    summary: list[str]

@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from job_agent.applications.follow_up import compute_follow_up_recommendations
 from job_agent.db.models import Application, ApplicationEvent
 from job_agent.db.models import Job as JobRow
 from job_agent.web.deps import CandidateDep, SessionDep
@@ -20,6 +21,7 @@ from job_agent.web.schemas import (
     PIPELINE_STAGES,
     AnalyticsOut,
     CareerPathAnalyticsOut,
+    FollowUpRecommendationOut,
     PipelineItemOut,
     PipelineUpdateIn,
     StageBreakdownOut,
@@ -134,6 +136,36 @@ def remove_pipeline_item(application_id: int, session: SessionDep, candidate: Ca
     session.flush()
     session.delete(application)
     session.commit()
+
+
+@router.get("/follow-ups", response_model=list[FollowUpRecommendationOut])
+def follow_up_recommendations(
+    session: SessionDep, candidate: CandidateDep
+) -> list[FollowUpRecommendationOut]:
+    """Phase 13 — applications sitting in an active waiting stage
+    (APPLIED/ASSESSMENT/INTERVIEW) with no stage change in 7+ days.
+    Never contacts a recruiter — this only flags what to look at."""
+    _, candidate_id = candidate
+    applications = list(
+        session.execute(select(Application).where(Application.candidate_id == candidate_id))
+        .scalars()
+    )
+    applications_with_jobs = []
+    for application in applications:
+        job = session.get(JobRow, application.job_id)
+        if job is not None:
+            applications_with_jobs.append((application, job))
+
+    recommendations = compute_follow_up_recommendations(applications_with_jobs)
+    return [
+        FollowUpRecommendationOut(
+            application_id=r.application.id,
+            job=_job_out(r.job, _latest_match(session, r.job.id, candidate_id), r.application),
+            applied_days_ago=r.applied_days_ago,
+            suggested_action=r.suggested_action,
+        )
+        for r in recommendations
+    ]
 
 
 @router.get("/analytics", response_model=AnalyticsOut)

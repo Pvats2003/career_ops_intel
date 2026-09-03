@@ -10,7 +10,12 @@ import {
   PipelineStageBadge,
   ScoreRing,
 } from '../components/ui'
-import type { JobDetailOut } from '../types'
+import type {
+  AssistantAnswerOut,
+  CoverLetterOut,
+  JobDetailOut,
+  TailoredResumeOut,
+} from '../types'
 
 const MATCH_ROWS: { key: keyof NonNullable<JobDetailOut['match']>; label: string }[] = [
   { key: 'skills_match', label: 'Skills' },
@@ -147,6 +152,10 @@ export default function JobDetail() {
         </Card>
       )}
 
+      <TailorResumePanel jobId={job.id} />
+      <CoverLetterPanel jobId={job.id} />
+      <AssistantPanel jobId={job.id} />
+
       {(job.description || job.requirements) && (
         <Card className="p-6">
           <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-50">
@@ -170,5 +179,229 @@ export default function JobDetail() {
         </Card>
       )}
     </div>
+  )
+}
+
+function GeneratedByNote({ generatedBy }: { generatedBy: 'llm' | 'deterministic' }) {
+  return (
+    <p className="mt-3 text-xs text-slate-400 dark:text-slate-500">
+      {generatedBy === 'llm'
+        ? 'Refined with AI, validated against your profile.'
+        : 'Generated deterministically from your profile (no AI configured, or the AI draft was rejected).'}
+    </p>
+  )
+}
+
+function TailorResumePanel({ jobId }: { jobId: number }) {
+  const [result, setResult] = useState<TailoredResumeOut | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const generate = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      setResult(await api.tailorResume(jobId))
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : 'Failed to tailor resume.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Card className="p-6">
+      <div className="flex items-center justify-between gap-4">
+        <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-50">
+          Tailor resume for this job
+        </h2>
+        <Button variant="secondary" onClick={generate} disabled={loading}>
+          {loading ? 'Generating…' : result ? 'Regenerate' : 'Generate'}
+        </Button>
+      </div>
+      {error && <p className="mt-2 text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+      {result && (
+        <div className="mt-4 space-y-4">
+          <div>
+            <div className="text-sm font-medium text-slate-700 dark:text-slate-300">
+              Professional summary
+            </div>
+            <p className="mt-1 text-sm text-slate-700 dark:text-slate-300">
+              {result.professional_summary}
+            </p>
+          </div>
+          {result.relevant_skills.length > 0 && (
+            <div>
+              <div className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                Relevant skills to feature
+              </div>
+              <div className="mt-1 flex flex-wrap gap-1.5">
+                {result.relevant_skills.map((s) => (
+                  <span
+                    key={s}
+                    className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs text-slate-700 dark:bg-slate-800 dark:text-slate-300"
+                  >
+                    {s}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {result.ats_keywords.length > 0 && (
+            <div>
+              <div className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                ATS keywords already in your profile — make sure they appear on your resume
+              </div>
+              <div className="mt-1 flex flex-wrap gap-1.5">
+                {result.ats_keywords.map((k) => (
+                  <span
+                    key={k}
+                    className="rounded-full bg-indigo-50 px-2.5 py-0.5 text-xs text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300"
+                  >
+                    {k}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {result.notes.length > 0 && (
+            <ul className="list-inside list-disc text-sm text-slate-500 dark:text-slate-400">
+              {result.notes.map((n) => (
+                <li key={n}>{n}</li>
+              ))}
+            </ul>
+          )}
+          <GeneratedByNote generatedBy={result.generated_by} />
+        </div>
+      )}
+    </Card>
+  )
+}
+
+function CoverLetterPanel({ jobId }: { jobId: number }) {
+  const [result, setResult] = useState<CoverLetterOut | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const generate = async () => {
+    setLoading(true)
+    setError(null)
+    setCopied(false)
+    try {
+      setResult(await api.coverLetter(jobId))
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : 'Failed to generate cover letter.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const copy = async () => {
+    if (!result) return
+    await navigator.clipboard.writeText(result.body)
+    setCopied(true)
+  }
+
+  return (
+    <Card className="p-6">
+      <div className="flex items-center justify-between gap-4">
+        <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-50">Cover letter</h2>
+        <div className="flex gap-2">
+          {result && (
+            <Button variant="ghost" onClick={copy}>
+              {copied ? 'Copied ✓' : 'Copy'}
+            </Button>
+          )}
+          <Button variant="secondary" onClick={generate} disabled={loading}>
+            {loading ? 'Generating…' : result ? 'Regenerate' : 'Generate'}
+          </Button>
+        </div>
+      </div>
+      {error && <p className="mt-2 text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+      {result && (
+        <div className="mt-4">
+          <p className="whitespace-pre-line text-sm text-slate-700 dark:text-slate-300">
+            {result.body}
+          </p>
+          {result.notes.length > 0 && (
+            <ul className="mt-3 list-inside list-disc text-sm text-slate-500 dark:text-slate-400">
+              {result.notes.map((n) => (
+                <li key={n}>{n}</li>
+              ))}
+            </ul>
+          )}
+          <GeneratedByNote generatedBy={result.generated_by} />
+        </div>
+      )}
+    </Card>
+  )
+}
+
+function AssistantPanel({ jobId }: { jobId: number }) {
+  const [question, setQuestion] = useState('')
+  const [answers, setAnswers] = useState<AssistantAnswerOut[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const ask = async () => {
+    if (!question.trim()) return
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await api.askAssistant(jobId, [question.trim()])
+      setAnswers((prev) => [...response.answers, ...prev])
+      setQuestion('')
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : 'Failed to get an answer.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Card className="p-6">
+      <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-50">
+        Application assistant
+      </h2>
+      <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+        Ask a common application question — answered from your profile, never invented.
+      </p>
+      <div className="mt-3 flex gap-2">
+        <input
+          type="text"
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && ask()}
+          placeholder="e.g. What is your expected salary?"
+          className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+        />
+        <Button variant="secondary" onClick={ask} disabled={loading || !question.trim()}>
+          {loading ? 'Asking…' : 'Ask'}
+        </Button>
+      </div>
+      {error && <p className="mt-2 text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+      {answers.length > 0 && (
+        <div className="mt-4 space-y-3">
+          {answers.map((a, i) => (
+            <div
+              key={`${a.question}-${i}`}
+              className="rounded-lg border border-slate-200 p-3 dark:border-slate-800"
+            >
+              <div className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                {a.question}
+              </div>
+              {a.requires_human ? (
+                <p className="mt-1 text-sm text-amber-600 dark:text-amber-400">
+                  Needs your input — Career OS can't answer this from your profile ({a.source}).
+                </p>
+              ) : (
+                <p className="mt-1 text-sm text-slate-700 dark:text-slate-300">{a.answer}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
   )
 }

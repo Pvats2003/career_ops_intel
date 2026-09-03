@@ -52,6 +52,14 @@ class Candidate(Base, TimestampMixin):
     parsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     source_files: Mapped[list] = mapped_column(JSON, default=list)
 
+    # Career OS web dashboard (Phase 8+) — when the candidate last opened
+    # the dashboard, used purely to compute "new since last visit" on read
+    # (never gates or authorizes anything); set by the web layer, not by
+    # any CLI command.
+    last_dashboard_view_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     facts: Mapped[list[CandidateFact]] = relationship(
         back_populates="candidate", cascade="all, delete-orphan"
     )
@@ -246,6 +254,16 @@ class Job(Base, TimestampMixin):
     freshness_status: Mapped[str] = mapped_column(String(32), default="UNKNOWN_POST_DATE")
     raw_data: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    # Career OS Phase 8 — source-availability lifecycle (ACTIVE/CLOSED/
+    # EXPIRED), deliberately separate from `freshness_status` above:
+    # `freshness_status` says how recently the posting claims to have been
+    # posted; `lifecycle_status` says whether the posting is still
+    # actually live, set by `job_agent.jobs.service` when a full re-scan
+    # of a source no longer lists a previously-seen job (CLOSED), or by a
+    # separate staleness sweep for a job unconfirmed for too long
+    # (EXPIRED) — never guessed at import time, always ACTIVE by default.
+    lifecycle_status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
+
 
 class JobMatch(Base, TimestampMixin):
     __tablename__ = "job_matches"
@@ -275,6 +293,12 @@ class JobMatch(Base, TimestampMixin):
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
     prompt_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     model_used: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Career OS Phase 16 cost control — job_agent.matching.cache.
+    # compute_match_cache_key(profile, config, job): when a fresh match's
+    # key equals the LATEST existing row's, the match is reused verbatim
+    # instead of paying for another deterministic+LLM pass. NULL for any
+    # row written before this column existed — never treated as a match.
+    cache_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +476,9 @@ class Notification(Base):
     __tablename__ = "notifications"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("candidate.id"), nullable=True, index=True
+    )
     event_type: Mapped[str] = mapped_column(String(64))
     channel: Mapped[str] = mapped_column(String(32))
     title: Mapped[str] = mapped_column(String(255))
@@ -461,7 +488,79 @@ class Notification(Base):
         ForeignKey("applications.id"), nullable=True
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Phase 8 (Career OS web dashboard): when the candidate dismissed/read
+    # this notification in the UI — None means still unread. Distinct from
+    # `sent_at`, which is about outbound delivery (email/push), not
+    # in-app read state.
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WatchlistEntry(Base, TimestampMixin):
+    """A company/role/location the candidate wants proactively flagged —
+    Career OS Phase 11 section 19. `kind` + `value` together define what
+    to match new jobs against; matching happens in `job_agent.jobs.
+    watchlist`, never here (this table is pure storage)."""
+
+    __tablename__ = "watchlist_entries"
+    __table_args__ = (Index("ix_watchlist_entries_candidate_kind", "candidate_id", "kind"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidate.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(16))  # COMPANY | ROLE | LOCATION
+    value: Mapped[str] = mapped_column(String(255))
+
+
+class SearchPreferences(Base, TimestampMixin):
+    """One row per candidate — Career OS Phase 15 settings page. Overlays
+    (never replaces) `config/preferences.yaml`/`config/profile.yaml`: those
+    YAML files stay the source of truth for who the candidate IS (facts),
+    this table holds how they want the SEARCH scoped, live-editable from
+    the dashboard without touching a YAML file on disk. A missing row for
+    the candidate means "no overrides set yet" — callers fall back to the
+    YAML-derived defaults, never to a guessed value.
+    """
+
+    __tablename__ = "search_preferences"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate.id"), unique=True, index=True
+    )
+    target_roles: Mapped[list] = mapped_column(JSON, default=list)
+    target_countries: Mapped[list] = mapped_column(JSON, default=list)
+    target_cities: Mapped[list] = mapped_column(JSON, default=list)
+    remote_preference: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    min_salary: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_experience_gap_years: Mapped[float | None] = mapped_column(Float, nullable=True)
+    industries: Mapped[list] = mapped_column(JSON, default=list)
+    companies_priority: Mapped[list] = mapped_column(JSON, default=list)
+    companies_excluded: Mapped[list] = mapped_column(JSON, default=list)
+    min_match_score: Mapped[int] = mapped_column(default=0)
+    search_frequency_hours: Mapped[int] = mapped_column(default=24)
+    notification_min_score: Mapped[int] = mapped_column(default=90)
+    notification_frequency: Mapped[str] = mapped_column(String(16), default="daily")
+
+
+class SearchRun(Base):
+    """One end-to-end discovery run (scan -> dedupe -> freshness -> match)
+    — Career OS Phase 8 section 3. Insert-only history, mirroring the
+    `application_events` audit-trail pattern: `status` is updated in place
+    as the run progresses, everything else is append-only observation."""
+
+    __tablename__ = "search_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sources: Mapped[list] = mapped_column(JSON, default=list)
+    queries: Mapped[list] = mapped_column(JSON, default=list)
+    jobs_found: Mapped[int] = mapped_column(default=0)
+    duplicates_removed: Mapped[int] = mapped_column(default=0)
+    expired_removed: Mapped[int] = mapped_column(default=0)
+    qualified: Mapped[int] = mapped_column(default=0)
+    errors: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(16), default="RUNNING")
 
 
 class SystemEvent(Base):

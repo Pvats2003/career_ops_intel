@@ -41,6 +41,54 @@ sources:
       - token: "REPLACE_WITH_REAL_LEVER_COMPANY_SLUG"
         company_name: "REPLACE_WITH_COMPANY_NAME"
 
+  remotive:
+    enabled: false
+    kind: "search_api"
+    poll_interval_minutes: 60
+    rate_limit_per_minute: 10
+    max_queries: 3
+    notes: >-
+      Public, keyless remote-jobs API (https://remotive.com/api/remote-jobs)
+      — no ToS concern, no credential needed. Searches the candidate's own
+      generated query portfolio (job_agent.jobs.query_generator), up to
+      max_queries terms per scan. PLACEHOLDER — this sandbox's network
+      policy blocks outbound calls to remotive.com, so this could not be
+      live-verified from here. Confirm connectivity before enabling.
+
+  arbeitnow:
+    enabled: false
+    kind: "search_api"
+    poll_interval_minutes: 60
+    rate_limit_per_minute: 10
+    notes: >-
+      Public, keyless job-board API
+      (https://www.arbeitnow.com/api/job-board-api) — no ToS concern, no
+      credential needed, lists every current posting (no search term
+      supported by the API itself). Reports a real visa_sponsorship flag
+      per listing when the source states it. PLACEHOLDER — this sandbox's
+      network policy blocks outbound calls to arbeitnow.com, so this could
+      not be live-verified from here. Confirm connectivity before enabling.
+
+  adzuna:
+    enabled: false
+    kind: "search_api"
+    poll_interval_minutes: 60
+    rate_limit_per_minute: 10
+    max_queries: 2
+    # ISO 3166-1 alpha-2 codes Adzuna supports, drawn from BUILD PROMPT
+    # section 2's requested countries: gb=UK, us=USA, ca=Canada, in=India,
+    # sg=Singapore, au=Australia, de=Germany, nl=Netherlands. Ireland and
+    # UAE are not Adzuna markets as of this writing — omitted rather than
+    # faked. Add/remove codes to change coverage; no code change needed.
+    countries: []
+    notes: >-
+      Official Adzuna Jobs API (https://developer.adzuna.com/) — requires
+      a free ADZUNA_APP_ID/ADZUNA_APP_KEY (see .env.example); skipped with
+      a logged reason if unset even when enabled here. PLACEHOLDER —
+      this sandbox's network policy blocks outbound calls to
+      api.adzuna.com, so this could not be live-verified from here.
+      Confirm connectivity and real credentials before enabling.
+
   workday:
     enabled: false
     kind: "ats_api"

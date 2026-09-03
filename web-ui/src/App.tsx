@@ -1,17 +1,24 @@
 import { NavLink, Route, Routes } from 'react-router-dom'
 import Analytics from './pages/Analytics'
+import Companies from './pages/Companies'
+import CompanyDetail from './pages/CompanyDetail'
 import Dashboard from './pages/Dashboard'
 import JobDetail from './pages/JobDetail'
 import Jobs from './pages/Jobs'
+import Notifications from './pages/Notifications'
 import Pipeline from './pages/Pipeline'
 import Resume from './pages/Resume'
+import Settings from './pages/Settings'
 
 const NAV = [
   { to: '/', label: 'Dashboard', end: true },
   { to: '/jobs', label: 'Jobs' },
   { to: '/pipeline', label: 'Applications' },
+  { to: '/companies', label: 'Companies' },
   { to: '/resume', label: 'Resume' },
   { to: '/analytics', label: 'Analytics' },
+  { to: '/notifications', label: 'Notifications' },
+  { to: '/settings', label: 'Settings' },
 ]
 
 export default function App() {
@@ -75,8 +82,12 @@ export default function App() {
             <Route path="/jobs" element={<Jobs />} />
             <Route path="/jobs/:id" element={<JobDetail />} />
             <Route path="/pipeline" element={<Pipeline />} />
+            <Route path="/companies" element={<Companies />} />
+            <Route path="/companies/:id" element={<CompanyDetail />} />
             <Route path="/resume" element={<Resume />} />
             <Route path="/analytics" element={<Analytics />} />
+            <Route path="/notifications" element={<Notifications />} />
+            <Route path="/settings" element={<Settings />} />
           </Routes>
         </main>
       </div>

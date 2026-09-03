@@ -18,8 +18,10 @@ from sqlalchemy.orm import Session
 from job_agent.candidate.schema import CandidateProfile
 from job_agent.config.loader import AppConfig
 from job_agent.db.models import Job as JobRow
+from job_agent.db.models import JobMatch as JobMatchRow
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
 from job_agent.logging.setup import get_logger, log_event
+from job_agent.matching.cache import compute_match_cache_key
 from job_agent.matching.decision import finalize
 from job_agent.matching.deterministic import JobText, compute_deterministic_match
 from job_agent.matching.repository import save_job_match
@@ -100,6 +102,38 @@ def match_job(
     )
 
 
+def _outcome_from_cached_row(job_row: JobRow, row: JobMatchRow) -> MatchOutcome:
+    """Rehydrates a `MatchOutcome` from an existing `JobMatch` row — used
+    when `job_agent.matching.cache.compute_match_cache_key` says nothing
+    that would change the result has changed since that row was written,
+    so this run pays for NO deterministic recompute and NO LLM call
+    (Phase 16 cost control)."""
+    result = JobMatchResult(
+        overall_score=int(row.overall_score),
+        decision=Decision(row.decision),
+        skills_match=int(row.skills_match or 0),
+        experience_match=int(row.experience_match or 0),
+        role_match=int(row.role_match or 0),
+        project_match=int(row.project_match or 0),
+        education_match=int(row.education_match or 0),
+        location_match=int(row.location_match or 0),
+        seniority_match=int(row.seniority_match or 0),
+        eligibility_match=int(row.eligibility_match or 0),
+        missing_requirements=tuple(row.missing_requirements or []),
+        concerns=tuple(row.concerns or []),
+        reasoning=row.reasoning or "",
+        hard_stop_reasons=tuple(row.hard_stop_reasons or []),
+        excluded_reasons=tuple(row.excluded_reasons or []),
+        semantic_available=bool(row.semantic_available),
+        prompt_version=row.prompt_version,
+        model_used=row.model_used,
+    )
+    return MatchOutcome(
+        job_id=job_row.id, title=job_row.title, company=job_row.company_name,
+        result=result, semantic_call_made=False,
+    )
+
+
 def run_matching(
     session: Session,
     config: AppConfig,
@@ -112,6 +146,14 @@ def run_matching(
 
     `job_ids=None` matches every job currently in the `jobs` table. Pass an
     explicit list to match only specific jobs (e.g. newly discovered ones).
+
+    Cost control (Phase 16): before doing any real work for a job, checks
+    whether the LATEST existing `JobMatch` row for (job, candidate) was
+    computed under an identical cache key (same job content, same profile,
+    same scoring config — see `job_agent.matching.cache`). If so, that
+    row is reused as-is and NO new deterministic/LLM work happens for
+    that job this run — no new row is written either, since nothing about
+    it would differ.
     """
     llm = llm or NullLLMProvider()
     query = select(JobRow)
@@ -122,9 +164,24 @@ def run_matching(
     outcomes: list[MatchOutcome] = []
     for job_row in job_rows:
         try:
+            cache_key = compute_match_cache_key(profile, config, job_row)
+            existing = session.execute(
+                select(JobMatchRow)
+                .where(
+                    JobMatchRow.job_id == job_row.id, JobMatchRow.candidate_id == candidate_id
+                )
+                .order_by(JobMatchRow.created_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+            if existing is not None and existing.cache_key == cache_key:
+                outcomes.append(_outcome_from_cached_row(job_row, existing))
+                continue
+
             outcome = match_job(profile, config, job_row, llm)
             save_job_match(
-                session, job_id=job_row.id, candidate_id=candidate_id, result=outcome.result
+                session, job_id=job_row.id, candidate_id=candidate_id, result=outcome.result,
+                cache_key=cache_key,
             )
         except Exception as exc:  # noqa: BLE001
             # One malformed/unexpected job must never abort the whole batch —

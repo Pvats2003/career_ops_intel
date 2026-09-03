@@ -17,7 +17,12 @@ from job_agent.matching.schema import JobMatchResult
 
 
 def save_job_match(
-    session: Session, *, job_id: int, candidate_id: int, result: JobMatchResult
+    session: Session,
+    *,
+    job_id: int,
+    candidate_id: int,
+    result: JobMatchResult,
+    cache_key: str | None = None,
 ) -> JobMatch:
     row = JobMatch(
         job_id=job_id,
@@ -40,6 +45,7 @@ def save_job_match(
         reasoning=result.reasoning,
         prompt_version=result.prompt_version,
         model_used=result.model_used,
+        cache_key=cache_key,
     )
     session.add(row)
     session.flush()

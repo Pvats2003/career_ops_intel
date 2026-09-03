@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from job_agent.candidate.schema import (
     CandidateProfile,
@@ -24,7 +25,9 @@ from job_agent.candidate.schema import (
 )
 from job_agent.db.models import Job as JobRow
 from job_agent.db.models import JobMatch
+from job_agent.db.models import JobSource as JobSourceRow
 from job_agent.db.session import get_engine, get_session_factory, init_db
+from job_agent.jobs.notifications import generate_notifications
 from job_agent.web.app import create_app
 
 SYNTHETIC_VALUES = {
@@ -105,12 +108,30 @@ def _configure_env(tmp_path: Path, monkeypatch, real_config) -> Path:
     return db_path
 
 
-def _seed_job(db_path: Path, *, fingerprint: str) -> int:
+def _seed_job(
+    db_path: Path,
+    *,
+    fingerprint: str,
+    source_name: str | None = None,
+    lifecycle_status: str = "ACTIVE",
+    posted_at=None,
+) -> int:
     engine = get_engine(f"sqlite:///{db_path}")
     init_db(engine)
     factory = get_session_factory(engine)
     with factory() as session:
+        source_id = None
+        if source_name is not None:
+            source = session.execute(
+                select(JobSourceRow).where(JobSourceRow.name == source_name)
+            ).scalar_one_or_none()
+            if source is None:
+                source = JobSourceRow(name=source_name, kind="ats_api", enabled=True)
+                session.add(source)
+                session.flush()
+            source_id = source.id
         job = JobRow(
+            source_id=source_id,
             company_name="Acme Corp",
             title="Business Analyst",
             location="Remote",
@@ -123,6 +144,8 @@ def _seed_job(db_path: Path, *, fingerprint: str) -> int:
             job_fingerprint=fingerprint,
             description="Analyze business processes.",
             requirements="SQL, Excel",
+            lifecycle_status=lifecycle_status,
+            posted_at=posted_at,
         )
         session.add(job)
         session.flush()
@@ -326,7 +349,42 @@ def test_pipeline_delete_allowed_while_saved(tmp_path, monkeypatch, real_config)
 
     r = client.delete(f"/api/pipeline/{application_id}")
     assert r.status_code == 204
-    assert client.get("/api/pipeline").json() == []
+
+
+def test_follow_ups_empty_for_fresh_application(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="fresh-app")
+    application_id = client.post(f"/api/jobs/{job_id}/save").json()["application_id"]
+    client.patch(f"/api/pipeline/{application_id}", json={"pipeline_stage": "APPLIED"})
+
+    r = client.get("/api/pipeline/follow-ups")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_follow_ups_surfaces_stale_applied_application(tmp_path, monkeypatch, real_config):
+    from datetime import UTC, datetime, timedelta
+
+    from job_agent.db.models import Application
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="stale-app")
+    application_id = client.post(f"/api/jobs/{job_id}/save").json()["application_id"]
+    client.patch(f"/api/pipeline/{application_id}", json={"pipeline_stage": "APPLIED"})
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    with get_session_factory(engine)() as session:
+        application = session.get(Application, application_id)
+        application.updated_at = datetime.now(UTC) - timedelta(days=10)
+        session.commit()
+
+    r = client.get("/api/pipeline/follow-ups")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["application_id"] == application_id
+    assert body[0]["applied_days_ago"] >= 10
+    assert "follow-up" in body[0]["suggested_action"].lower()
 
 
 def test_analytics_reflects_pipeline_stage_counts(tmp_path, monkeypatch, real_config):
@@ -417,3 +475,407 @@ def test_spa_fallback_serves_index_for_client_routes(tmp_path, monkeypatch, real
 
     r = client.get("/api/this-route-does-not-exist")
     assert r.status_code == 404
+
+
+def test_duplicate_jobs_across_sources_show_as_one_canonical_entry(
+    tmp_path, monkeypatch, real_config
+):
+    """Two Job rows with the SAME fingerprint (same content, different
+    sources) must appear as ONE card, with the other source listed under
+    also_seen_on — never two separate cards (section 8)."""
+    from datetime import UTC, datetime, timedelta
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    older = datetime.now(UTC) - timedelta(days=2)
+    newer = datetime.now(UTC) - timedelta(hours=1)
+    _seed_job(
+        db_path, fingerprint="dup-fp", source_name="greenhouse", posted_at=older,
+    )
+    _seed_job(
+        db_path, fingerprint="dup-fp", source_name="lever", posted_at=newer,
+    )
+
+    r = client.get("/api/jobs")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    item = body["items"][0]
+    assert item["source_name"] == "lever"  # the freshest of the two
+    assert item["also_seen_on"] == ["greenhouse"]
+    assert item["duplicate_count"] == 1
+
+
+def test_inactive_jobs_excluded_by_default_included_on_request(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="active-job", lifecycle_status="ACTIVE")
+    _seed_job(db_path, fingerprint="closed-job", lifecycle_status="CLOSED")
+    _seed_job(db_path, fingerprint="expired-job", lifecycle_status="EXPIRED")
+
+    default_r = client.get("/api/jobs")
+    assert default_r.json()["total"] == 1
+
+    all_r = client.get("/api/jobs", params={"include_inactive": "true"})
+    assert all_r.json()["total"] == 3
+
+
+def test_top10_ranks_by_composite_score_not_match_alone(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    weak_job = _seed_job(db_path, fingerprint="weak")
+    strong_job = _seed_job(db_path, fingerprint="strong")
+    _seed_match(db_path, weak_job, candidate_id, overall_score=30, decision="SKIP")
+    _seed_match(db_path, strong_job, candidate_id, overall_score=95, decision="APPLY")
+
+    r = client.get("/api/jobs/top10")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 2
+    assert body[0]["job"]["id"] == strong_job
+    assert body[0]["rank_score"] >= body[1]["rank_score"]
+    assert body[0]["recommendation"] == "Apply today."
+
+
+def test_top10_excludes_closed_and_expired_jobs(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    active_job = _seed_job(db_path, fingerprint="active")
+    closed_job = _seed_job(db_path, fingerprint="closed", lifecycle_status="CLOSED")
+    _seed_match(db_path, active_job, candidate_id, overall_score=90, decision="APPLY")
+    _seed_match(db_path, closed_job, candidate_id, overall_score=99, decision="APPLY")
+
+    r = client.get("/api/jobs/top10")
+    ids = [item["job"]["id"] for item in r.json()]
+    assert active_job in ids
+    assert closed_job not in ids
+
+
+def test_apply_now_queue_only_includes_apply_decisions(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    apply_job = _seed_job(db_path, fingerprint="apply-me")
+    review_job = _seed_job(db_path, fingerprint="review-me")
+    _seed_match(db_path, apply_job, candidate_id, overall_score=95, decision="APPLY")
+    _seed_match(db_path, review_job, candidate_id, overall_score=70, decision="REVIEW")
+
+    r = client.get("/api/jobs/apply-now")
+    assert r.status_code == 200
+    ids = [item["job"]["id"] for item in r.json()]
+    assert apply_job in ids
+    assert review_job not in ids
+
+
+def test_tailor_resume_returns_deterministic_result_with_no_api_key(
+    tmp_path, monkeypatch, real_config
+):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="tailor-me")
+
+    r = client.post(f"/api/jobs/{job_id}/tailor-resume")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert body["generated_by"] == "deterministic"
+    assert body["professional_summary"]
+    assert isinstance(body["relevant_skills"], list)
+    assert isinstance(body["ats_keywords"], list)
+
+
+def test_tailor_resume_404_for_unknown_job(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.post("/api/jobs/999999/tailor-resume")
+    assert r.status_code == 404
+
+
+def test_cover_letter_is_job_specific_and_deterministic_with_no_api_key(
+    tmp_path, monkeypatch, real_config
+):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="cover-letter-me")
+
+    r = client.post(f"/api/jobs/{job_id}/cover-letter")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert body["generated_by"] == "deterministic"
+    assert "Business Analyst" in body["body"]
+    assert "Acme Corp" in body["body"]
+
+
+def test_cover_letter_404_for_unknown_job(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.post("/api/jobs/999999/cover-letter")
+    assert r.status_code == 404
+
+
+def test_assistant_grounds_answers_in_candidate_profile(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="assistant-me")
+
+    r = client.post(
+        f"/api/jobs/{job_id}/assistant",
+        json={"questions": ["What is your email address?", "What is your expected salary?"]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert len(body["answers"]) == 2
+    email_answer = body["answers"][0]
+    assert email_answer["answer"] == SYNTHETIC_VALUES["email"]
+    assert email_answer["requires_human"] is False
+    salary_answer = body["answers"][1]
+    assert salary_answer["answer"] is None
+    assert salary_answer["requires_human"] is True
+
+
+def test_assistant_404_for_unknown_job(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.post("/api/jobs/999999/assistant", json={"questions": ["What is your email?"]})
+    assert r.status_code == 404
+
+
+def test_assistant_rejects_empty_question_list(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="assistant-empty")
+    r = client.post(f"/api/jobs/{job_id}/assistant", json={"questions": []})
+    assert r.status_code == 422
+
+
+def test_companies_empty_by_default(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/companies")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_companies_aggregates_jobs_by_company_name(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_a = _seed_job(db_path, fingerprint="company-a-1")
+    job_b = _seed_job(db_path, fingerprint="company-a-2")
+
+    r = client.get("/api/companies")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["name"] == "Acme Corp"
+    assert body[0]["open_roles"] == 2
+    job_ids = {j["id"] for j in body[0]["matching_jobs"]}
+    assert job_ids == {job_a, job_b}
+    # No verified company data exists — never fabricated.
+    assert body[0]["industry"] is None
+    assert body[0]["size"] is None
+
+
+def test_company_fit_unknown_with_no_matches(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="no-match-co")
+
+    r = client.get("/api/companies")
+    body = r.json()
+    assert body[0]["company_fit"] is None
+
+
+def test_company_fit_reflects_real_match_scores(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="high-fit-co")
+    _seed_match(db_path, job_id, candidate_id, overall_score=95, decision="APPLY")
+
+    r = client.get("/api/companies")
+    body = r.json()
+    assert body[0]["company_fit"] is not None
+    assert body[0]["company_fit"] >= 80
+
+
+def test_get_company_by_id_returns_company(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="single-co")
+
+    r = client.get(f"/api/companies/{job_id}")
+    assert r.status_code == 200
+    assert r.json()["name"] == "Acme Corp"
+
+
+def test_get_company_404_for_unknown_id(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/companies/999999")
+    assert r.status_code == 404
+
+
+def test_watchlist_empty_by_default(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/watchlist")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_watchlist_add_list_delete(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+
+    r = client.post("/api/watchlist", json={"kind": "COMPANY", "value": "Acme Corp"})
+    assert r.status_code == 200
+    entry_id = r.json()["id"]
+    assert r.json()["kind"] == "COMPANY"
+    assert r.json()["value"] == "Acme Corp"
+
+    r = client.get("/api/watchlist")
+    assert len(r.json()) == 1
+
+    r = client.delete(f"/api/watchlist/{entry_id}")
+    assert r.status_code == 204
+
+    r = client.get("/api/watchlist")
+    assert r.json() == []
+
+
+def test_watchlist_rejects_invalid_kind(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.post("/api/watchlist", json={"kind": "INVALID", "value": "x"})
+    assert r.status_code == 422
+
+
+def test_watchlist_add_is_idempotent_for_same_kind_and_value(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    client.post("/api/watchlist", json={"kind": "ROLE", "value": "Business Analyst"})
+    client.post("/api/watchlist", json={"kind": "ROLE", "value": "Business Analyst"})
+    r = client.get("/api/watchlist")
+    assert len(r.json()) == 1
+
+
+def test_watchlist_delete_404_for_unknown_entry(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.delete("/api/watchlist/999999")
+    assert r.status_code == 404
+
+
+def test_notifications_empty_by_default(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/notifications")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_notifications_generated_from_high_match_and_marked_read(
+    tmp_path, monkeypatch, real_config
+):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="notif-me")
+    _seed_match(db_path, job_id, candidate_id, overall_score=95, decision="APPLY")
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    with get_session_factory(engine)() as session:
+        job = session.get(JobRow, job_id)
+        match = session.execute(
+            select(JobMatch).where(JobMatch.job_id == job_id)
+        ).scalar_one()
+        generate_notifications(session, candidate_id, [(job, match)], min_score=90)
+
+    r = client.get("/api/notifications")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["event_type"] == "HIGH_MATCH"
+    assert body[0]["read_at"] is None
+
+    notif_id = body[0]["id"]
+    r = client.post(f"/api/notifications/{notif_id}/read")
+    assert r.status_code == 200
+    assert r.json()["read_at"] is not None
+
+    r = client.get("/api/notifications", params={"unread_only": "true"})
+    assert r.json() == []
+
+
+def test_notifications_mark_read_404_for_unknown(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.post("/api/notifications/999999/read")
+    assert r.status_code == 404
+
+
+def test_search_preferences_default_when_no_row(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/settings/search-preferences")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["target_roles"] == []
+    assert body["min_match_score"] == 0
+    assert body["search_frequency_hours"] == 24
+    assert body["notification_min_score"] == 90
+    assert body["notification_frequency"] == "daily"
+
+
+def test_search_preferences_update_persists_and_merges(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+
+    r = client.put(
+        "/api/settings/search-preferences",
+        json={"target_roles": ["Business Analyst"], "min_match_score": 70},
+    )
+    assert r.status_code == 200
+    assert r.json()["target_roles"] == ["Business Analyst"]
+    assert r.json()["min_match_score"] == 70
+
+    # A second, partial update must not reset the first update's fields.
+    r = client.put(
+        "/api/settings/search-preferences", json={"notification_frequency": "weekly"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["target_roles"] == ["Business Analyst"]
+    assert body["min_match_score"] == 70
+    assert body["notification_frequency"] == "weekly"
+
+    r = client.get("/api/settings/search-preferences")
+    assert r.json()["target_roles"] == ["Business Analyst"]
+
+
+def test_supported_countries_lists_expected_set(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/settings/supported-countries")
+    assert r.status_code == 200
+    assert "India" in r.json()
+    assert "Remote" in r.json()
+
+
+def test_insights_empty_with_no_matched_jobs(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/candidate/insights")
+    assert r.status_code == 200
+    assert r.json() == {"categories": [], "summary": []}
+
+
+def test_insights_surfaces_notable_pattern_from_saved_jobs(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    saved_ids = []
+    for i in range(4):
+        job_id = _seed_job(db_path, fingerprint=f"remote-saved-{i}")
+        _seed_match(db_path, job_id, candidate_id, overall_score=80)
+        client.post(f"/api/jobs/{job_id}/save")
+        saved_ids.append(job_id)
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    with get_session_factory(engine)() as session:
+        for job_id in saved_ids:
+            job = session.get(JobRow, job_id)
+            job.remote_type = "remote"
+        session.commit()
+
+    for i in range(4):
+        job_id = _seed_job(db_path, fingerprint=f"onsite-ignored-{i}")
+        _seed_match(db_path, job_id, candidate_id, overall_score=80)
+        with get_session_factory(engine)() as session:
+            job = session.get(JobRow, job_id)
+            job.remote_type = "onsite"
+            session.commit()
+
+    r = client.get("/api/candidate/insights")
+    assert r.status_code == 200
+    body = r.json()
+    assert any("remote" in s.lower() for s in body["summary"])
+    remote_category = next(c for c in body["categories"] if c["category"] == "remote")
+    assert remote_category["saved"] == 4
