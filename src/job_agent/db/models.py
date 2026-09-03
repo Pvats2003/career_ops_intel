@@ -303,12 +303,28 @@ class Application(Base, TimestampMixin):
     row is required to also append an immutable `ApplicationEvent` row;
     this table holds current state, `application_events` holds history —
     the same split already used for `jobs`/`job_matches`.
+
+    `pipeline_stage` (Career OS web dashboard, section 13) is a SEPARATE
+    concern from `status` above and never read or written by anything in
+    `job_agent.applications.state_machine`/`service` — `status` tracks
+    what the SAFETY-GATED AUTOMATION has actually done (discovered,
+    prepared, submitted, verified...) and its transitions are guarded by
+    `state_machine.validate_transition`; `pipeline_stage` tracks where the
+    CANDIDATE'S OWN real-world recruiting process currently stands
+    (saved it, shortlisted it, applied by any means, in an assessment,
+    interviewing, an offer, rejected) and the human is free to move it in
+    any order from the dashboard — it is never used to gate or authorize
+    an automated action. Reusing this table (rather than a separate
+    SavedJob entity) means "save a job" and "track an application" are
+    the same row, so there is exactly one place a given job's pipeline
+    state lives.
     """
 
     __tablename__ = "applications"
     __table_args__ = (
         Index("ix_applications_status", "status"),
         Index("ix_applications_match_score", "match_score"),
+        Index("ix_applications_pipeline_stage", "pipeline_stage"),
         UniqueConstraint("job_id", "candidate_id", name="uq_applications_job_candidate"),
     )
 
@@ -329,6 +345,15 @@ class Application(Base, TimestampMixin):
     confirmation_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     screenshot_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- Career OS web dashboard (recruiting-pipeline tracking; see the
+    # class docstring's `pipeline_stage` note above) ---
+    pipeline_stage: Mapped[str] = mapped_column(String(32), default="SAVED")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recruiter_contact: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    interview_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    follow_up_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class ApplicationAnswer(Base, TimestampMixin):

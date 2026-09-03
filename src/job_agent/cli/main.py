@@ -1784,8 +1784,27 @@ def allowlist_list() -> None:
 
 
 @app.command()
-def dashboard() -> None:
-    _not_implemented("Phase 7 (Dashboard)")
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address for the web dashboard."),
+    port: int = typer.Option(8000, "--port", help="Port for the web dashboard."),
+    reload: bool = typer.Option(
+        False, "--reload", help="Auto-reload on source changes (development only)."
+    ),
+) -> None:
+    """Launch the Career OS web dashboard (Phase 7) — a FastAPI server
+    exposing the exact same candidate/job/matching/pipeline services every
+    other command here already uses (`job_agent.web.app`), plus the built
+    frontend if `web-ui/dist` exists (`cd web-ui && npm run build`).
+    During frontend development, run `npm run dev` in `web-ui/` separately
+    (it proxies API calls to this server) instead of relying on the built
+    `dist/` bundle here."""
+    import uvicorn
+
+    console.print(
+        f"[green]Career OS dashboard starting at[/green] http://{host}:{port} "
+        "(Ctrl+C to stop)"
+    )
+    uvicorn.run("job_agent.web.app:app", host=host, port=port, reload=reload)
 
 
 if __name__ == "__main__":
