@@ -333,7 +333,7 @@ def career_chat(
         {
             "title": r.job.title,
             "company": r.job.company_name,
-            "score": r.match.overall_score if r.match else None,
+            "score": int(r.match.overall_score) if r.match else None,
             "why": r.why[0] if r.why else r.recommendation,
         }
         for r in ranked

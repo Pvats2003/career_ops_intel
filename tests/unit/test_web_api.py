@@ -1357,6 +1357,23 @@ def test_career_chat_no_llm_grounds_answer_in_real_top_jobs(tmp_path, monkeypatc
     assert "Top" in " ".join(body["grounded_in"])
 
 
+def test_career_chat_score_formatted_as_clean_integer(tmp_path, monkeypatch, real_config):
+    """overall_score is stored as a float; every other view in the app
+    (job_view.match_out) displays it as a clean int ("88", never "88.0")
+    — the deterministic chat fallback must match, not leak the raw float
+    into a message discussing "your data, never generic advice"."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="chat-job-float-score")
+    _seed_match(db_path, job_id, candidate_id, overall_score=88, decision="APPLY")
+
+    r = client.post("/api/candidate/chat", json={"question": "What are the best jobs for me?"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "88/100" in body["answer"]
+    assert "88.0" not in body["answer"]
+
+
 def test_career_chat_honest_when_no_jobs_yet(tmp_path, monkeypatch, real_config):
     client, _ = _client(tmp_path, monkeypatch, real_config)
     r = client.post("/api/candidate/chat", json={"question": "What are the best jobs for me?"})
