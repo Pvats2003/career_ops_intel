@@ -25,7 +25,9 @@ from job_agent.applications.repository import get_or_create_application
 from job_agent.applications.schema import ApplicationQuestion
 from job_agent.candidate.learning import compute_learned_preferences
 from job_agent.config.loader import AppConfig
+from job_agent.db.models import Application as ApplicationRow
 from job_agent.db.models import Job as JobRow
+from job_agent.db.models import JobMatch as JobMatchRow
 from job_agent.db.models import JobSource as JobSourceRow
 from job_agent.db.models import SearchRun as SearchRunRow
 from job_agent.jobs.search_run import execute_search_run
@@ -264,14 +266,9 @@ def apply_now_queue(
     return [r for r in ranked if r.job.match is not None and r.job.match.decision == "APPLY"]
 
 
-@router.get("/{job_id}", response_model=JobDetailOut)
-def get_job(job_id: int, session: SessionDep, candidate: CandidateDep) -> JobDetailOut:
-    job = session.get(JobRow, job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"No job with id {job_id}.")
-    _, candidate_id = candidate
-    match_row = _latest_match(session, job.id, candidate_id)
-    application = _application_for(session, job.id, candidate_id)
+def _job_detail_out(
+    job: JobRow, match_row: JobMatchRow | None, application: ApplicationRow | None
+) -> JobDetailOut:
     base = _job_out(job, match_row, application)
     return JobDetailOut(
         **base.model_dump(),
@@ -281,6 +278,48 @@ def get_job(job_id: int, session: SessionDep, candidate: CandidateDep) -> JobDet
         visa_information=job.visa_information,
         company_url=job.company_url,
     )
+
+
+@router.get("/compare", response_model=list[JobDetailOut])
+def compare_jobs(
+    session: SessionDep,
+    candidate: CandidateDep,
+    ids: str = Query(..., description="Comma-separated job ids, e.g. '12,45,78'."),
+) -> list[JobDetailOut]:
+    """Part 3.10's job comparison view: the same JobDetailOut every other
+    view uses (match, data confidence, viability all included), just for
+    several jobs at once so the frontend can lay them out side by side —
+    never a second, separate comparison-specific computation."""
+    try:
+        job_ids = [int(part) for part in ids.split(",") if part.strip()]
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="ids must be comma-separated integers."
+        ) from exc
+    if not (2 <= len(job_ids) <= 6):
+        raise HTTPException(status_code=400, detail="Compare between 2 and 6 jobs at a time.")
+
+    _, candidate_id = candidate
+    results: list[JobDetailOut] = []
+    for job_id in job_ids:
+        job = session.get(JobRow, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"No job with id {job_id}.")
+        match_row = _latest_match(session, job.id, candidate_id)
+        application = _application_for(session, job.id, candidate_id)
+        results.append(_job_detail_out(job, match_row, application))
+    return results
+
+
+@router.get("/{job_id}", response_model=JobDetailOut)
+def get_job(job_id: int, session: SessionDep, candidate: CandidateDep) -> JobDetailOut:
+    job = session.get(JobRow, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"No job with id {job_id}.")
+    _, candidate_id = candidate
+    match_row = _latest_match(session, job.id, candidate_id)
+    application = _application_for(session, job.id, candidate_id)
+    return _job_detail_out(job, match_row, application)
 
 
 @router.post("/{job_id}/save", response_model=JobDetailOut)
@@ -299,15 +338,7 @@ def save_job(
     )
     session.commit()
     match_row = _latest_match(session, job.id, candidate_id)
-    base = _job_out(job, match_row, application)
-    return JobDetailOut(
-        **base.model_dump(),
-        description=job.description,
-        requirements=job.requirements,
-        preferred_qualifications=job.preferred_qualifications,
-        visa_information=job.visa_information,
-        company_url=job.company_url,
-    )
+    return _job_detail_out(job, match_row, application)
 
 
 @router.post("/{job_id}/check-url", response_model=URLCheckResultOut)

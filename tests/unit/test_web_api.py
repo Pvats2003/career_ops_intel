@@ -359,6 +359,56 @@ def test_get_job_detail_404_for_missing_job(tmp_path, monkeypatch, real_config):
     assert r.status_code == 404
 
 
+def test_compare_jobs_returns_full_detail_for_each(tmp_path, monkeypatch, real_config):
+    """Part 3.10: comparing jobs must use the exact same JobDetailOut every
+    other view uses — same match, confidence, and viability — never a
+    second, separate comparison computation."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    id_a = _seed_job(db_path, fingerprint="compare-a")
+    id_b = _seed_job(db_path, fingerprint="compare-b")
+    _seed_match(db_path, id_a, candidate_id, overall_score=91, decision="APPLY")
+    _seed_match(db_path, id_b, candidate_id, overall_score=60, decision="REVIEW")
+
+    r = client.get("/api/jobs/compare", params={"ids": f"{id_a},{id_b}"})
+    assert r.status_code == 200
+    body = r.json()
+    assert {j["id"] for j in body} == {id_a, id_b}
+    by_id = {j["id"]: j for j in body}
+    assert by_id[id_a]["match"]["overall_score"] == 91
+    assert by_id[id_b]["match"]["overall_score"] == 60
+    assert "data_confidence" in by_id[id_a]
+    assert "viability" in by_id[id_a]
+
+
+def test_compare_jobs_requires_at_least_two_ids(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="only-one")
+    r = client.get("/api/jobs/compare", params={"ids": str(job_id)})
+    assert r.status_code == 400
+
+
+def test_compare_jobs_rejects_more_than_six(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    ids = [_seed_job(db_path, fingerprint=f"compare-many-{i}") for i in range(7)]
+    r = client.get("/api/jobs/compare", params={"ids": ",".join(str(i) for i in ids)})
+    assert r.status_code == 400
+
+
+def test_compare_jobs_404_when_any_id_missing(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="compare-real")
+    r = client.get("/api/jobs/compare", params={"ids": f"{job_id},999999"})
+    assert r.status_code == 404
+
+
+def test_compare_jobs_rejects_malformed_ids(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/jobs/compare", params={"ids": "12,not-a-number"})
+    assert r.status_code == 400
+
+
 def test_save_job_creates_pipeline_entry_at_saved(tmp_path, monkeypatch, real_config):
     client, db_path = _client(tmp_path, monkeypatch, real_config)
     job_id = _seed_job(db_path, fingerprint="save-me")

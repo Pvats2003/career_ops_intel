@@ -1,8 +1,11 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { api, ApiError } from '../api'
 import { JobCard } from '../components/JobCard'
+import { JobCompare } from '../components/JobCompare'
 import { Button, EmptyState, ErrorBanner, LoadingState } from '../components/ui'
 import type { JobListOut } from '../types'
+
+const MAX_COMPARE = 6
 
 const SORTS = [
   { value: 'match', label: 'Best match' },
@@ -21,6 +24,16 @@ export default function Jobs() {
   const [location, setLocation] = useState('')
   const [company, setCompany] = useState('')
   const [sort, setSort] = useState('match')
+
+  const [compareIds, setCompareIds] = useState<number[]>([])
+  const [showCompare, setShowCompare] = useState(false)
+  const toggleCompare = (id: number) => {
+    setCompareIds((prev) => {
+      if (prev.includes(id)) return prev.filter((x) => x !== id)
+      if (prev.length >= MAX_COMPARE) return prev
+      return [...prev, id]
+    })
+  }
 
   const load = () => {
     setLoading(true)
@@ -104,6 +117,26 @@ export default function Jobs() {
         </Button>
       </div>
 
+      {compareIds.length >= 2 && !showCompare && (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm dark:border-indigo-900 dark:bg-indigo-900/20">
+          <span className="text-indigo-800 dark:text-indigo-200">
+            {compareIds.length} job{compareIds.length === 1 ? '' : 's'} selected to compare
+          </span>
+          <div className="flex gap-2">
+            <Button variant="primary" onClick={() => setShowCompare(true)}>
+              Compare
+            </Button>
+            <Button variant="ghost" onClick={() => setCompareIds([])}>
+              Clear
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {showCompare && compareIds.length >= 2 && (
+        <JobCompare jobIds={compareIds} onClose={() => setShowCompare(false)} />
+      )}
+
       {error && <ErrorBanner message={error} />}
       {loading && <LoadingState />}
 
@@ -120,7 +153,13 @@ export default function Jobs() {
           ) : (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               {data.items.map((job) => (
-                <JobCard key={job.id} job={job} onSave={() => api.saveJob(job.id).then(load)} />
+                <JobCard
+                  key={job.id}
+                  job={job}
+                  onSave={() => api.saveJob(job.id).then(load)}
+                  compareSelected={compareIds.includes(job.id)}
+                  onToggleCompare={toggleCompare}
+                />
               ))}
             </div>
           )}

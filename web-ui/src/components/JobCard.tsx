@@ -14,26 +14,41 @@ export function JobCard({
   job,
   onSave,
   saving,
+  compareSelected,
+  onToggleCompare,
 }: {
   job: JobOut
   onSave?: (id: number) => void
   saving?: boolean
+  compareSelected?: boolean
+  onToggleCompare?: (id: number) => void
 }) {
   const salary = formatSalary(job)
   return (
     <Card className="flex flex-col gap-3 p-5">
       <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <Link
-            to={`/jobs/${job.id}`}
-            className="block truncate text-base font-semibold text-slate-900 hover:text-indigo-600 dark:text-slate-50 dark:hover:text-indigo-400"
-          >
-            {job.title}
-          </Link>
-          <div className="mt-0.5 truncate text-sm text-slate-600 dark:text-slate-400">
-            {job.company_name}
-            {job.location ? ` · ${job.location}` : ''}
-            {job.remote_type ? ` · ${job.remote_type}` : ''}
+        <div className="flex min-w-0 items-start gap-2.5">
+          {onToggleCompare && (
+            <input
+              type="checkbox"
+              checked={!!compareSelected}
+              onChange={() => onToggleCompare(job.id)}
+              title="Select to compare"
+              className="mt-1 h-4 w-4 shrink-0 rounded border-slate-300 text-indigo-600 dark:border-slate-600"
+            />
+          )}
+          <div className="min-w-0">
+            <Link
+              to={`/jobs/${job.id}`}
+              className="block truncate text-base font-semibold text-slate-900 hover:text-indigo-600 dark:text-slate-50 dark:hover:text-indigo-400"
+            >
+              {job.title}
+            </Link>
+            <div className="mt-0.5 truncate text-sm text-slate-600 dark:text-slate-400">
+              {job.company_name}
+              {job.location ? ` · ${job.location}` : ''}
+              {job.remote_type ? ` · ${job.remote_type}` : ''}
+            </div>
           </div>
         </div>
         {job.match && <ScoreRing score={job.match.overall_score} />}
