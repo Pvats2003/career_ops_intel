@@ -46,6 +46,26 @@ export function JobCard({
         {salary && (
           <span className="text-xs font-medium text-slate-600 dark:text-slate-300">{salary}</span>
         )}
+        {job.data_confidence.level === 'Medium' && (
+          <span
+            title={job.data_confidence.reasons.join('; ')}
+            className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-300"
+          >
+            Medium confidence
+          </span>
+        )}
+        {job.viability.overall !== 'VIABLE' && (
+          <span
+            title={job.viability.reasons.join('; ')}
+            className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+              job.viability.overall === 'BLOCKED'
+                ? 'bg-rose-50 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300'
+                : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
+            }`}
+          >
+            {job.viability.overall === 'BLOCKED' ? 'Not viable to apply' : 'Viability caution'}
+          </span>
+        )}
       </div>
 
       {job.match && job.match.reasoning && (

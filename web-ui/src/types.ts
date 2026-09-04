@@ -20,6 +20,28 @@ export interface MatchOut {
   semantic_available: boolean
 }
 
+export interface DataConfidenceOut {
+  level: 'High' | 'Medium'
+  reasons: string[]
+}
+
+export interface ApplicationViabilityOut {
+  url_exists: boolean
+  direct_application: boolean
+  job_active: boolean
+  qualifications_status: 'MEETS' | 'GAPS' | 'UNKNOWN'
+  location_compatible: boolean | null
+  visa_info_available: boolean
+  overall: 'VIABLE' | 'CAUTION' | 'BLOCKED'
+  reasons: string[]
+}
+
+export interface URLCheckResultOut {
+  status: 'REACHABLE' | 'UNREACHABLE' | 'UNKNOWN'
+  detail: string
+  checked_at: string
+}
+
 export interface JobOut {
   id: number
   title: string
@@ -42,6 +64,8 @@ export interface JobOut {
   lifecycle_status: string
   also_seen_on: string[]
   duplicate_count: number
+  data_confidence: DataConfidenceOut
+  viability: ApplicationViabilityOut
 }
 
 export interface JobDetailOut extends JobOut {

@@ -9,6 +9,7 @@ or real `candidate/` files.
 from __future__ import annotations
 
 import shutil
+from datetime import UTC
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -60,12 +61,16 @@ def _synthetic_identity_profile() -> CandidateProfile:
             open_to_countries=unknown_pref,
         ),
         salary_preferences=SalaryPreferences(
-            currency=unknown_pref, minimum_annual=unknown_pref,
-            target_annual=unknown_pref, negotiable=unknown_pref,
+            currency=unknown_pref,
+            minimum_annual=unknown_pref,
+            target_annual=unknown_pref,
+            negotiable=unknown_pref,
         ),
         visa_information=VisaInformation(
-            nationality=unknown_pref, requires_sponsorship_us=unknown_pref,
-            requires_sponsorship_uk=unknown_pref, requires_sponsorship_eu=unknown_pref,
+            nationality=unknown_pref,
+            requires_sponsorship_us=unknown_pref,
+            requires_sponsorship_uk=unknown_pref,
+            requires_sponsorship_eu=unknown_pref,
             requires_sponsorship_other=unknown_pref,
         ),
     )
@@ -83,7 +88,11 @@ def _make_synthetic_candidate_dir(candidate_dir: Path) -> Path:
         f"linkedin: {SYNTHETIC_VALUES['linkedin_url']}\n"
     )
     for filename in (
-        "experience.md", "projects.md", "skills.md", "education.md", "achievements.md",
+        "experience.md",
+        "projects.md",
+        "skills.md",
+        "education.md",
+        "achievements.md",
     ):
         (candidate_dir / filename).write_text("")
     (candidate_dir / "answers").mkdir(exist_ok=True)
@@ -174,8 +183,13 @@ def _seed_match(
                 candidate_id=candidate_id,
                 overall_score=overall_score,
                 decision=decision,
-                skills_match=80, experience_match=70, role_match=90, project_match=60,
-                education_match=100, location_match=100, seniority_match=80,
+                skills_match=80,
+                experience_match=70,
+                role_match=90,
+                project_match=60,
+                education_match=100,
+                location_match=100,
+                seniority_match=80,
                 eligibility_match=100,
                 reasoning="Strong overlap with stated skills.",
                 semantic_available=False,
@@ -248,6 +262,80 @@ def test_list_jobs_and_match_serialization(tmp_path, monkeypatch, real_config):
     assert item["match"]["decision"] == "APPLY"
     assert item["pipeline_stage"] is None
     assert item["application_id"] is None
+
+
+def test_job_out_carries_data_confidence_and_viability(tmp_path, monkeypatch, real_config):
+    """Part 3.8/3.9: every JobOut carries confidence in the DATA (separate
+    from the match score) and a practical application-viability read —
+    computed honestly from the actual stored fields, not fabricated."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    job_id = _seed_job(db_path, fingerprint="job-confidence")
+    _seed_match(db_path, job_id, candidate_id, overall_score=91, decision="APPLY")
+
+    item = client.get("/api/jobs").json()["items"][0]
+
+    # _seed_job never sets posted_at or a company link, so confidence must
+    # honestly report Medium — never a fabricated High next to those gaps.
+    assert item["data_confidence"]["level"] == "Medium"
+    assert any("posting date" in r.lower() for r in item["data_confidence"]["reasons"])
+    assert any("company" in r.lower() for r in item["data_confidence"]["reasons"])
+
+    # _seed_job has an application_url + ACTIVE lifecycle, and the match
+    # above has no hard-stop/missing requirements and a perfect
+    # location_match — so viability should be clean.
+    assert item["viability"]["url_exists"] is True
+    assert item["viability"]["job_active"] is True
+    assert item["viability"]["qualifications_status"] == "MEETS"
+    assert item["viability"]["location_compatible"] is True
+    assert item["viability"]["overall"] == "VIABLE"
+
+
+def test_check_url_endpoint_reports_live_reachability(tmp_path, monkeypatch, real_config):
+    """The one live network check in viability — kept out of unit-test
+    reach by monkeypatching the router's check_application_url so this
+    test never makes a real request."""
+    from datetime import datetime
+
+    from job_agent.jobs.url_check import URLCheckResult
+    from job_agent.web.routers import jobs as jobs_router
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="job-url-check")
+
+    monkeypatch.setattr(
+        jobs_router,
+        "check_application_url",
+        lambda url, **_: URLCheckResult("REACHABLE", "HTTP 200", datetime.now(UTC)),
+    )
+
+    r = client.post(f"/api/jobs/{job_id}/check-url")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "REACHABLE"
+    assert body["detail"] == "HTTP 200"
+
+
+def test_check_url_endpoint_404_for_missing_job(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.post("/api/jobs/999999/check-url")
+    assert r.status_code == 404
+
+
+def test_check_url_endpoint_400_when_no_application_url(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="job-no-url")
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    factory = get_session_factory(engine)
+    with factory() as session:
+        job = session.get(JobRow, job_id)
+        job.application_url = None
+        session.commit()
+
+    r = client.post(f"/api/jobs/{job_id}/check-url")
+    assert r.status_code == 400
 
 
 def test_list_jobs_filters_by_min_score(tmp_path, monkeypatch, real_config):
@@ -445,7 +533,8 @@ def test_resume_upload_accepts_valid_docx(tmp_path, monkeypatch, real_config):
         "/api/candidate/resume",
         files={
             "file": (
-                "resume.docx", buf,
+                "resume.docx",
+                buf,
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         },
@@ -474,7 +563,7 @@ def test_spa_fallback_serves_index_for_client_routes(tmp_path, monkeypatch, real
     for path in ("/pipeline", "/jobs/5", "/resume", "/analytics"):
         r = client.get(path)
         assert r.status_code == 200, path
-        assert "<div id=\"root\">" in r.text
+        assert '<div id="root">' in r.text
 
     r = client.get("/api/this-route-does-not-exist")
     assert r.status_code == 404
@@ -492,10 +581,16 @@ def test_duplicate_jobs_across_sources_show_as_one_canonical_entry(
     older = datetime.now(UTC) - timedelta(days=2)
     newer = datetime.now(UTC) - timedelta(hours=1)
     _seed_job(
-        db_path, fingerprint="dup-fp", source_name="greenhouse", posted_at=older,
+        db_path,
+        fingerprint="dup-fp",
+        source_name="greenhouse",
+        posted_at=older,
     )
     _seed_job(
-        db_path, fingerprint="dup-fp", source_name="lever", posted_at=newer,
+        db_path,
+        fingerprint="dup-fp",
+        source_name="lever",
+        posted_at=newer,
     )
 
     r = client.get("/api/jobs")
@@ -771,9 +866,7 @@ def test_notifications_generated_from_high_match_and_marked_read(
     engine = get_engine(f"sqlite:///{db_path}")
     with get_session_factory(engine)() as session:
         job = session.get(JobRow, job_id)
-        match = session.execute(
-            select(JobMatch).where(JobMatch.job_id == job_id)
-        ).scalar_one()
+        match = session.execute(select(JobMatch).where(JobMatch.job_id == job_id)).scalar_one()
         generate_notifications(session, candidate_id, [(job, match)], min_score=90)
 
     r = client.get("/api/notifications")
@@ -822,9 +915,7 @@ def test_search_preferences_update_persists_and_merges(tmp_path, monkeypatch, re
     assert r.json()["min_match_score"] == 70
 
     # A second, partial update must not reset the first update's fields.
-    r = client.put(
-        "/api/settings/search-preferences", json={"notification_frequency": "weekly"}
-    )
+    r = client.put("/api/settings/search-preferences", json={"notification_frequency": "weekly"})
     assert r.status_code == 200
     body = r.json()
     assert body["target_roles"] == ["Business Analyst"]

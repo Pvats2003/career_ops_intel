@@ -30,6 +30,7 @@ from job_agent.db.models import JobSource as JobSourceRow
 from job_agent.db.models import SearchRun as SearchRunRow
 from job_agent.jobs.search_run import execute_search_run
 from job_agent.jobs.service import build_sources, run_scan
+from job_agent.jobs.url_check import check_application_url
 from job_agent.llm.provider import build_llm_provider
 from job_agent.matching.ranking import rank_jobs
 from job_agent.matching.service import run_matching
@@ -52,6 +53,7 @@ from job_agent.web.schemas import (
     ScanSourceResultOut,
     SearchRunOut,
     TailoredResumeOut,
+    URLCheckResultOut,
 )
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -148,18 +150,21 @@ def list_jobs(
 
         items.append(
             _job_out(
-                job, match_row, application,
+                job,
+                match_row,
+                application,
                 source_name=source_names.get(job.source_id, None) if job.source_id else None,
-                also_seen_on=also_seen_on, duplicate_count=duplicate_count,
+                also_seen_on=also_seen_on,
+                duplicate_count=duplicate_count,
             )
         )
 
     if sort == "match":
-        items.sort(key=lambda j: (j.match.overall_score if j.match else -1), reverse=True)
+        items.sort(key=lambda j: j.match.overall_score if j.match else -1, reverse=True)
     elif sort == "newest":
         items.sort(key=lambda j: j.posted_at or j.discovered_at, reverse=True)
     elif sort == "salary":
-        items.sort(key=lambda j: (j.salary_max or j.salary_min or 0), reverse=True)
+        items.sort(key=lambda j: j.salary_max or j.salary_min or 0, reverse=True)
     elif sort == "company":
         items.sort(key=lambda j: j.company_name.lower())
 
@@ -170,10 +175,17 @@ def list_jobs(
 
 def _search_run_out(run: SearchRunRow) -> SearchRunOut:
     return SearchRunOut(
-        id=run.id, started_at=run.started_at, completed_at=run.completed_at,
-        sources=list(run.sources), queries=list(run.queries), jobs_found=run.jobs_found,
-        duplicates_removed=run.duplicates_removed, expired_removed=run.expired_removed,
-        qualified=run.qualified, errors=list(run.errors), status=run.status,
+        id=run.id,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+        sources=list(run.sources),
+        queries=list(run.queries),
+        jobs_found=run.jobs_found,
+        duplicates_removed=run.duplicates_removed,
+        expired_removed=run.expired_removed,
+        qualified=run.qualified,
+        errors=list(run.errors),
+        status=run.status,
     )
 
 
@@ -222,7 +234,9 @@ def _ranked_jobs(
         out.append(
             RankedJobOut(
                 job=_job_out(r.job, r.match, application),
-                rank_score=r.rank_score, why=list(r.why), gaps=list(r.gaps),
+                rank_score=r.rank_score,
+                why=list(r.why),
+                gaps=list(r.gaps),
                 recommendation=r.recommendation,
             )
         )
@@ -296,6 +310,24 @@ def save_job(
     )
 
 
+@router.post("/{job_id}/check-url", response_model=URLCheckResultOut)
+def check_url(job_id: int, session: SessionDep) -> URLCheckResultOut:
+    """The one live, on-demand part of application viability (Part 3.9's
+    "URL works"): a single real outbound request against this job's
+    application_url, triggered explicitly rather than on every page load
+    (see `job_agent.jobs.url_check` for why). Never fabricates a result —
+    a timeout or connection failure comes back UNKNOWN, not "broken"."""
+    job = session.get(JobRow, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"No job with id {job_id}.")
+    if not job.application_url:
+        raise HTTPException(status_code=400, detail="This job has no application URL to check.")
+    result = check_application_url(job.application_url)
+    return URLCheckResultOut(
+        status=result.status, detail=result.detail, checked_at=result.checked_at
+    )
+
+
 @router.post("/{job_id}/tailor-resume", response_model=TailoredResumeOut)
 def tailor_resume(
     job_id: int, session: SessionDep, candidate: CandidateDep, config: ConfigDep
@@ -313,8 +345,13 @@ def tailor_resume(
     profile, _candidate_id = candidate
     llm = build_llm_provider(config)
     result = tailor_resume_for_job(
-        profile, None, job_title=job.title, job_company=job.company_name,
-        job_description=job.description, job_requirements=job.requirements, llm=llm,
+        profile,
+        None,
+        job_title=job.title,
+        job_company=job.company_name,
+        job_description=job.description,
+        job_requirements=job.requirements,
+        llm=llm,
     )
     return TailoredResumeOut(
         job_id=job_id,
@@ -344,11 +381,16 @@ def cover_letter(
     profile, _candidate_id = candidate
     llm = build_llm_provider(config)
     result = generate_cover_letter(
-        profile, job_title=job.title, job_company=job.company_name,
-        job_description=job.description, llm=llm,
+        profile,
+        job_title=job.title,
+        job_company=job.company_name,
+        job_description=job.description,
+        llm=llm,
     )
     return CoverLetterOut(
-        job_id=job_id, body=result.body, notes=list(result.notes),
+        job_id=job_id,
+        body=result.body,
+        notes=list(result.notes),
         generated_by=result.generated_by,
     )
 

@@ -10,8 +10,10 @@ from sqlalchemy.orm import Session
 
 from job_agent.db.models import Application, JobMatch
 from job_agent.db.models import Job as JobRow
+from job_agent.jobs.confidence import assess_data_confidence
 from job_agent.jobs.schema import FreshnessStatus
-from job_agent.web.schemas import JobOut, MatchOut
+from job_agent.jobs.viability import assess_application_viability
+from job_agent.web.schemas import ApplicationViabilityOut, DataConfidenceOut, JobOut, MatchOut
 
 FRESHNESS_LABELS: dict[str, str] = {
     FreshnessStatus.JUST_POSTED.value: "Posted within hours",
@@ -96,6 +98,8 @@ def job_out(
     also_seen_on: list[str] | None = None,
     duplicate_count: int = 0,
 ) -> JobOut:
+    confidence = assess_data_confidence(job)
+    viability = assess_application_viability(job, match_row)
     return JobOut(
         id=job.id,
         title=job.title,
@@ -118,4 +122,15 @@ def job_out(
         lifecycle_status=job.lifecycle_status,
         also_seen_on=also_seen_on or [],
         duplicate_count=duplicate_count,
+        data_confidence=DataConfidenceOut(level=confidence.level, reasons=confidence.reasons),
+        viability=ApplicationViabilityOut(
+            url_exists=viability.url_exists,
+            direct_application=viability.direct_application,
+            job_active=viability.job_active,
+            qualifications_status=viability.qualifications_status,
+            location_compatible=viability.location_compatible,
+            visa_info_available=viability.visa_info_available,
+            overall=viability.overall,
+            reasons=viability.reasons,
+        ),
     )

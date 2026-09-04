@@ -15,6 +15,7 @@ import type {
   CoverLetterOut,
   JobDetailOut,
   TailoredResumeOut,
+  URLCheckResultOut,
 } from '../types'
 
 const MATCH_ROWS: { key: keyof NonNullable<JobDetailOut['match']>; label: string }[] = [
@@ -80,6 +81,7 @@ export default function JobDetail() {
               <span className="text-xs text-slate-500 dark:text-slate-400">
                 {job.freshness_label}
               </span>
+              <DataConfidenceBadge confidence={job.data_confidence} />
             </div>
           </div>
           {job.match && <ScoreRing score={job.match.overall_score} />}
@@ -152,6 +154,8 @@ export default function JobDetail() {
         </Card>
       )}
 
+      <ViabilityPanel job={job} />
+
       <TailorResumePanel jobId={job.id} />
       <CoverLetterPanel jobId={job.id} />
       <AssistantPanel jobId={job.id} />
@@ -179,6 +183,125 @@ export default function JobDetail() {
         </Card>
       )}
     </div>
+  )
+}
+
+function DataConfidenceBadge({ confidence }: { confidence: JobDetailOut['data_confidence'] }) {
+  const isHigh = confidence.level === 'High'
+  return (
+    <span
+      title={confidence.reasons.join('; ') || 'All key fields verified from the source.'}
+      className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+        isHigh
+          ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'
+          : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
+      }`}
+    >
+      Data confidence: {confidence.level}
+    </span>
+  )
+}
+
+const VIABILITY_STYLES: Record<string, string> = {
+  VIABLE: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
+  CAUTION: 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
+  BLOCKED: 'bg-rose-50 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300',
+}
+
+function ViabilityCheck({ label, ok }: { label: string; ok: boolean | null }) {
+  const icon = ok === null ? '—' : ok ? '✓' : '✗'
+  const color =
+    ok === null
+      ? 'text-slate-400 dark:text-slate-500'
+      : ok
+        ? 'text-emerald-600 dark:text-emerald-400'
+        : 'text-rose-600 dark:text-rose-400'
+  return (
+    <div className="flex items-center gap-2 text-sm">
+      <span className={`w-4 font-semibold ${color}`}>{icon}</span>
+      <span className="text-slate-700 dark:text-slate-300">{label}</span>
+    </div>
+  )
+}
+
+function ViabilityPanel({ job }: { job: JobDetailOut }) {
+  const v = job.viability
+  const [checking, setChecking] = useState(false)
+  const [urlResult, setUrlResult] = useState<URLCheckResultOut | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const checkUrl = async () => {
+    setChecking(true)
+    setError(null)
+    try {
+      setUrlResult(await api.checkUrl(job.id))
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : 'Could not check the URL.')
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  return (
+    <Card className="p-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-50">
+          Application viability
+        </h2>
+        <span
+          className={`rounded-full px-2.5 py-1 text-xs font-semibold ${VIABILITY_STYLES[v.overall]}`}
+        >
+          {v.overall}
+        </span>
+      </div>
+
+      <div className="mt-4 grid grid-cols-1 gap-y-2 sm:grid-cols-2">
+        <ViabilityCheck label="Application URL exists" ok={v.url_exists} />
+        <ViabilityCheck label="Direct application available" ok={v.direct_application} />
+        <ViabilityCheck label="Job still active" ok={v.job_active} />
+        <ViabilityCheck
+          label="Required qualifications"
+          ok={v.qualifications_status === 'UNKNOWN' ? null : v.qualifications_status === 'MEETS'}
+        />
+        <ViabilityCheck label="Location compatible" ok={v.location_compatible} />
+        <ViabilityCheck label="Visa information provided" ok={v.visa_info_available} />
+      </div>
+
+      {v.reasons.length > 0 && (
+        <ul className="mt-4 list-inside list-disc text-sm text-slate-500 dark:text-slate-400">
+          {v.reasons.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      )}
+
+      {job.application_url && (
+        <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4 dark:border-slate-800">
+          <Button variant="ghost" onClick={checkUrl} disabled={checking}>
+            {checking ? 'Checking…' : 'Check application URL is live'}
+          </Button>
+          {urlResult && (
+            <span
+              className={`text-sm ${
+                urlResult.status === 'REACHABLE'
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : urlResult.status === 'UNREACHABLE'
+                    ? 'text-rose-600 dark:text-rose-400'
+                    : 'text-slate-500 dark:text-slate-400'
+              }`}
+            >
+              {urlResult.status === 'REACHABLE'
+                ? 'Reachable'
+                : urlResult.status === 'UNREACHABLE'
+                  ? 'Not reachable'
+                  : 'Could not verify (no result either way)'}{' '}
+              — {urlResult.detail}
+            </span>
+          )}
+          {error && <span className="text-sm text-rose-600 dark:text-rose-400">{error}</span>}
+        </div>
+      )}
+    </Card>
   )
 }
 

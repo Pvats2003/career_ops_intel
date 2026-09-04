@@ -26,6 +26,7 @@ import type {
   SearchRunOut,
   SkillGapEntryOut,
   TailoredResumeOut,
+  URLCheckResultOut,
   WatchlistEntryIn,
   WatchlistEntryOut,
 } from './types'
@@ -81,6 +82,7 @@ export const api = {
   },
   getJob: (id: number) => request<JobDetailOut>(`/jobs/${id}`),
   saveJob: (id: number) => request<JobDetailOut>(`/jobs/${id}/save`, { method: 'POST' }),
+  checkUrl: (id: number) => request<URLCheckResultOut>(`/jobs/${id}/check-url`, { method: 'POST' }),
   scanJobs: () => request<ScanRunOut>('/jobs/scan', { method: 'POST' }),
   matchJobs: () => request<MatchRunOut>('/jobs/match', { method: 'POST' }),
   runSearch: () => request<SearchRunOut>('/jobs/search-run', { method: 'POST' }),

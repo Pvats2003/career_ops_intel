@@ -70,6 +70,37 @@ class MatchOut(BaseModel):
     semantic_available: bool
 
 
+class DataConfidenceOut(BaseModel):
+    """Confidence in the underlying DATA, separate from the match score —
+    Career OS FINAL GOD MODE Part 3.8. Prevents false precision: a 91
+    match score built on an unverified posting date and no salary is
+    still a 91, but the candidate should know which facts are shaky."""
+
+    level: str  # "High" | "Medium"
+    reasons: list[str]
+
+
+class ApplicationViabilityOut(BaseModel):
+    """Practical, mechanical readiness to apply — Part 3.9. Computed
+    entirely from stored data (no live network check); see
+    `URLCheckResultOut` for the one live check, triggered on demand."""
+
+    url_exists: bool
+    direct_application: bool
+    job_active: bool
+    qualifications_status: str  # "MEETS" | "GAPS" | "UNKNOWN"
+    location_compatible: bool | None
+    visa_info_available: bool
+    overall: str  # "VIABLE" | "CAUTION" | "BLOCKED"
+    reasons: list[str]
+
+
+class URLCheckResultOut(BaseModel):
+    status: str  # "REACHABLE" | "UNREACHABLE" | "UNKNOWN"
+    detail: str
+    checked_at: datetime
+
+
 class JobOut(BaseModel):
     id: int
     title: str
@@ -96,6 +127,8 @@ class JobOut(BaseModel):
     # carried this same posting — never a separate card in the UI.
     also_seen_on: list[str]
     duplicate_count: int
+    data_confidence: DataConfidenceOut
+    viability: ApplicationViabilityOut
 
 
 class JobDetailOut(JobOut):
@@ -403,8 +436,18 @@ class SearchPreferencesIn(BaseModel):
 
 
 SUPPORTED_COUNTRIES: tuple[str, ...] = (
-    "India", "USA", "Canada", "UK", "Germany", "Netherlands", "Ireland",
-    "Singapore", "UAE", "Australia", "Remote", "Worldwide",
+    "India",
+    "USA",
+    "Canada",
+    "UK",
+    "Germany",
+    "Netherlands",
+    "Ireland",
+    "Singapore",
+    "UAE",
+    "Australia",
+    "Remote",
+    "Worldwide",
 )
 
 
