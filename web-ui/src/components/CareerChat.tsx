@@ -52,7 +52,7 @@ export function CareerChat() {
         advice.
       </p>
 
-      <div className="mt-3 flex gap-2">
+      <div className="mt-3 flex flex-col gap-2 sm:flex-row">
         <input
           type="text"
           value={question}
@@ -61,7 +61,11 @@ export function CareerChat() {
           placeholder="e.g. What are the best jobs for me today?"
           className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
         />
-        <Button variant="secondary" onClick={() => ask(question)} disabled={loading || !question.trim()}>
+        <Button
+          variant="secondary"
+          onClick={() => ask(question)}
+          disabled={loading || !question.trim()}
+        >
           {loading ? 'Thinking…' : 'Ask'}
         </Button>
       </div>

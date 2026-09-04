@@ -69,30 +69,37 @@ export default function Analytics() {
             />
           </div>
         ) : (
-          <table className="mt-3 w-full text-left text-sm">
-            <thead>
-              <tr className="text-xs text-slate-500 dark:text-slate-400">
-                <th className="pb-2 font-medium">Company</th>
-                <th className="pb-2 font-medium">Applications</th>
-                <th className="pb-2 font-medium">Interviews</th>
-                <th className="pb-2 font-medium">Offers</th>
-                <th className="pb-2 font-medium">Interview rate</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.by_company.map((row) => (
-                <tr key={row.label} className="border-t border-slate-100 dark:border-slate-800">
-                  <td className="py-2 text-slate-800 dark:text-slate-200">{row.label}</td>
-                  <td className="py-2 text-slate-600 dark:text-slate-400">{row.applications}</td>
-                  <td className="py-2 text-slate-600 dark:text-slate-400">{row.interviews}</td>
-                  <td className="py-2 text-slate-600 dark:text-slate-400">{row.offers}</td>
-                  <td className="py-2 font-medium text-indigo-600 dark:text-indigo-400">
-                    {row.interview_rate}%
-                  </td>
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full min-w-[520px] text-left text-sm">
+              <thead>
+                <tr className="text-xs text-slate-500 dark:text-slate-400">
+                  <th className="pb-2 font-medium">Company</th>
+                  <th className="pb-2 font-medium">Applications</th>
+                  <th className="pb-2 font-medium">Interviews</th>
+                  <th className="pb-2 font-medium">Offers</th>
+                  <th className="pb-2 font-medium">Interview rate</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {data.by_company.map((row) => (
+                  <tr
+                    key={row.label}
+                    className="border-t border-slate-100 dark:border-slate-800"
+                  >
+                    <td className="py-2 text-slate-800 dark:text-slate-200">{row.label}</td>
+                    <td className="py-2 text-slate-600 dark:text-slate-400">
+                      {row.applications}
+                    </td>
+                    <td className="py-2 text-slate-600 dark:text-slate-400">{row.interviews}</td>
+                    <td className="py-2 text-slate-600 dark:text-slate-400">{row.offers}</td>
+                    <td className="py-2 font-medium text-indigo-600 dark:text-indigo-400">
+                      {row.interview_rate}%
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </Card>
     </div>

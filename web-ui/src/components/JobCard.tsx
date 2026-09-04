@@ -1,4 +1,6 @@
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
+import { ApiError } from '../api'
 import type { JobOut } from '../types'
 import { Button, Card, DecisionBadge, PipelineStageBadge, ScoreRing } from './ui'
 
@@ -13,17 +15,30 @@ function formatSalary(job: JobOut): string | null {
 export function JobCard({
   job,
   onSave,
-  saving,
   compareSelected,
   onToggleCompare,
 }: {
   job: JobOut
-  onSave?: (id: number) => void
-  saving?: boolean
+  onSave?: (id: number) => Promise<unknown>
   compareSelected?: boolean
   onToggleCompare?: (id: number) => void
 }) {
   const salary = formatSalary(job)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  const handleSave = async () => {
+    if (!onSave) return
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await onSave(job.id)
+    } catch (e) {
+      setSaveError(e instanceof ApiError ? e.message : 'Failed to save this job.')
+    } finally {
+      setSaving(false)
+    }
+  }
   return (
     <Card className="flex flex-col gap-3 p-5">
       <div className="flex items-start justify-between gap-4">
@@ -99,9 +114,12 @@ export function JobCard({
           </a>
         )}
         {onSave && !job.application_id && (
-          <Button variant="ghost" onClick={() => onSave(job.id)} disabled={saving}>
+          <Button variant="ghost" onClick={handleSave} disabled={saving}>
             {saving ? 'Saving…' : 'Save'}
           </Button>
+        )}
+        {saveError && (
+          <span className="text-xs text-rose-600 dark:text-rose-400">{saveError}</span>
         )}
       </div>
     </Card>

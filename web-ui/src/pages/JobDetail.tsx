@@ -35,6 +35,7 @@ export default function JobDetail() {
   const [job, setJob] = useState<JobDetailOut | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   const load = () => {
     if (!id) return
@@ -51,9 +52,12 @@ export default function JobDetail() {
 
   const save = async () => {
     setSaving(true)
+    setSaveError(null)
     try {
       const updated = await api.saveJob(job.id)
       setJob(updated)
+    } catch (e) {
+      setSaveError(e instanceof ApiError ? e.message : 'Failed to save this job.')
     } finally {
       setSaving(false)
     }
@@ -99,9 +103,14 @@ export default function JobDetail() {
             </span>
           )}
           {!job.application_id ? (
-            <Button variant="secondary" onClick={save} disabled={saving}>
-              {saving ? 'Saving…' : 'Save to pipeline'}
-            </Button>
+            <div className="flex flex-col items-end gap-1.5">
+              <Button variant="secondary" onClick={save} disabled={saving}>
+                {saving ? 'Saving…' : 'Save to pipeline'}
+              </Button>
+              {saveError && (
+                <span className="text-xs text-rose-600 dark:text-rose-400">{saveError}</span>
+              )}
+            </div>
           ) : (
             <Link to="/pipeline">
               <Button variant="secondary">View in pipeline</Button>
