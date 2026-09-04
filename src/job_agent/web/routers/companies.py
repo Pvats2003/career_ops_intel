@@ -57,6 +57,11 @@ def _company_out(
         for j in sorted(jobs, key=lambda j: j.posted_at or j.discovered_at, reverse=True)
     ]
 
+    active_matched = [j for j in matching_jobs if j.lifecycle_status == "ACTIVE" and j.match]
+    best_role = (
+        max(active_matched, key=lambda j: j.match.overall_score) if active_matched else None
+    )
+
     return CompanyOut(
         id=company_id,
         name=company_name,
@@ -67,6 +72,7 @@ def _company_out(
         notes=None,
         open_roles=open_roles,
         matching_jobs=matching_jobs,
+        best_role=best_role,
         company_fit=fit_score,
         company_fit_reasons=list(fit_reasons),
     )

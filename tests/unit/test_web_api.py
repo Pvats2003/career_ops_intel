@@ -923,6 +923,30 @@ def test_company_fit_reflects_real_match_scores(tmp_path, monkeypatch, real_conf
     assert body[0]["company_fit"] >= 80
 
 
+def test_company_best_role_is_the_highest_scoring_active_match(tmp_path, monkeypatch, real_config):
+    """Part 5.15: best_role must be the single highest-match ACTIVE
+    opening — never just the most recently posted one."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    lower_id = _seed_job(db_path, fingerprint="best-role-lower")
+    higher_id = _seed_job(db_path, fingerprint="best-role-higher")
+    _seed_match(db_path, lower_id, candidate_id, overall_score=55, decision="REVIEW")
+    _seed_match(db_path, higher_id, candidate_id, overall_score=91, decision="APPLY")
+
+    r = client.get("/api/companies")
+    body = r.json()
+    assert body[0]["best_role"]["id"] == higher_id
+    assert body[0]["best_role"]["match"]["overall_score"] == 91
+
+
+def test_company_best_role_none_with_no_matches(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="no-match-best-role")
+
+    r = client.get("/api/companies")
+    assert r.json()[0]["best_role"] is None
+
+
 def test_get_company_by_id_returns_company(tmp_path, monkeypatch, real_config):
     client, db_path = _client(tmp_path, monkeypatch, real_config)
     job_id = _seed_job(db_path, fingerprint="single-co")
@@ -982,6 +1006,32 @@ def test_watchlist_delete_404_for_unknown_entry(tmp_path, monkeypatch, real_conf
     client, _ = _client(tmp_path, monkeypatch, real_config)
     r = client.delete("/api/watchlist/999999")
     assert r.status_code == 404
+
+
+def test_watchlist_summary_reflects_real_matching_jobs(tmp_path, monkeypatch, real_config):
+    """Part 5.16: matching_count/highest_match_score/latest_posted_at must
+    come from actual discovered jobs — an entry with nothing posted
+    reports zero/None honestly."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    client.post("/api/watchlist", json={"kind": "COMPANY", "value": "Acme Corp"})
+    client.post("/api/watchlist", json={"kind": "COMPANY", "value": "Nowhere Inc"})
+
+    job_id = _seed_job(db_path, fingerprint="watchlist-summary-job")
+    _seed_match(db_path, job_id, candidate_id, overall_score=77, decision="APPLY")
+
+    r = client.get("/api/watchlist/summary")
+    assert r.status_code == 200
+    body = r.json()
+    by_value = {s["entry"]["value"]: s for s in body}
+
+    assert by_value["Acme Corp"]["matching_count"] == 1
+    assert by_value["Acme Corp"]["highest_match_score"] == 77
+    assert by_value["Acme Corp"]["latest_posted_at"] is not None
+
+    assert by_value["Nowhere Inc"]["matching_count"] == 0
+    assert by_value["Nowhere Inc"]["highest_match_score"] is None
+    assert by_value["Nowhere Inc"]["latest_posted_at"] is None
 
 
 def test_notifications_empty_by_default(tmp_path, monkeypatch, real_config):

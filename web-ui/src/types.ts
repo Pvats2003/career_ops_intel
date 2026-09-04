@@ -382,6 +382,7 @@ export interface CompanyOut {
   notes: string | null
   open_roles: number
   matching_jobs: JobOut[]
+  best_role: JobOut | null
   company_fit: number | null
   company_fit_reasons: string[]
 }
@@ -403,6 +404,14 @@ export interface WatchlistEntryOut {
 export interface WatchlistEntryIn {
   kind: WatchlistKind
   value: string
+}
+
+export interface WatchlistEntrySummaryOut {
+  entry: WatchlistEntryOut
+  matching_count: number
+  new_matching_count: number
+  highest_match_score: number | null
+  latest_posted_at: string | null
 }
 
 // --------------------------------------------------------------------------

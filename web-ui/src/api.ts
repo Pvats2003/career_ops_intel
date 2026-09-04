@@ -30,6 +30,7 @@ import type {
   URLCheckResultOut,
   WatchlistEntryIn,
   WatchlistEntryOut,
+  WatchlistEntrySummaryOut,
 } from './types'
 
 export class ApiError extends Error {
@@ -126,6 +127,7 @@ export const api = {
   getCompany: (id: number) => request<CompanyOut>(`/companies/${id}`),
 
   listWatchlist: () => request<WatchlistEntryOut[]>('/watchlist'),
+  watchlistSummary: () => request<WatchlistEntrySummaryOut[]>('/watchlist/summary'),
   addWatchlistEntry: (body: WatchlistEntryIn) =>
     request<WatchlistEntryOut>('/watchlist', { method: 'POST', body: JSON.stringify(body) }),
   removeWatchlistEntry: (id: number) =>

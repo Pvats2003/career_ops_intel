@@ -387,6 +387,11 @@ class CompanyOut(BaseModel):
     notes: str | None
     open_roles: int
     matching_jobs: list[JobOut]
+    # The single highest-match ACTIVE opening at this company — Part
+    # 5.15's "best role" — None if nothing here has been matched yet.
+    # `matching_jobs` (above) stays the full list, most-recent first, so
+    # "other opportunities" is just matching_jobs with best_role excluded.
+    best_role: JobOut | None
     company_fit: int | None
     company_fit_reasons: list[str]
 
@@ -408,6 +413,19 @@ class WatchlistEntryOut(BaseModel):
 class WatchlistEntryIn(BaseModel):
     kind: str
     value: str
+
+
+class WatchlistEntrySummaryOut(BaseModel):
+    """FINAL GOD MODE Part 5.16's Company Watchlist view: for this
+    watch entry, how many ACTIVE postings match it right now, how many
+    are new in the last 7 days, the highest match score among them (None
+    if nothing has been matched yet), and the most recent posting date."""
+
+    entry: WatchlistEntryOut
+    matching_count: int
+    new_matching_count: int
+    highest_match_score: int | None
+    latest_posted_at: datetime | None
 
 
 # --------------------------------------------------------------------------

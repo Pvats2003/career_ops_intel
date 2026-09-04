@@ -10,9 +10,17 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
+from job_agent.db.models import Job as JobRow
 from job_agent.db.models import WatchlistEntry as WatchlistEntryRow
+from job_agent.jobs.watchlist_summary import summarize_watchlist
+from job_agent.web import job_view
 from job_agent.web.deps import CandidateDep, SessionDep
-from job_agent.web.schemas import WATCHLIST_KINDS, WatchlistEntryIn, WatchlistEntryOut
+from job_agent.web.schemas import (
+    WATCHLIST_KINDS,
+    WatchlistEntryIn,
+    WatchlistEntryOut,
+    WatchlistEntrySummaryOut,
+)
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -30,6 +38,37 @@ def list_watchlist(session: SessionDep, candidate: CandidateDep) -> list[Watchli
         .order_by(WatchlistEntryRow.created_at.desc())
     ).scalars()
     return [_out(r) for r in rows]
+
+
+@router.get("/summary", response_model=list[WatchlistEntrySummaryOut])
+def watchlist_summary(
+    session: SessionDep, candidate: CandidateDep
+) -> list[WatchlistEntrySummaryOut]:
+    """Part 5.16's Company Watchlist view — per entry, how many ACTIVE
+    postings match it, how many are new in the last 7 days, the highest
+    match score among them, and the latest posting date."""
+    _, candidate_id = candidate
+    entries = list(
+        session.execute(
+            select(WatchlistEntryRow)
+            .where(WatchlistEntryRow.candidate_id == candidate_id)
+            .order_by(WatchlistEntryRow.created_at.desc())
+        ).scalars()
+    )
+    jobs = list(session.execute(select(JobRow)).scalars())
+    jobs_with_matches = [(j, job_view.latest_match(session, j.id, candidate_id)) for j in jobs]
+
+    summaries = summarize_watchlist(entries, jobs_with_matches)
+    return [
+        WatchlistEntrySummaryOut(
+            entry=_out(s.entry),
+            matching_count=s.matching_count,
+            new_matching_count=s.new_matching_count,
+            highest_match_score=s.highest_match_score,
+            latest_posted_at=s.latest_posted_at,
+        )
+        for s in summaries
+    ]
 
 
 @router.post("", response_model=WatchlistEntryOut)

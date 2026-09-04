@@ -73,14 +73,25 @@ export default function CompanyDetail() {
         )}
       </Card>
 
+      {company.best_role && (
+        <section>
+          <h2 className="mb-3 text-lg font-semibold text-slate-900 dark:text-slate-50">
+            Best role for you at {company.name}
+          </h2>
+          <JobCard job={company.best_role} />
+        </section>
+      )}
+
       <section>
         <h2 className="mb-3 text-lg font-semibold text-slate-900 dark:text-slate-50">
-          Open roles at {company.name}
+          {company.best_role ? 'Other opportunities' : `Open roles at ${company.name}`}
         </h2>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          {company.matching_jobs.map((job) => (
-            <JobCard key={job.id} job={job} />
-          ))}
+          {company.matching_jobs
+            .filter((job) => job.id !== company.best_role?.id)
+            .map((job) => (
+              <JobCard key={job.id} job={job} />
+            ))}
         </div>
       </section>
     </div>

@@ -2,7 +2,12 @@ import { useEffect, useState } from 'react'
 import { api, ApiError } from '../api'
 import { Button, Card, ErrorBanner, LoadingState } from '../components/ui'
 import { WATCHLIST_KINDS } from '../types'
-import type { SearchPreferencesOut, WatchlistEntryOut, WatchlistKind } from '../types'
+import type {
+  SearchPreferencesOut,
+  WatchlistEntryOut,
+  WatchlistEntrySummaryOut,
+  WatchlistKind,
+} from '../types'
 
 function csvToList(value: string): string[] {
   return value
@@ -15,6 +20,7 @@ export default function Settings() {
   const [prefs, setPrefs] = useState<SearchPreferencesOut | null>(null)
   const [countries, setCountries] = useState<string[]>([])
   const [watchlist, setWatchlist] = useState<WatchlistEntryOut[]>([])
+  const [watchlistSummary, setWatchlistSummary] = useState<WatchlistEntrySummaryOut[]>([])
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -29,6 +35,7 @@ export default function Settings() {
       .catch((e) => setError(e instanceof ApiError ? e.message : 'Failed to load settings.'))
     api.supportedCountries().then(setCountries).catch(() => setCountries([]))
     api.listWatchlist().then(setWatchlist).catch(() => setWatchlist([]))
+    api.watchlistSummary().then(setWatchlistSummary).catch(() => setWatchlistSummary([]))
   }
 
   useEffect(load, [])
@@ -56,11 +63,13 @@ export default function Settings() {
     const entry = await api.addWatchlistEntry({ kind: newWatchKind, value: newWatchValue.trim() })
     setWatchlist((prev) => [entry, ...prev.filter((e) => e.id !== entry.id)])
     setNewWatchValue('')
+    api.watchlistSummary().then(setWatchlistSummary).catch(() => {})
   }
 
   const removeWatchlistEntry = async (id: number) => {
     await api.removeWatchlistEntry(id)
     setWatchlist((prev) => prev.filter((e) => e.id !== id))
+    setWatchlistSummary((prev) => prev.filter((s) => s.entry.id !== id))
   }
 
   return (
@@ -208,22 +217,38 @@ export default function Settings() {
           </p>
         ) : (
           <ul className="flex flex-col gap-2">
-            {watchlist.map((entry) => (
-              <li
-                key={entry.id}
-                className="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-800"
-              >
-                <span>
-                  <span className="mr-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                    {entry.kind}
-                  </span>
-                  {entry.value}
-                </span>
-                <Button variant="ghost" onClick={() => removeWatchlistEntry(entry.id)}>
-                  Remove
-                </Button>
-              </li>
-            ))}
+            {watchlist.map((entry) => {
+              const summary = watchlistSummary.find((s) => s.entry.id === entry.id)
+              return (
+                <li
+                  key={entry.id}
+                  className="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-800"
+                >
+                  <div>
+                    <span>
+                      <span className="mr-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                        {entry.kind}
+                      </span>
+                      {entry.value}
+                    </span>
+                    {summary && (
+                      <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                        {summary.matching_count === 0
+                          ? 'No matching roles yet'
+                          : `${summary.matching_count} matching role${summary.matching_count === 1 ? '' : 's'}`}
+                        {summary.new_matching_count > 0 &&
+                          ` · ${summary.new_matching_count} new this week`}
+                        {summary.highest_match_score !== null &&
+                          ` · highest match ${summary.highest_match_score}%`}
+                      </div>
+                    )}
+                  </div>
+                  <Button variant="ghost" onClick={() => removeWatchlistEntry(entry.id)}>
+                    Remove
+                  </Button>
+                </li>
+              )
+            })}
           </ul>
         )}
       </Card>

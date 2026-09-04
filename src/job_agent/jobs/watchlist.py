@@ -19,7 +19,7 @@ from job_agent.db.models import WatchlistEntry as WatchlistEntryRow
 from job_agent.matching.text import contains_keyword
 
 
-def _matches_entry(job: JobRow, entry: WatchlistEntryRow) -> bool:
+def matches_entry(job: JobRow, entry: WatchlistEntryRow) -> bool:
     if entry.kind == "COMPANY":
         return job.company_name.strip().casefold() == entry.value.strip().casefold()
     if entry.kind == "ROLE":
@@ -35,4 +35,4 @@ def matching_entries(
 ) -> tuple[WatchlistEntryRow, ...]:
     """Every watchlist entry this job matches — a job can match more than
     one (e.g. both a COMPANY entry and a ROLE entry)."""
-    return tuple(entry for entry in entries if _matches_entry(job, entry))
+    return tuple(entry for entry in entries if matches_entry(job, entry))
