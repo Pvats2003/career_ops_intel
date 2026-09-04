@@ -121,6 +121,27 @@ def test_notes_flag_missing_requirements_without_claiming_them():
     assert "Tableau" not in result.relevant_skills
 
 
+def test_qualified_skill_name_still_counts_as_relevant():
+    """Real-world activation audit finding: a candidate's skill is often
+    authored with a self-rating qualifier ("Basic SQL", "Figma (basic)")
+    rather than the bare term a job posting uses ("SQL", "Figma"). An
+    exact-phrase match would wrongly report a real, demonstrated skill as
+    "not found in your profile" — the same fuzzy-substring check
+    matching.deterministic._find_evidence already uses for match scoring
+    must also apply here, or the tailored resume disagrees with the job's
+    own match score about whether the candidate has the skill."""
+    profile = _profile(skills=(_skill("Basic SQL"), _skill("Figma (basic)")))
+    result = tailor_resume_for_job(
+        profile, None, job_title="Analyst", job_company="Acme",
+        job_description="Must know SQL and Figma.", job_requirements=None,
+    )
+    assert "Basic SQL" in result.relevant_skills
+    assert "Figma (basic)" in result.relevant_skills
+    assert "SQL" in result.ats_keywords
+    assert not any("SQL" in note for note in result.notes)
+    assert not any("Figma" in note for note in result.notes)
+
+
 def test_experience_ranked_by_relevance_to_job_text():
     relevant = _experience("Data Analyst", "Acme", highlights=("Built SQL dashboards",))
     irrelevant = _experience("Barista", "Cafe", highlights=("Made coffee",))

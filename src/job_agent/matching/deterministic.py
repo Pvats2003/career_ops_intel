@@ -18,7 +18,7 @@ from job_agent.matching.text import (
     any_keyword_present,
     contains_keyword,
     extract_year_requirement,
-    normalize,
+    fuzzy_overlap,
 )
 from job_agent.matching.vocabulary import (
     COMMON_REQUIREMENT_KEYWORDS,
@@ -52,11 +52,9 @@ def _find_evidence(profile: CandidateProfile, keyword: str) -> EvidenceLevel:
     "Agile", "Figma") — an exact-name match would wrongly report every one
     of these as MISSING, which is worse than a fuzzy match's occasional
     false positive on an unrelated skill sharing a short token."""
-    kw = normalize(keyword)
     best = EvidenceLevel.MISSING
     for skill in profile.skills:
-        name = normalize(skill.name)
-        if kw and (kw in name or name in kw):
+        if fuzzy_overlap(keyword, skill.name):
             if _EVIDENCE_PRIORITY[skill.evidence_level] > _EVIDENCE_PRIORITY[best]:
                 best = skill.evidence_level
     return best

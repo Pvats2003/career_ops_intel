@@ -4,6 +4,7 @@ from job_agent.matching.text import (
     any_keyword_present,
     contains_keyword,
     extract_year_requirement,
+    fuzzy_overlap,
     normalize,
 )
 
@@ -45,3 +46,28 @@ def test_extract_year_requirement_none_when_absent():
 
 def test_extract_year_requirement_ignores_noise():
     assert extract_year_requirement("founded in 1999, growing fast") is None
+
+
+# --- fuzzy_overlap: real-world activation audit finding -------------------
+# A candidate's authored skill name ("Basic SQL") is a qualified version of
+# the bare vocabulary term a job posting uses ("SQL") — matching.
+# deterministic._find_evidence and resume.tailor's skill-relevance checks
+# both need this to still count as a match, not "missing".
+
+
+def test_fuzzy_overlap_matches_qualified_skill_name():
+    assert fuzzy_overlap("SQL", "Basic SQL") is True
+    assert fuzzy_overlap("Basic SQL", "SQL") is True
+
+
+def test_fuzzy_overlap_matches_parenthetical_qualifier():
+    assert fuzzy_overlap("Figma", "Figma (basic)") is True
+
+
+def test_fuzzy_overlap_false_for_unrelated_terms():
+    assert fuzzy_overlap("SQL", "Excel") is False
+
+
+def test_fuzzy_overlap_empty_inputs():
+    assert fuzzy_overlap("", "SQL") is False
+    assert fuzzy_overlap("SQL", "") is False

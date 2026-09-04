@@ -29,7 +29,7 @@ from job_agent.jobs.schema import Job as NormalizedJob
 from job_agent.llm.errors import LLMOutputValidationError, LLMUnavailableError
 from job_agent.llm.provider import LLMProvider
 from job_agent.logging.setup import redact_text
-from job_agent.matching.text import contains_keyword
+from job_agent.matching.text import any_keyword_present, contains_keyword, fuzzy_overlap
 from job_agent.matching.vocabulary import COMMON_REQUIREMENT_KEYWORDS
 
 PROMPT_VERSION = "resume_tailor.v1"
@@ -71,10 +71,21 @@ def _job_text(job_title: str, job_description: str | None, job_requirements: str
 
 
 def _relevant_skills(profile: CandidateProfile, job_text: str) -> tuple[str, ...]:
+    # A skill counts as relevant two ways: it's stated close enough to
+    # verbatim in the job text (contains_keyword — catches e.g. "React"
+    # appearing literally), or one of the job's mentioned requirement
+    # keywords fuzzy-overlaps the skill's authored name (fuzzy_overlap —
+    # catches e.g. a job asking for plain "SQL" against a skill literally
+    # named "Basic SQL"; an exact-phrase check alone would wrongly call
+    # that real, demonstrated skill "not found in your profile". Mirrors
+    # matching.deterministic._find_evidence, which already handles this
+    # the same way — real-world activation audit finding).
+    mentioned = any_keyword_present(job_text, COMMON_REQUIREMENT_KEYWORDS)
     return tuple(
         skill.name
         for skill in profile.skills
-        if contains_keyword(job_text, skill.name) or contains_keyword(skill.name, job_text)
+        if contains_keyword(job_text, skill.name)
+        or any(fuzzy_overlap(kw, skill.name) for kw in mentioned)
     )
 
 
@@ -92,12 +103,18 @@ def _ats_keywords(job_text: str, profile_skill_names: set[str]) -> tuple[str, ..
     OWN skill list already covers — surfaced so the candidate makes sure
     these exact terms actually appear in their resume text (ATS systems
     often keyword-match literally), never a suggestion to claim a skill
-    that isn't already in the profile."""
-    lowered_skills = {s.lower() for s in profile_skill_names}
+    that isn't already in the profile.
+
+    `fuzzy_overlap` (not an exact `kw.lower() in {skill names}` match) for
+    the same reason `_relevant_skills` needs it: a plain vocabulary term
+    like "SQL" must still count as covered by a skill authored as
+    "Basic SQL" — an exact match would silently drop it from this list
+    (real-world activation audit finding)."""
     return tuple(
         kw
         for kw in COMMON_REQUIREMENT_KEYWORDS
-        if contains_keyword(job_text, kw) and kw.lower() in lowered_skills
+        if contains_keyword(job_text, kw)
+        and any(fuzzy_overlap(kw, name) for name in profile_skill_names)
     )
 
 
@@ -146,7 +163,7 @@ def tailor_resume_for_job(
     missing = [
         kw for kw in COMMON_REQUIREMENT_KEYWORDS
         if contains_keyword(job_text, kw)
-        and kw.lower() not in {s.name.lower() for s in profile.skills}
+        and not any(fuzzy_overlap(kw, s.name) for s in profile.skills)
     ]
     if missing:
         notes.append(

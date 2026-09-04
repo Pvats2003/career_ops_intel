@@ -37,6 +37,25 @@ def any_keyword_present(text: str, keywords: tuple[str, ...]) -> list[str]:
     return [kw for kw in keywords if contains_keyword(text, kw)]
 
 
+def fuzzy_overlap(a: str, b: str) -> bool:
+    """True if either normalized string is a substring of the other.
+
+    For matching a bare vocabulary term ("SQL") against a candidate's
+    self-authored skill name ("Basic SQL", "Figma (basic)") — an exact
+    phrase match (`contains_keyword`) would treat a job asking for plain
+    "SQL" as not matching a skill literally named "Basic SQL", wrongly
+    reporting a real, demonstrated skill as missing. Originally written
+    once for `matching.deterministic._find_evidence`; factored out here
+    (real-world activation audit) after the same "SQL" vs "Basic SQL" gap
+    was found independently in `resume.tailor`, which had its own,
+    stricter check that missed it — one shared definition instead of two
+    that can silently drift apart."""
+    if not a or not b:
+        return False
+    norm_a, norm_b = normalize(a), normalize(b)
+    return bool(norm_a) and (norm_a in norm_b or norm_b in norm_a)
+
+
 def extract_year_requirement(text: str) -> int | None:
     """Extract the largest "N+ years" style requirement mentioned, or None."""
     if not text:
