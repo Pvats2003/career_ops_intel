@@ -125,6 +125,11 @@ export default function JobDetail() {
             Why this matches you
           </h2>
           <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">{job.match.reasoning}</p>
+          <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+            {job.match.semantic_available
+              ? 'Scored with AI-assisted semantic matching, on top of deterministic rules.'
+              : 'Scored with deterministic rules only — AI semantic matching was not available for this job.'}
+          </p>
 
           <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
             {MATCH_ROWS.map((row) => (
@@ -593,7 +598,19 @@ function AssistantPanel({ jobId }: { jobId: number }) {
                   Needs your input — Career OS can't answer this from your profile ({a.source}).
                 </p>
               ) : (
-                <p className="mt-1 text-sm text-slate-700 dark:text-slate-300">{a.answer}</p>
+                <>
+                  <p className="mt-1 text-sm text-slate-700 dark:text-slate-300">{a.answer}</p>
+                  <p className="mt-1.5 text-xs text-slate-400 dark:text-slate-500">
+                    Source: {a.source} · Confidence: {Math.round(a.confidence * 100)}%
+                  </p>
+                  {a.validation_notes.length > 0 && (
+                    <ul className="mt-1 list-inside list-disc text-xs text-amber-600 dark:text-amber-400">
+                      {a.validation_notes.map((n) => (
+                        <li key={n}>{n}</li>
+                      ))}
+                    </ul>
+                  )}
+                </>
               )}
             </div>
           ))}
