@@ -359,6 +359,37 @@ def test_get_job_detail_404_for_missing_job(tmp_path, monkeypatch, real_config):
     assert r.status_code == 404
 
 
+def test_why_this_job_breaks_down_the_real_rank_score(tmp_path, monkeypatch, real_config):
+    """Part 7.21: reasons/components must be the exact same numbers that
+    produced the rank score used elsewhere — never a second computation."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="why-job")
+    _seed_match(db_path, job_id, candidate_id, overall_score=91, decision="APPLY")
+
+    r = client.get(f"/api/jobs/{job_id}/why")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert body["rank_score"] == round(sum(body["components"].values()), 1)
+    assert len(body["reasons"]) > 0
+    assert "match" in body["components"]
+
+
+def test_why_this_job_404_for_missing_job(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/jobs/999999/why")
+    assert r.status_code == 404
+
+
+def test_why_this_job_409_for_inactive_job(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="why-inactive", lifecycle_status="CLOSED")
+
+    r = client.get(f"/api/jobs/{job_id}/why")
+    assert r.status_code == 409
+
+
 def test_compare_jobs_returns_full_detail_for_each(tmp_path, monkeypatch, real_config):
     """Part 3.10: comparing jobs must use the exact same JobDetailOut every
     other view uses — same match, confidence, and viability — never a
@@ -1213,6 +1244,50 @@ def test_career_profile_grounded_in_real_career_paths(tmp_path, monkeypatch, rea
     # Never fabricated when the synthetic candidate has no real skills/paths.
     if body["primary_direction"] is None:
         assert body["strengths"] == []
+
+
+def test_career_chat_no_llm_grounds_answer_in_real_top_jobs(tmp_path, monkeypatch, real_config):
+    """Part 7.20: with no LLM configured (the synthetic test env has no
+    ANTHROPIC_API_KEY), the assistant must hand back the real Career OS
+    data rather than a fabricated "AI" answer."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="chat-job")
+    _seed_match(db_path, job_id, candidate_id, overall_score=91, decision="APPLY")
+
+    r = client.post("/api/candidate/chat", json={"question": "What are the best jobs for me?"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["generated_by"] == "deterministic"
+    assert "Business Analyst" in body["answer"]
+    assert "Acme Corp" in body["answer"]
+    assert "Top" in " ".join(body["grounded_in"])
+
+
+def test_career_chat_honest_when_no_jobs_yet(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.post("/api/candidate/chat", json={"question": "What are the best jobs for me?"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["generated_by"] == "deterministic"
+    assert "run a search" in body["answer"].lower()
+
+
+def test_career_chat_with_job_id_includes_specific_job_grounding(
+    tmp_path, monkeypatch, real_config
+):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="chat-why-job")
+    _seed_match(db_path, job_id, candidate_id, overall_score=88, decision="APPLY")
+
+    r = client.post(
+        "/api/candidate/chat",
+        json={"question": "Why should I apply to this job?", "job_id": job_id},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert any("Full detail for" in g for g in body["grounded_in"])
 
 
 def test_career_path_comparison_empty_when_no_paths(tmp_path, monkeypatch, real_config):

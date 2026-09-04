@@ -551,6 +551,18 @@ class RankedJobOut(BaseModel):
     recommendation: str
 
 
+class WhyBreakdownOut(BaseModel):
+    """FINAL GOD MODE Part 7.21's Explainable AI — a numbered breakdown
+    of exactly what produced this job's rank score, plus one named main
+    weakness. Never a second, LLM-generated justification."""
+
+    job_id: int
+    rank_score: float
+    reasons: list[str]
+    main_weakness: str | None
+    components: dict[str, float]
+
+
 class NewSinceLastVisitOut(BaseModel):
     previous_visit_at: datetime | None
     jobs: list[RankedJobOut]
@@ -617,3 +629,21 @@ class CategoryInsightOut(BaseModel):
 class InsightsOut(BaseModel):
     categories: list[CategoryInsightOut]
     summary: list[str]
+
+
+# --------------------------------------------------------------------------
+# Career Chat (FINAL GOD MODE Part 7.20)
+# --------------------------------------------------------------------------
+
+
+class CareerChatIn(BaseModel):
+    question: str
+    # Optional: "why should I apply to THIS job" — includes that job's
+    # full match/viability detail in the grounding context.
+    job_id: int | None = None
+
+
+class CareerChatOut(BaseModel):
+    answer: str
+    generated_by: str  # "llm" | "deterministic"
+    grounded_in: list[str]

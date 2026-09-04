@@ -3,6 +3,8 @@ import type {
   ApplicationHistoryEventOut,
   AssistantResponseOut,
   CandidateProfileOut,
+  CareerChatIn,
+  CareerChatOut,
   CareerPathComparisonRowOut,
   CareerPathOut,
   CareerProfileOut,
@@ -33,6 +35,7 @@ import type {
   WatchlistEntryIn,
   WatchlistEntryOut,
   WatchlistEntrySummaryOut,
+  WhyBreakdownOut,
 } from './types'
 
 export class ApiError extends Error {
@@ -87,6 +90,7 @@ export const api = {
   getJob: (id: number) => request<JobDetailOut>(`/jobs/${id}`),
   saveJob: (id: number) => request<JobDetailOut>(`/jobs/${id}/save`, { method: 'POST' }),
   checkUrl: (id: number) => request<URLCheckResultOut>(`/jobs/${id}/check-url`, { method: 'POST' }),
+  whyThisJob: (id: number) => request<WhyBreakdownOut>(`/jobs/${id}/why`),
   compareJobs: (ids: number[]) =>
     request<JobDetailOut[]>(`/jobs/compare?ids=${ids.join(',')}`),
   scanJobs: () => request<ScanRunOut>('/jobs/scan', { method: 'POST' }),
@@ -126,6 +130,8 @@ export const api = {
     request<CareerPathComparisonRowOut[]>('/candidate/career-paths/compare'),
   skillGaps: () => request<SkillGapEntryOut[]>('/candidate/skill-gaps'),
   insights: () => request<InsightsOut>('/candidate/insights'),
+  careerChat: (body: CareerChatIn) =>
+    request<CareerChatOut>('/candidate/chat', { method: 'POST', body: JSON.stringify(body) }),
 
   listCompanies: () => request<CompanyOut[]>('/companies'),
   getCompany: (id: number) => request<CompanyOut>(`/companies/${id}`),

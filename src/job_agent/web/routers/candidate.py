@@ -18,15 +18,20 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, UploadFile
 from sqlalchemy import select
 
+from job_agent.applications.follow_up import compute_follow_up_recommendations
+from job_agent.candidate.career_chat import answer_career_question
 from job_agent.candidate.career_comparison import compare_career_paths
 from job_agent.candidate.career_paths import discover_career_paths
 from job_agent.candidate.career_profile import build_career_profile
-from job_agent.candidate.learning import discover_insights
+from job_agent.candidate.explain import explain_ranking
+from job_agent.candidate.learning import compute_learned_preferences, discover_insights
 from job_agent.candidate.schema import CandidateProfile
 from job_agent.candidate.skill_gap import discover_skill_gaps
 from job_agent.db.models import Application as ApplicationRow
 from job_agent.db.models import Job as JobRow
 from job_agent.db.models import JobMatch as JobMatchRow
+from job_agent.llm.provider import build_llm_provider
+from job_agent.matching.ranking import rank_jobs
 from job_agent.resume.errors import ResumeExtractionError
 from job_agent.resume.repository import list_versions
 from job_agent.resume.service import create_profile_version
@@ -34,6 +39,8 @@ from job_agent.web import job_view
 from job_agent.web.deps import CandidateDep, ConfigDep, SessionDep
 from job_agent.web.schemas import (
     CandidateProfileOut,
+    CareerChatIn,
+    CareerChatOut,
     CareerPathComparisonRowOut,
     CareerPathOut,
     CareerProfileOut,
@@ -159,11 +166,15 @@ def get_career_paths(candidate: CandidateDep) -> list[CareerPathOut]:
     results = discover_career_paths(profile)
     return [
         CareerPathOut(
-            label=r.label, fit_score=r.fit_score, evidence=list(r.evidence),
+            label=r.label,
+            fit_score=r.fit_score,
+            evidence=list(r.evidence),
             relevant_skills=list(r.relevant_skills),
             relevant_experience=list(r.relevant_experience),
-            missing_skills=list(r.missing_skills), typical_titles=list(r.typical_titles),
-            career_upside=r.career_upside, recommended_priority=r.recommended_priority,
+            missing_skills=list(r.missing_skills),
+            typical_titles=list(r.typical_titles),
+            career_upside=r.career_upside,
+            recommended_priority=r.recommended_priority,
         )
         for r in results
     ]
@@ -180,8 +191,10 @@ def get_career_profile(candidate: CandidateDep) -> CareerProfileOut:
     career_paths = discover_career_paths(profile)
     result = build_career_profile(profile, career_paths)
     return CareerProfileOut(
-        primary_direction=result.primary_direction, strengths=list(result.strengths),
-        growing_area=result.growing_area, skill_gaps=list(result.skill_gaps),
+        primary_direction=result.primary_direction,
+        strengths=list(result.strengths),
+        growing_area=result.growing_area,
+        skill_gaps=list(result.skill_gaps),
         best_locations=list(result.best_locations),
     )
 
@@ -213,9 +226,13 @@ def get_career_path_comparison(
     rows = compare_career_paths(career_paths, active_jobs, applications_with_jobs)
     return [
         CareerPathComparisonRowOut(
-            label=r.label, current_fit=r.current_fit, job_volume=r.job_volume,
-            career_upside=r.career_upside, skill_gap=r.skill_gap,
-            interview_rate=r.interview_rate, interview_sample_size=r.interview_sample_size,
+            label=r.label,
+            current_fit=r.current_fit,
+            job_volume=r.job_volume,
+            career_upside=r.career_upside,
+            skill_gap=r.skill_gap,
+            interview_rate=r.interview_rate,
+            interview_sample_size=r.interview_sample_size,
             overall=r.overall,
         )
         for r in rows
@@ -243,8 +260,11 @@ def get_skill_gaps(session: SessionDep, candidate: CandidateDep) -> list[SkillGa
     entries = discover_skill_gaps(matches, career_paths)
     return [
         SkillGapEntryOut(
-            skill=e.skill, frequency_count=e.frequency_count, frequency_pct=e.frequency_pct,
-            unlocks_count=e.unlocks_count, relevant_career_paths=list(e.relevant_career_paths),
+            skill=e.skill,
+            frequency_count=e.frequency_count,
+            frequency_pct=e.frequency_pct,
+            unlocks_count=e.unlocks_count,
+            relevant_career_paths=list(e.relevant_career_paths),
         )
         for e in entries
     ]
@@ -264,8 +284,12 @@ def get_insights(session: SessionDep, candidate: CandidateDep) -> InsightsOut:
     return InsightsOut(
         categories=[
             CategoryInsightOut(
-                category=c.category, saved=c.saved, ignored=c.ignored, applied=c.applied,
-                save_rate=c.save_rate, explanation=c.explanation,
+                category=c.category,
+                saved=c.saved,
+                ignored=c.ignored,
+                applied=c.applied,
+                save_rate=c.save_rate,
+                explanation=c.explanation,
             )
             for c in categories
         ],
@@ -285,3 +309,97 @@ def get_resume_versions(session: SessionDep, candidate: CandidateDep) -> list[di
         }
         for v in versions
     ]
+
+
+@router.post("/chat", response_model=CareerChatOut)
+def career_chat(
+    body: CareerChatIn, session: SessionDep, candidate: CandidateDep, config: ConfigDep
+) -> CareerChatOut:
+    """Part 7.20's Career Chat — every fact available to the answer comes
+    from the same data Top 10/Career Profile/Follow-ups already compute,
+    assembled fresh here (never re-derived differently or stored
+    separately). With no LLM configured, the real data is returned
+    directly rather than a fabricated "AI" answer."""
+    profile, candidate_id = candidate
+    grounded_in: list[str] = []
+
+    jobs = list(session.execute(select(JobRow)).scalars())
+    pairs = [(job, job_view.latest_match(session, job.id, candidate_id)) for job in jobs]
+    preferences = compute_learned_preferences(
+        job_view.matched_jobs_with_applications(session, candidate_id)
+    )
+    ranked = rank_jobs(pairs, config.automation.priority_weights, preferences=preferences, limit=10)
+    top_jobs = [
+        {
+            "title": r.job.title,
+            "company": r.job.company_name,
+            "score": r.match.overall_score if r.match else None,
+            "why": r.why[0] if r.why else r.recommendation,
+        }
+        for r in ranked
+    ]
+    if top_jobs:
+        grounded_in.append(f"Top {len(top_jobs)} ranked jobs")
+
+    career_paths = discover_career_paths(profile)
+    career_profile_result = build_career_profile(profile, career_paths)
+    career_profile_context = {
+        "primary_direction": career_profile_result.primary_direction,
+        "strengths": list(career_profile_result.strengths),
+        "growing_area": career_profile_result.growing_area,
+        "skill_gaps": list(career_profile_result.skill_gaps),
+    }
+    grounded_in.append("Career profile")
+
+    applications = list(
+        session.execute(
+            select(ApplicationRow).where(ApplicationRow.candidate_id == candidate_id)
+        ).scalars()
+    )
+    applications_with_jobs = []
+    for app in applications:
+        job = session.get(JobRow, app.job_id)
+        if job is not None:
+            applications_with_jobs.append((app, job))
+    recommendations = compute_follow_up_recommendations(applications_with_jobs)
+    follow_ups_context = [
+        {
+            "title": r.job.title,
+            "company": r.job.company_name,
+            "applied_days_ago": r.applied_days_ago,
+            "suggested_action": r.suggested_action,
+        }
+        for r in recommendations
+    ]
+    if follow_ups_context:
+        grounded_in.append("Pending follow-ups")
+
+    context: dict = {
+        "top_jobs": top_jobs,
+        "career_profile": career_profile_context,
+        "follow_ups": follow_ups_context,
+    }
+
+    if body.job_id is not None:
+        job = session.get(JobRow, body.job_id)
+        if job is not None:
+            match_row = job_view.latest_match(session, job.id, candidate_id)
+            job_ranked = rank_jobs(
+                [(job, match_row)], config.automation.priority_weights, preferences=preferences
+            )
+            if job_ranked:
+                breakdown = explain_ranking(job_ranked[0])
+                context["specific_job"] = {
+                    "title": job.title,
+                    "company": job.company_name,
+                    "rank_score": breakdown.rank_score,
+                    "reasons": breakdown.reasons,
+                    "main_weakness": breakdown.main_weakness,
+                }
+                grounded_in.append(f"Full detail for {job.title} at {job.company_name}")
+
+    llm = build_llm_provider(config)
+    response = answer_career_question(body.question, context, llm=llm)
+    return CareerChatOut(
+        answer=response.answer, generated_by=response.generated_by, grounded_in=grounded_in
+    )

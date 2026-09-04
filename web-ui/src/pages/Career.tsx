@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, ApiError } from '../api'
+import { CareerChat } from '../components/CareerChat'
 import { Card, ErrorBanner, LoadingState } from '../components/ui'
 import type { CareerPathComparisonRowOut, CareerProfileOut, SkillGapEntryOut } from '../types'
 
@@ -43,6 +44,8 @@ export default function Career() {
           a separate guess about you.
         </p>
       </div>
+
+      <CareerChat />
 
       <Card className="p-6">
         {profile.primary_direction ? (

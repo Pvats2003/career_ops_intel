@@ -24,6 +24,7 @@ from job_agent.applications.answer_engine import classify_question, generate_ans
 from job_agent.applications.cover_letter import generate_cover_letter
 from job_agent.applications.repository import get_or_create_application
 from job_agent.applications.schema import ApplicationQuestion
+from job_agent.candidate.explain import explain_ranking
 from job_agent.candidate.learning import compute_learned_preferences
 from job_agent.config.loader import AppConfig
 from job_agent.db.models import Application as ApplicationRow
@@ -57,6 +58,7 @@ from job_agent.web.schemas import (
     SearchRunOut,
     TailoredResumeOut,
     URLCheckResultOut,
+    WhyBreakdownOut,
 )
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -355,6 +357,39 @@ def get_job(job_id: int, session: SessionDep, candidate: CandidateDep) -> JobDet
     match_row = _latest_match(session, job.id, candidate_id)
     application = _application_for(session, job.id, candidate_id)
     return _job_detail_out(job, match_row, application)
+
+
+@router.get("/{job_id}/why", response_model=WhyBreakdownOut)
+def why_this_job(
+    job_id: int, session: SessionDep, candidate: CandidateDep, config: ConfigDep
+) -> WhyBreakdownOut:
+    """Part 7.21's Explainable AI — the numbered breakdown behind this
+    job's rank score, computed the exact same way Top 10 ranks it (never
+    a second, separate scoring pass)."""
+    job = session.get(JobRow, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"No job with id {job_id}.")
+    _, candidate_id = candidate
+    match_row = _latest_match(session, job.id, candidate_id)
+    preferences = compute_learned_preferences(
+        job_view.matched_jobs_with_applications(session, candidate_id)
+    )
+    ranked = rank_jobs(
+        [(job, match_row)], config.automation.priority_weights, preferences=preferences
+    )
+    if not ranked:
+        raise HTTPException(
+            status_code=409,
+            detail="This job is not currently ACTIVE, so it has no rank breakdown.",
+        )
+    breakdown = explain_ranking(ranked[0])
+    return WhyBreakdownOut(
+        job_id=job_id,
+        rank_score=breakdown.rank_score,
+        reasons=breakdown.reasons,
+        main_weakness=breakdown.main_weakness,
+        components=ranked[0].components,
+    )
 
 
 @router.post("/{job_id}/save", response_model=JobDetailOut)

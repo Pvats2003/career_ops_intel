@@ -317,6 +317,29 @@ export interface SkillGapEntryOut {
 }
 
 // --------------------------------------------------------------------------
+// Career Chat / Explainable AI (Phase 7)
+// --------------------------------------------------------------------------
+
+export interface CareerChatIn {
+  question: string
+  job_id?: number
+}
+
+export interface CareerChatOut {
+  answer: string
+  generated_by: 'llm' | 'deterministic'
+  grounded_in: string[]
+}
+
+export interface WhyBreakdownOut {
+  job_id: number
+  rank_score: number
+  reasons: string[]
+  main_weakness: string | null
+  components: Record<string, number>
+}
+
+// --------------------------------------------------------------------------
 // Search runs / ranking (Phase 8)
 // --------------------------------------------------------------------------
 

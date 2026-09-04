@@ -16,6 +16,7 @@ import type {
   JobDetailOut,
   TailoredResumeOut,
   URLCheckResultOut,
+  WhyBreakdownOut,
 } from '../types'
 
 const MATCH_ROWS: { key: keyof NonNullable<JobDetailOut['match']>; label: string }[] = [
@@ -154,6 +155,8 @@ export default function JobDetail() {
         </Card>
       )}
 
+      {job.match && <WhyBreakdownPanel jobId={job.id} />}
+
       <ViabilityPanel job={job} />
 
       <TailorResumePanel jobId={job.id} />
@@ -183,6 +186,68 @@ export default function JobDetail() {
         </Card>
       )}
     </div>
+  )
+}
+
+function WhyBreakdownPanel({ jobId }: { jobId: number }) {
+  const [breakdown, setBreakdown] = useState<WhyBreakdownOut | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const load = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      setBreakdown(await api.whyThisJob(jobId))
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : 'Could not load the ranking breakdown.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  if (!breakdown) {
+    return (
+      <Card className="p-6">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-50">
+              Why is this ranked this way?
+            </h2>
+            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+              A numbered breakdown of exactly what produced this job's rank score.
+            </p>
+          </div>
+          <Button variant="ghost" onClick={load} disabled={loading}>
+            {loading ? 'Loading…' : 'Show breakdown'}
+          </Button>
+        </div>
+        {error && <p className="mt-2 text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+      </Card>
+    )
+  }
+
+  return (
+    <Card className="p-6">
+      <div className="flex items-center justify-between gap-4">
+        <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-50">
+          Why is this ranked this way?
+        </h2>
+        <span className="text-xl font-bold text-indigo-600 dark:text-indigo-400">
+          {breakdown.rank_score}
+        </span>
+      </div>
+      <ol className="mt-3 list-inside list-decimal space-y-1 text-sm text-slate-700 dark:text-slate-300">
+        {breakdown.reasons.map((r, i) => (
+          <li key={i}>{r}</li>
+        ))}
+      </ol>
+      {breakdown.main_weakness && (
+        <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
+          Main weakness: {breakdown.main_weakness}
+        </p>
+      )}
+    </Card>
   )
 }
 
