@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from job_agent.applications.checklist import compute_checklist
 from job_agent.applications.follow_up import compute_follow_up_recommendations
+from job_agent.applications.follow_up_message import generate_follow_up_message
 from job_agent.applications.repository import record_event
 from job_agent.applications.scorecard import compute_scorecard
 from job_agent.db.models import Application, ApplicationEvent, Resume
@@ -27,6 +28,7 @@ from job_agent.web.schemas import (
     ApplicationHistoryEventOut,
     ApplicationScorecardOut,
     CareerPathAnalyticsOut,
+    FollowUpMessageOut,
     FollowUpRecommendationOut,
     PipelineItemOut,
     PipelineUpdateIn,
@@ -229,8 +231,10 @@ def follow_up_recommendations(
 ) -> list[FollowUpRecommendationOut]:
     """Phase 13 — applications sitting in an active waiting stage
     (APPLIED/ASSESSMENT/INTERVIEW) with no stage change in 7+ days.
-    Never contacts a recruiter — this only flags what to look at."""
-    _, candidate_id = candidate
+    Never contacts a recruiter — this only flags what to look at, and
+    (Part 4.14) drafts the actual message text for the candidate to
+    review and send themselves; nothing here is ever sent automatically."""
+    profile, candidate_id = candidate
     applications = list(
         session.execute(
             select(Application).where(Application.candidate_id == candidate_id)
@@ -243,15 +247,20 @@ def follow_up_recommendations(
             applications_with_jobs.append((application, job))
 
     recommendations = compute_follow_up_recommendations(applications_with_jobs)
-    return [
-        FollowUpRecommendationOut(
-            application_id=r.application.id,
-            job=_job_out(r.job, _latest_match(session, r.job.id, candidate_id), r.application),
-            applied_days_ago=r.applied_days_ago,
-            suggested_action=r.suggested_action,
+    candidate_name = profile.identity_name.value or "your name"
+    results = []
+    for r in recommendations:
+        message = generate_follow_up_message(r, candidate_name)
+        results.append(
+            FollowUpRecommendationOut(
+                application_id=r.application.id,
+                job=_job_out(r.job, _latest_match(session, r.job.id, candidate_id), r.application),
+                applied_days_ago=r.applied_days_ago,
+                suggested_action=r.suggested_action,
+                message=FollowUpMessageOut(subject=message.subject, body=message.body),
+            )
         )
-        for r in recommendations
-    ]
+    return results
 
 
 @router.get("/analytics", response_model=AnalyticsOut)

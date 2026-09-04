@@ -24,6 +24,8 @@ export default function Dashboard() {
   const [insights, setInsights] = useState<InsightsOut | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState<'scan' | 'match' | 'search' | null>(null)
+  const [expandedFollowUpId, setExpandedFollowUpId] = useState<number | null>(null)
+  const [copiedFollowUpId, setCopiedFollowUpId] = useState<number | null>(null)
 
   const load = () => {
     setError(null)
@@ -297,21 +299,60 @@ export default function Dashboard() {
               </h2>
               <div className="flex flex-col gap-2">
                 {followUps.map((f) => (
-                  <Card key={f.application_id} className="flex items-center justify-between p-4">
-                    <div>
-                      <Link
-                        to={`/jobs/${f.job.id}`}
-                        className="font-medium text-slate-900 hover:text-indigo-600 dark:text-slate-50 dark:hover:text-indigo-400"
-                      >
-                        {f.job.title} at {f.job.company_name}
-                      </Link>
-                      <p className="text-sm text-slate-500 dark:text-slate-400">
-                        {f.suggested_action}
-                      </p>
+                  <Card key={f.application_id} className="p-4">
+                    <div className="flex items-center justify-between gap-4">
+                      <div>
+                        <Link
+                          to={`/jobs/${f.job.id}`}
+                          className="font-medium text-slate-900 hover:text-indigo-600 dark:text-slate-50 dark:hover:text-indigo-400"
+                        >
+                          {f.job.title} at {f.job.company_name}
+                        </Link>
+                        <p className="text-sm text-slate-500 dark:text-slate-400">
+                          {f.suggested_action}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-3">
+                        <span className="whitespace-nowrap text-xs text-slate-400 dark:text-slate-500">
+                          {f.applied_days_ago}d since last update
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedFollowUpId((prev) =>
+                              prev === f.application_id ? null : f.application_id,
+                            )
+                          }
+                          className="text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+                        >
+                          {expandedFollowUpId === f.application_id ? 'Hide message' : 'Draft message'}
+                        </button>
+                      </div>
                     </div>
-                    <span className="whitespace-nowrap text-xs text-slate-400 dark:text-slate-500">
-                      {f.applied_days_ago}d since last update
-                    </span>
+                    {expandedFollowUpId === f.application_id && (
+                      <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm dark:border-slate-800 dark:bg-slate-800/50">
+                        <p className="text-xs text-slate-500 dark:text-slate-400">
+                          A draft to review and send yourself — Career OS never contacts anyone
+                          automatically.
+                        </p>
+                        <div className="mt-2 font-medium text-slate-800 dark:text-slate-200">
+                          {f.message.subject}
+                        </div>
+                        <p className="mt-1 whitespace-pre-line text-slate-700 dark:text-slate-300">
+                          {f.message.body}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await navigator.clipboard.writeText(f.message.body)
+                            setCopiedFollowUpId(f.application_id)
+                          }}
+                          className="mt-2 text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+                        >
+                          {copiedFollowUpId === f.application_id ? 'Copied ✓' : 'Copy message'}
+                        </button>
+                      </div>
+                    )}
                   </Card>
                 ))}
               </div>

@@ -606,6 +606,13 @@ def test_follow_ups_surfaces_stale_applied_application(tmp_path, monkeypatch, re
     assert body[0]["applied_days_ago"] >= 10
     assert "follow-up" in body[0]["suggested_action"].lower()
 
+    # Part 4.14: an actual, ready-to-send message — never fabricated,
+    # grounded in the real job title/company already on the recommendation.
+    message = body[0]["message"]
+    assert "subject" in message and "body" in message
+    assert "Business Analyst" in message["subject"] or "Business Analyst" in message["body"]
+    assert "Acme Corp" in message["body"]
+
 
 def test_analytics_reflects_pipeline_stage_counts(tmp_path, monkeypatch, real_config):
     client, db_path = _client(tmp_path, monkeypatch, real_config)

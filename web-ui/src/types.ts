@@ -446,11 +446,17 @@ export type SearchPreferencesIn = Partial<SearchPreferencesOut>
 // Follow-up intelligence (Phase 13)
 // --------------------------------------------------------------------------
 
+export interface FollowUpMessageOut {
+  subject: string
+  body: string
+}
+
 export interface FollowUpRecommendationOut {
   application_id: number
   job: JobOut
   applied_days_ago: number
   suggested_action: string
+  message: FollowUpMessageOut
 }
 
 // --------------------------------------------------------------------------

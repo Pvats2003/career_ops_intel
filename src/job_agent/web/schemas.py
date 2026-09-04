@@ -521,11 +521,17 @@ class NewSinceLastVisitOut(BaseModel):
 # --------------------------------------------------------------------------
 
 
+class FollowUpMessageOut(BaseModel):
+    subject: str
+    body: str
+
+
 class FollowUpRecommendationOut(BaseModel):
     application_id: int
     job: JobOut
     applied_days_ago: int
     suggested_action: str
+    message: FollowUpMessageOut
 
 
 # --------------------------------------------------------------------------
