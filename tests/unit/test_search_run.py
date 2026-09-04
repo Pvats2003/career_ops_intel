@@ -155,6 +155,71 @@ def test_execute_search_run_detects_cross_source_duplicates(db_session, real_con
     assert run_b.duplicates_removed == 1
 
 
+def test_execute_search_run_default_path_reaches_the_network_without_a_premature_close(
+    db_session, real_config, monkeypatch
+):
+    """Regression test for a real bug caught during a real-world activation
+    audit (2026-09-04): `execute_search_run`'s default (`sources=None`)
+    path — the ONLY path every real caller (the CLI's `jobs search-run`,
+    the web API's `POST /api/jobs/search-run`, and the autonomous
+    scheduler) actually uses — built its own `ResilientHttpClient`, passed
+    it to `build_sources()`, then closed that client in a `finally` right
+    after `build_sources()` returned. `build_sources()` only constructs
+    adapter objects; the real HTTP request happens later inside
+    `run_scan()`'s `scan_source()` calls, by which point the shared client
+    was already closed. Every real source scan failed with "Cannot send a
+    request, as the client has been closed." — silently, in every
+    environment, even with full network access — and every existing test
+    for this code path injected `sources=[...]` directly, bypassing the
+    broken branch entirely, so nothing caught it until a live run was
+    actually attempted.
+
+    This exercises the exact `sources=None` branch end-to-end (using the
+    real, enabled config/sources.yaml sources) with `httpx.Client` itself
+    monkeypatched onto a mock transport, so a real request object is
+    built and dispatched but never touches the network — proving the
+    client is still open when that dispatch happens."""
+    import httpx
+
+    real_calls: list[str] = []
+    real_client_cls = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        real_calls.append(str(request.url))
+        if "remotive.com" in request.url.host:
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [
+                        {
+                            "id": 1,
+                            "title": "Business Analyst",
+                            "company_name": "Acme",
+                            "url": "https://example.test/apply/1",
+                            "candidate_required_location": "Worldwide",
+                        }
+                    ]
+                },
+            )
+        if "arbeitnow.com" in request.url.host:
+            return httpx.Response(200, json={"data": [], "links": {}})
+        return httpx.Response(200, json={})
+
+    def fake_client(*args, **kwargs):
+        kwargs.pop("timeout", None)
+        return real_client_cls(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(httpx, "Client", fake_client)
+
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    run = execute_search_run(db_session, real_config, profile, candidate_id)
+
+    assert real_calls, "expected at least one request to actually reach the mock transport"
+    assert not any("closed" in e.lower() for e in run.errors), (
+        f"a source failed because the shared HTTP client was already closed: {run.errors}"
+    )
+
+
 def test_execute_search_run_qualified_counts_apply_and_review_only(db_session, real_config):
     profile, candidate_id = _seed_candidate(db_session, real_config)
     src = _StubJobSource([{"id": "1", "title": "Totally Unrelated Role XYZ"}])

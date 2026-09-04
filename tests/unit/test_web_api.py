@@ -12,6 +12,7 @@ import shutil
 from datetime import UTC
 from pathlib import Path
 
+import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -235,11 +236,23 @@ def test_dashboard_summary_empty_by_default(tmp_path, monkeypatch, real_config):
 
 
 def test_jobs_scan_with_no_sources_enabled_is_honest_zero(tmp_path, monkeypatch, real_config):
-    """config/sources.yaml ships with every source disabled — scanning
-    must report zero results, never fabricate a job listing, and must not
-    attempt any network call (build_sources returns an empty adapter
-    list, so run_scan has nothing to iterate)."""
-    client, _ = _client(tmp_path, monkeypatch, real_config)
+    """With every source explicitly disabled, scanning must report zero
+    results, never fabricate a job listing, and must not attempt any
+    network call (build_sources returns an empty adapter list, so run_scan
+    has nothing to iterate). Explicitly disables every source in its own
+    copied config rather than relying on config/sources.yaml's shipped
+    defaults — remotive/arbeitnow/adzuna are enabled there (a real-world
+    activation change, keyless/free sources), so a test asserting "nothing
+    enabled" must set that up itself or it would both misrepresent what
+    it's testing and attempt a real network call inside a unit test."""
+    _configure_env(tmp_path, monkeypatch, real_config)
+    sources_path = tmp_path / "config" / "sources.yaml"
+    data = yaml.safe_load(sources_path.read_text())
+    for source_cfg in data["sources"].values():
+        source_cfg["enabled"] = False
+    sources_path.write_text(yaml.dump(data))
+
+    client = TestClient(create_app())
     r = client.post("/api/jobs/scan")
     assert r.status_code == 200
     body = r.json()

@@ -25,12 +25,11 @@ from job_agent.db.models import SearchPreferences as SearchPreferencesRow
 from job_agent.db.models import SearchRun as SearchRunRow
 from job_agent.jobs.notifications import generate_notifications
 from job_agent.jobs.query_generator import generate_search_queries
-from job_agent.jobs.service import build_sources, mark_stale_jobs_expired, run_scan
+from job_agent.jobs.service import mark_stale_jobs_expired, run_scan
 from job_agent.jobs.source import JobSource
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
 from job_agent.logging.setup import get_logger, log_event
 from job_agent.matching.service import run_matching
-from job_agent.net.http_client import ResilientHttpClient
 
 logger = get_logger("job_agent.jobs.search_run")
 
@@ -110,21 +109,19 @@ def execute_search_run(
     session.commit()
 
     try:
-        if sources is not None:
-            active_sources = sources
-        else:
-            http = ResilientHttpClient(
-                max_retries=config.sources.global_limits.max_retries_per_request,
-                backoff_seconds=config.sources.global_limits.default_backoff_seconds,
-                backoff_multiplier=config.sources.global_limits.default_backoff_multiplier,
-                backoff_max_seconds=config.sources.global_limits.default_backoff_max_seconds,
-            )
-            try:
-                active_sources = build_sources(config, http, portfolio.all_queries)
-            finally:
-                http.close()
-
-        scan_results = run_scan(session, config, active_sources)
+        # Delegates the whole scan — including building the HTTP client,
+        # building sources from it, and closing it — to `run_scan`, which
+        # already keeps that client open for exactly as long as the sources
+        # built from it are actually used. An earlier version duplicated
+        # this lifecycle here and got it wrong: it closed the shared
+        # `ResilientHttpClient` right after `build_sources()` returned
+        # (which only constructs adapter objects — no network call happens
+        # until they're scanned), so every real (non-test-injected) source
+        # scan failed with "Cannot send a request, as the client has been
+        # closed." — silently, in every real caller (CLI, web API, the
+        # autonomous scheduler), never a single job found even with full
+        # network access. Caught during a real-world activation audit.
+        scan_results = run_scan(session, config, sources, queries=portfolio.all_queries)
         expired = mark_stale_jobs_expired(session)
         session.commit()
 
