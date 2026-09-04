@@ -12,14 +12,20 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from job_agent.applications.checklist import compute_checklist
 from job_agent.applications.follow_up import compute_follow_up_recommendations
-from job_agent.db.models import Application, ApplicationEvent
+from job_agent.applications.repository import record_event
+from job_agent.applications.scorecard import compute_scorecard
+from job_agent.db.models import Application, ApplicationEvent, Resume
 from job_agent.db.models import Job as JobRow
 from job_agent.web.deps import CandidateDep, SessionDep
 from job_agent.web.routers.jobs import _job_out, _latest_match
 from job_agent.web.schemas import (
     PIPELINE_STAGES,
     AnalyticsOut,
+    ApplicationChecklistOut,
+    ApplicationHistoryEventOut,
+    ApplicationScorecardOut,
     CareerPathAnalyticsOut,
     FollowUpRecommendationOut,
     PipelineItemOut,
@@ -34,6 +40,9 @@ def _item_out(
     session: Session, application: Application, job: JobRow, candidate_id: int
 ) -> PipelineItemOut:
     match_row = _latest_match(session, job.id, candidate_id)
+    resume = session.get(Resume, application.resume_id) if application.resume_id else None
+    scorecard = compute_scorecard(job, match_row)
+    checklist = compute_checklist(application, resume)
     return PipelineItemOut(
         application_id=application.id,
         job=_job_out(job, match_row, application),
@@ -46,6 +55,22 @@ def _item_out(
         outcome=application.outcome,
         created_at=application.created_at,
         updated_at=application.updated_at,
+        scorecard=ApplicationScorecardOut(
+            candidate_fit=scorecard.candidate_fit,
+            job_quality=scorecard.job_quality,
+            career_value=scorecard.career_value,
+            application_viability=scorecard.application_viability,
+            overall_score=scorecard.overall_score,
+            overall_recommendation=scorecard.overall_recommendation,
+        ),
+        checklist=ApplicationChecklistOut(
+            resume_selected=checklist.resume_selected,
+            resume_tailored=checklist.resume_tailored,
+            cover_letter_ready=checklist.cover_letter_ready,
+            questions_prepared=checklist.questions_prepared,
+            submitted=checklist.submitted,
+            confirmation_received=checklist.confirmation_received,
+        ),
     )
 
 
@@ -71,10 +96,16 @@ def list_pipeline(session: SessionDep, candidate: CandidateDep) -> list[Pipeline
 def update_pipeline_item(
     application_id: int, body: PipelineUpdateIn, session: SessionDep, candidate: CandidateDep
 ) -> PipelineItemOut:
+    """Every field actually changed here is also appended to
+    `application_events` (Part 4.13's Application History) via
+    `record_event` — an insert-only log, so re-editing a note or moving a
+    card back a stage never erases what the record used to say."""
     _, candidate_id = candidate
     application = session.get(Application, application_id)
     if application is None or application.candidate_id != candidate_id:
         raise HTTPException(status_code=404, detail=f"No application with id {application_id}.")
+
+    changes: dict[str, dict[str, str | bool | None]] = {}
 
     if body.pipeline_stage is not None:
         if body.pipeline_stage not in PIPELINE_STAGES:
@@ -82,23 +113,76 @@ def update_pipeline_item(
                 status_code=422,
                 detail=f"pipeline_stage must be one of {PIPELINE_STAGES}.",
             )
-        application.pipeline_stage = body.pipeline_stage
-    if body.notes is not None:
+        if body.pipeline_stage != application.pipeline_stage:
+            changes["pipeline_stage"] = {
+                "from": application.pipeline_stage,
+                "to": body.pipeline_stage,
+            }
+            application.pipeline_stage = body.pipeline_stage
+    if body.notes is not None and body.notes != application.notes:
+        changes["notes"] = {"to": body.notes}
         application.notes = body.notes
-    if body.recruiter_contact is not None:
+    recruiter_contact_changed = (
+        body.recruiter_contact is not None
+        and body.recruiter_contact != application.recruiter_contact
+    )
+    if recruiter_contact_changed:
+        changes["recruiter_contact"] = {"to": body.recruiter_contact}
         application.recruiter_contact = body.recruiter_contact
     if body.interview_date is not None:
         application.interview_date = body.interview_date
     if body.follow_up_date is not None:
         application.follow_up_date = body.follow_up_date
-    if body.outcome is not None:
+    if body.outcome is not None and body.outcome != application.outcome:
+        changes["outcome"] = {"from": application.outcome, "to": body.outcome}
         application.outcome = body.outcome
+    cover_letter_ready_changed = (
+        body.cover_letter_ready is not None
+        and body.cover_letter_ready != application.cover_letter_ready
+    )
+    if cover_letter_ready_changed:
+        changes["cover_letter_ready"] = {"to": body.cover_letter_ready}
+        application.cover_letter_ready = body.cover_letter_ready
+    questions_prepared_changed = (
+        body.questions_prepared is not None
+        and body.questions_prepared != application.questions_prepared
+    )
+    if questions_prepared_changed:
+        changes["questions_prepared"] = {"to": body.questions_prepared}
+        application.questions_prepared = body.questions_prepared
 
+    if changes:
+        record_event(session, application.id, "PIPELINE_UPDATED", changes)
     session.commit()
     job = session.get(JobRow, application.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Application's job no longer exists.")
     return _item_out(session, application, job, candidate_id)
+
+
+@router.get("/{application_id}/history", response_model=list[ApplicationHistoryEventOut])
+def application_history(
+    application_id: int, session: SessionDep, candidate: CandidateDep
+) -> list[ApplicationHistoryEventOut]:
+    """Part 4.13's Application History — the same immutable
+    `application_events` audit trail the automation pipeline already
+    writes to, read back oldest-first. Nothing here is ever edited or
+    deleted; a correction is a new event, not a rewrite."""
+    _, candidate_id = candidate
+    application = session.get(Application, application_id)
+    if application is None or application.candidate_id != candidate_id:
+        raise HTTPException(status_code=404, detail=f"No application with id {application_id}.")
+    events = session.execute(
+        select(ApplicationEvent)
+        .where(ApplicationEvent.application_id == application_id)
+        .order_by(ApplicationEvent.created_at)
+    ).scalars()
+    return [
+        ApplicationHistoryEventOut(
+            event_type=e.event_type, details=e.details, created_at=e.created_at
+        )
+        for e in events
+    ]
 
 
 @router.delete("/{application_id}", status_code=204)
@@ -107,13 +191,14 @@ def remove_pipeline_item(application_id: int, session: SessionDep, candidate: Ca
     happened (a real submission, an audit trail) — that history is never
     silently deleted; move it to REJECTED instead.
 
-    The `pipeline_stage`/`submitted_at is None` guards below mean the only
-    `ApplicationEvent` rows a deletable application can ever have is the
-    single `APPLICATION_DISCOVERED` bookkeeping event `get_or_create_
-    application` writes when "save" first creates the row — never a
-    submission-related event — so removing those alongside the row here
-    does not touch the safety-relevant audit trail `job_agent.
-    applications.repository.record_event`'s docstring describes."""
+    The `pipeline_stage`/`submitted_at is None` guards below mean a
+    deletable application can only ever carry the initial
+    `APPLICATION_DISCOVERED` bookkeeping event plus any `PIPELINE_UPDATED`
+    events from editing notes/recruiter contact while still SAVED/
+    SHORTLISTED — never a submission-related event — so removing those
+    alongside the row here does not touch the safety-relevant audit trail
+    `job_agent.applications.repository.record_event`'s docstring
+    describes."""
     _, candidate_id = candidate
     application = session.get(Application, application_id)
     if application is None or application.candidate_id != candidate_id:
@@ -147,8 +232,9 @@ def follow_up_recommendations(
     Never contacts a recruiter — this only flags what to look at."""
     _, candidate_id = candidate
     applications = list(
-        session.execute(select(Application).where(Application.candidate_id == candidate_id))
-        .scalars()
+        session.execute(
+            select(Application).where(Application.candidate_id == candidate_id)
+        ).scalars()
     )
     applications_with_jobs = []
     for application in applications:
@@ -237,9 +323,7 @@ def pipeline_analytics(session: SessionDep, candidate: CandidateDep) -> Analytic
         application_rate=(
             round(100 * total_applied / len(applications), 1) if applications else 0.0
         ),
-        interview_rate=(
-            round(100 * total_interviews / total_applied, 1) if total_applied else 0.0
-        ),
+        interview_rate=(round(100 * total_interviews / total_applied, 1) if total_applied else 0.0),
         offer_rate=(round(100 * total_offers / total_applied, 1) if total_applied else 0.0),
         by_company=company_stats,
     )

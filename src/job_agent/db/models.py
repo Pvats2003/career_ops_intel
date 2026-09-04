@@ -379,6 +379,15 @@ class Application(Base, TimestampMixin):
     follow_up_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     outcome: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Application checklist (FINAL GOD MODE Part 4.12) — the two items with
+    # no automatically-derivable signal elsewhere (resume selection/
+    # tailoring already come from `resume_id`/`Resume.is_tailored`;
+    # submitted/confirmed already come from `status`/`submitted_at`/
+    # `confirmation_id`/`confirmation_url`). A candidate ticks these
+    # manually; never inferred.
+    cover_letter_ready: Mapped[bool] = mapped_column(default=False)
+    questions_prepared: Mapped[bool] = mapped_column(default=False)
+
 
 class ApplicationAnswer(Base, TimestampMixin):
     __tablename__ = "application_answers"

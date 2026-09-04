@@ -470,6 +470,85 @@ def test_pipeline_update_notes_and_dates(tmp_path, monkeypatch, real_config):
     assert body["interview_date"].startswith("2026-09-10")
 
 
+def test_pipeline_item_carries_scorecard_and_checklist(tmp_path, monkeypatch, real_config):
+    """Part 4.11/4.12: the same scorecard/checklist logic used everywhere
+    else — never a second, drifting computation on the pipeline view."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="scorecard-job")
+    _seed_match(db_path, job_id, candidate_id, overall_score=88, decision="APPLY")
+    application_id = client.post(f"/api/jobs/{job_id}/save").json()["application_id"]
+
+    body = client.get("/api/pipeline").json()[0]
+    assert body["application_id"] == application_id
+    assert body["scorecard"]["candidate_fit"] == 88.0
+    assert body["scorecard"]["career_value"] == 100.0
+    assert "overall_recommendation" in body["scorecard"]
+    assert body["checklist"]["resume_selected"] is False
+    assert body["checklist"]["cover_letter_ready"] is False
+    assert body["checklist"]["submitted"] is False
+
+
+def test_pipeline_checklist_toggles_are_manual_and_persist(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="checklist-job")
+    application_id = client.post(f"/api/jobs/{job_id}/save").json()["application_id"]
+
+    r = client.patch(
+        f"/api/pipeline/{application_id}",
+        json={"cover_letter_ready": True, "questions_prepared": True},
+    )
+    assert r.status_code == 200
+    assert r.json()["checklist"]["cover_letter_ready"] is True
+    assert r.json()["checklist"]["questions_prepared"] is True
+
+    # Persisted, not just echoed back.
+    refetched = client.get("/api/pipeline").json()[0]
+    assert refetched["checklist"]["cover_letter_ready"] is True
+    assert refetched["checklist"]["questions_prepared"] is True
+
+
+def test_pipeline_history_records_every_change_never_overwrites(tmp_path, monkeypatch, real_config):
+    """Part 4.13: History is append-only — two edits produce two entries,
+    and the first entry's content is never lost."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="history-job")
+    application_id = client.post(f"/api/jobs/{job_id}/save").json()["application_id"]
+
+    client.patch(f"/api/pipeline/{application_id}", json={"notes": "First note."})
+    client.patch(f"/api/pipeline/{application_id}", json={"notes": "Second note."})
+
+    r = client.get(f"/api/pipeline/{application_id}/history")
+    assert r.status_code == 200
+    events = r.json()
+    # At least the initial APPLICATION_DISCOVERED bookkeeping event plus
+    # two PIPELINE_UPDATED entries from the two distinct note edits above.
+    pipeline_updates = [e for e in events if e["event_type"] == "PIPELINE_UPDATED"]
+    assert len(pipeline_updates) == 2
+    assert pipeline_updates[0]["details"]["notes"]["to"] == "First note."
+    assert pipeline_updates[1]["details"]["notes"]["to"] == "Second note."
+    # Oldest first.
+    assert events[0]["created_at"] <= events[-1]["created_at"]
+
+
+def test_pipeline_history_404_for_missing_application(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/pipeline/999999/history")
+    assert r.status_code == 404
+
+
+def test_pipeline_update_with_no_changes_appends_no_event(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="no-op-job")
+    application_id = client.post(f"/api/jobs/{job_id}/save").json()["application_id"]
+
+    before = len(client.get(f"/api/pipeline/{application_id}/history").json())
+    # Re-sending the SAME pipeline_stage it already has is not a change.
+    client.patch(f"/api/pipeline/{application_id}", json={"pipeline_stage": "SAVED"})
+    after = len(client.get(f"/api/pipeline/{application_id}/history").json())
+    assert after == before
+
+
 def test_pipeline_delete_refuses_past_shortlisted(tmp_path, monkeypatch, real_config):
     client, db_path = _client(tmp_path, monkeypatch, real_config)
     job_id = _seed_job(db_path, fingerprint="protect-history")

@@ -116,6 +116,30 @@ export const PIPELINE_STAGES = [
 ] as const
 export type PipelineStage = (typeof PIPELINE_STAGES)[number]
 
+export interface ApplicationScorecardOut {
+  candidate_fit: number
+  job_quality: number
+  career_value: number
+  application_viability: number
+  overall_score: number
+  overall_recommendation: string
+}
+
+export interface ApplicationChecklistOut {
+  resume_selected: boolean
+  resume_tailored: boolean
+  cover_letter_ready: boolean
+  questions_prepared: boolean
+  submitted: boolean
+  confirmation_received: boolean
+}
+
+export interface ApplicationHistoryEventOut {
+  event_type: string
+  details: Record<string, unknown>
+  created_at: string
+}
+
 export interface PipelineItemOut {
   application_id: number
   job: JobOut
@@ -128,6 +152,8 @@ export interface PipelineItemOut {
   outcome: string | null
   created_at: string
   updated_at: string
+  scorecard: ApplicationScorecardOut
+  checklist: ApplicationChecklistOut
 }
 
 export interface PipelineUpdateIn {
@@ -137,6 +163,8 @@ export interface PipelineUpdateIn {
   interview_date?: string
   follow_up_date?: string
   outcome?: string
+  cover_letter_ready?: boolean
+  questions_prepared?: boolean
 }
 
 export interface CandidateProfileOut {

@@ -1,5 +1,6 @@
 import type {
   AnalyticsOut,
+  ApplicationHistoryEventOut,
   AssistantResponseOut,
   CandidateProfileOut,
   CareerPathComparisonRowOut,
@@ -109,6 +110,8 @@ export const api = {
     }),
   removePipelineItem: (applicationId: number) =>
     request<void>(`/pipeline/${applicationId}`, { method: 'DELETE' }),
+  applicationHistory: (applicationId: number) =>
+    request<ApplicationHistoryEventOut[]>(`/pipeline/${applicationId}/history`),
   analytics: () => request<AnalyticsOut>('/pipeline/analytics'),
   followUps: () => request<FollowUpRecommendationOut[]>('/pipeline/follow-ups'),
 

@@ -183,6 +183,30 @@ PIPELINE_STAGES: tuple[str, ...] = (
 )
 
 
+class ApplicationScorecardOut(BaseModel):
+    candidate_fit: float
+    job_quality: float
+    career_value: float
+    application_viability: float
+    overall_score: float
+    overall_recommendation: str
+
+
+class ApplicationChecklistOut(BaseModel):
+    resume_selected: bool
+    resume_tailored: bool
+    cover_letter_ready: bool
+    questions_prepared: bool
+    submitted: bool
+    confirmation_received: bool
+
+
+class ApplicationHistoryEventOut(BaseModel):
+    event_type: str
+    details: dict
+    created_at: datetime
+
+
 class PipelineItemOut(BaseModel):
     application_id: int
     job: JobOut
@@ -195,6 +219,8 @@ class PipelineItemOut(BaseModel):
     outcome: str | None
     created_at: datetime
     updated_at: datetime
+    scorecard: ApplicationScorecardOut
+    checklist: ApplicationChecklistOut
 
 
 class PipelineUpdateIn(BaseModel):
@@ -204,6 +230,8 @@ class PipelineUpdateIn(BaseModel):
     interview_date: datetime | None = None
     follow_up_date: datetime | None = None
     outcome: str | None = None
+    cover_letter_ready: bool | None = None
+    questions_prepared: bool | None = None
 
 
 # --------------------------------------------------------------------------
