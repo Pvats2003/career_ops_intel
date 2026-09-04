@@ -24,6 +24,7 @@ from job_agent.applications.answer_engine import classify_question, generate_ans
 from job_agent.applications.cover_letter import generate_cover_letter
 from job_agent.applications.repository import get_or_create_application
 from job_agent.applications.schema import ApplicationQuestion
+from job_agent.candidate.career_paths import discover_career_paths
 from job_agent.candidate.explain import explain_ranking
 from job_agent.candidate.learning import compute_learned_preferences
 from job_agent.config.loader import AppConfig
@@ -38,6 +39,7 @@ from job_agent.jobs.url_check import check_application_url
 from job_agent.llm.provider import build_llm_provider
 from job_agent.matching.ranking import rank_jobs
 from job_agent.matching.service import run_matching
+from job_agent.matching.text import contains_keyword
 from job_agent.net.http_client import ResilientHttpClient
 from job_agent.resume.extractor import extract_resume_text
 from job_agent.resume.tailor import tailor_resume_for_job
@@ -105,10 +107,28 @@ def _canonicalize_duplicates(
     return out
 
 
+def _rank_maps(
+    session: Session, config: AppConfig, candidate_id: int, jobs: list[JobRow]
+) -> tuple[dict[int, float], dict[int, float]]:
+    """(rank_score, career_value) per job id — one shared `rank_jobs` call
+    so "recommended" and "highest career value" sort never disagree with
+    Top 10's own ranking."""
+    pairs = [(job, _latest_match(session, job.id, candidate_id)) for job in jobs]
+    preferences = compute_learned_preferences(
+        job_view.matched_jobs_with_applications(session, candidate_id)
+    )
+    ranked = rank_jobs(pairs, config.automation.priority_weights, preferences=preferences)
+    rank_scores = {r.job.id: r.rank_score for r in ranked}
+    career_values = {r.job.id: r.components.get("career_value", 0.0) for r in ranked}
+    return rank_scores, career_values
+
+
 @router.get("", response_model=JobListOut)
 def list_jobs(
     session: SessionDep,
     candidate: CandidateDep,
+    config: ConfigDep,
+    q: str | None = Query(default=None, description="Free-text search across title/company."),
     min_score: int | None = Query(default=None, ge=0, le=100),
     decision: str | None = Query(default=None),
     remote_type: str | None = Query(default=None),
@@ -116,23 +136,38 @@ def list_jobs(
     company: str | None = Query(default=None),
     min_salary: float | None = Query(default=None),
     pipeline_stage: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    posted_within_days: int | None = Query(default=None, ge=1),
+    career_path: str | None = Query(
+        default=None, description="A career path label from GET /candidate/career-paths."
+    ),
     include_inactive: bool = Query(
         default=False,
         description="Include CLOSED/EXPIRED postings — excluded by default (section 7: "
         "never keep recommending dead jobs).",
     ),
-    sort: Literal["match", "newest", "salary", "company"] = Query(default="match"),
+    sort: Literal["recommended", "match", "newest", "salary", "company", "career_value"] = Query(
+        default="match"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> JobListOut:
-    _, candidate_id = candidate
+    profile, candidate_id = candidate
     jobs = list(session.execute(select(JobRow)).scalars())
     source_names = _source_name_map(session)
 
+    career_path_titles: set[str] | None = None
+    if career_path is not None:
+        paths = discover_career_paths(profile)
+        matched_path = next((p for p in paths if p.label == career_path), None)
+        career_path_titles = set(matched_path.typical_titles) if matched_path else set()
+
+    now = datetime.now(UTC)
     items: list[JobOut] = []
     for job, also_seen_on, duplicate_count in _canonicalize_duplicates(jobs, source_names):
         match_row = _latest_match(session, job.id, candidate_id)
         application = _application_for(session, job.id, candidate_id)
+        job_source_name = source_names.get(job.source_id, None) if job.source_id else None
 
         if not include_inactive and job.lifecycle_status != "ACTIVE":
             continue
@@ -152,19 +187,39 @@ def list_jobs(
             application is None or application.pipeline_stage != pipeline_stage
         ):
             continue
+        if source is not None and (job_source_name or "").lower() != source.lower():
+            continue
+        if posted_within_days is not None:
+            reference = job.posted_at or job.discovered_at
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=UTC)
+            if (now - reference).days > posted_within_days:
+                continue
+        if career_path_titles is not None and not any(
+            contains_keyword(job.title, t) for t in career_path_titles
+        ):
+            continue
+        if q is not None:
+            haystack = f"{job.title} {job.company_name} {job.description or ''}".lower()
+            if q.lower() not in haystack:
+                continue
 
         items.append(
             _job_out(
                 job,
                 match_row,
                 application,
-                source_name=source_names.get(job.source_id, None) if job.source_id else None,
+                source_name=job_source_name,
                 also_seen_on=also_seen_on,
                 duplicate_count=duplicate_count,
             )
         )
 
-    if sort == "match":
+    if sort in ("recommended", "career_value"):
+        rank_scores, career_values = _rank_maps(session, config, candidate_id, jobs)
+        score_map = rank_scores if sort == "recommended" else career_values
+        items.sort(key=lambda j: score_map.get(j.id, -1.0), reverse=True)
+    elif sort == "match":
         items.sort(key=lambda j: j.match.overall_score if j.match else -1, reverse=True)
     elif sort == "newest":
         items.sort(key=lambda j: j.posted_at or j.discovered_at, reverse=True)

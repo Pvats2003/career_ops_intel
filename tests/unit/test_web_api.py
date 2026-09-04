@@ -125,6 +125,9 @@ def _seed_job(
     lifecycle_status: str = "ACTIVE",
     posted_at=None,
     discovered_at=None,
+    title: str = "Business Analyst",
+    company_name: str = "Acme Corp",
+    description: str = "Analyze business processes.",
 ) -> int:
     engine = get_engine(f"sqlite:///{db_path}")
     init_db(engine)
@@ -142,8 +145,8 @@ def _seed_job(
             source_id = source.id
         job = JobRow(
             source_id=source_id,
-            company_name="Acme Corp",
-            title="Business Analyst",
+            company_name=company_name,
+            title=title,
             location="Remote",
             remote_type="remote",
             employment_type="full_time",
@@ -152,7 +155,7 @@ def _seed_job(
             currency="USD",
             application_url="https://example.test/apply",
             job_fingerprint=fingerprint,
-            description="Analyze business processes.",
+            description=description,
             requirements="SQL, Excel",
             lifecycle_status=lifecycle_status,
             posted_at=posted_at,
@@ -351,6 +354,96 @@ def test_list_jobs_filters_by_min_score(tmp_path, monkeypatch, real_config):
     assert r.status_code == 200
     ids = {item["id"] for item in r.json()["items"]}
     assert ids == {high_id}
+
+
+def test_list_jobs_free_text_search_matches_title_and_company(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    analyst_id = _seed_job(
+        db_path, fingerprint="q-analyst", title="Business Analyst", company_name="Acme Corp"
+    )
+    engineer_id = _seed_job(
+        db_path, fingerprint="q-engineer", title="Software Engineer", company_name="Globex"
+    )
+
+    r = client.get("/api/jobs", params={"q": "analyst"})
+    ids = {item["id"] for item in r.json()["items"]}
+    assert ids == {analyst_id}
+
+    r = client.get("/api/jobs", params={"q": "globex"})
+    ids = {item["id"] for item in r.json()["items"]}
+    assert ids == {engineer_id}
+
+
+def test_list_jobs_filters_by_source(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    greenhouse_id = _seed_job(db_path, fingerprint="src-a", source_name="greenhouse")
+    lever_id = _seed_job(db_path, fingerprint="src-b", source_name="lever")
+
+    r = client.get("/api/jobs", params={"source": "greenhouse"})
+    ids = {item["id"] for item in r.json()["items"]}
+    assert ids == {greenhouse_id}
+    assert lever_id not in ids
+
+
+def test_list_jobs_filters_by_posted_within_days(tmp_path, monkeypatch, real_config):
+    from datetime import UTC, datetime, timedelta
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    recent_id = _seed_job(
+        db_path, fingerprint="recent", posted_at=datetime.now(UTC) - timedelta(days=1)
+    )
+    old_id = _seed_job(db_path, fingerprint="old", posted_at=datetime.now(UTC) - timedelta(days=30))
+
+    r = client.get("/api/jobs", params={"posted_within_days": 7})
+    ids = {item["id"] for item in r.json()["items"]}
+    assert ids == {recent_id}
+    assert old_id not in ids
+
+
+def test_list_jobs_sort_recommended_matches_top10_ordering(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    low_id = _seed_job(db_path, fingerprint="rec-low")
+    high_id = _seed_job(db_path, fingerprint="rec-high")
+    _seed_match(db_path, low_id, candidate_id, overall_score=30, decision="SKIP")
+    _seed_match(db_path, high_id, candidate_id, overall_score=95, decision="APPLY")
+
+    r = client.get("/api/jobs", params={"sort": "recommended"})
+    ids_in_order = [item["id"] for item in r.json()["items"]]
+    assert ids_in_order.index(high_id) < ids_in_order.index(low_id)
+
+
+def test_list_jobs_sort_career_value(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    skip_id = _seed_job(db_path, fingerprint="cv-skip")
+    apply_id = _seed_job(db_path, fingerprint="cv-apply")
+    _seed_match(db_path, skip_id, candidate_id, overall_score=50, decision="SKIP")
+    _seed_match(db_path, apply_id, candidate_id, overall_score=50, decision="APPLY")
+
+    r = client.get("/api/jobs", params={"sort": "career_value"})
+    ids_in_order = [item["id"] for item in r.json()["items"]]
+    assert ids_in_order.index(apply_id) < ids_in_order.index(skip_id)
+
+
+def test_list_jobs_filters_by_career_path(tmp_path, monkeypatch, real_config):
+    """A career path label with real typical_titles from the synthetic
+    candidate's own discovered paths — filtering must actually narrow to
+    jobs whose title matches, never silently ignore the param."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    paths = client.get("/api/candidate/career-paths").json()
+    if not paths or not paths[0]["typical_titles"]:
+        return  # nothing to assert against for this synthetic profile
+    label = paths[0]["label"]
+    matching_title = paths[0]["typical_titles"][0]
+
+    match_id = _seed_job(db_path, fingerprint="cp-match", title=matching_title)
+    other_id = _seed_job(db_path, fingerprint="cp-other", title="Completely Unrelated Role Zzz")
+
+    r = client.get("/api/jobs", params={"career_path": label})
+    ids = {item["id"] for item in r.json()["items"]}
+    assert match_id in ids
+    assert other_id not in ids
 
 
 def test_get_job_detail_404_for_missing_job(tmp_path, monkeypatch, real_config):

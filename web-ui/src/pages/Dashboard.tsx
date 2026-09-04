@@ -10,6 +10,7 @@ import type {
   MorningBriefingOut,
   NewSinceLastVisitOut,
   RankedJobOut,
+  SearchRunOut,
 } from '../types'
 
 const TIER_ICON: Record<string, string> = { exceptional: '🔥', strong: '🟢', possible: '🟡' }
@@ -22,6 +23,7 @@ export default function Dashboard() {
   const [top10, setTop10] = useState<RankedJobOut[]>([])
   const [followUps, setFollowUps] = useState<FollowUpRecommendationOut[]>([])
   const [insights, setInsights] = useState<InsightsOut | null>(null)
+  const [lastSearchRun, setLastSearchRun] = useState<SearchRunOut | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState<'scan' | 'match' | 'search' | null>(null)
   const [expandedFollowUpId, setExpandedFollowUpId] = useState<number | null>(null)
@@ -38,6 +40,10 @@ export default function Dashboard() {
     api.top10().then(setTop10).catch(() => setTop10([]))
     api.followUps().then(setFollowUps).catch(() => setFollowUps([]))
     api.insights().then(setInsights).catch(() => setInsights(null))
+    api
+      .listSearchRuns()
+      .then((runs) => setLastSearchRun(runs[0] ?? null))
+      .catch(() => setLastSearchRun(null))
   }
 
   // Separate from `load()`: this call advances the server's "last visited"
@@ -373,6 +379,33 @@ export default function Dashboard() {
               </Card>
             </section>
           )}
+
+          <section>
+            <h2 className="mb-3 text-lg font-semibold text-slate-900 dark:text-slate-50">
+              🔍 Search activity
+            </h2>
+            <Card className="flex flex-wrap items-center justify-between gap-3 p-4">
+              {lastSearchRun ? (
+                <p className="text-sm text-slate-600 dark:text-slate-400">
+                  Last run {new Date(lastSearchRun.started_at).toLocaleString()} —{' '}
+                  {lastSearchRun.jobs_found} found, {lastSearchRun.qualified} qualified
+                  {lastSearchRun.errors.length > 0 &&
+                    ` (${lastSearchRun.errors.length} source error${lastSearchRun.errors.length === 1 ? '' : 's'})`}
+                  .
+                </p>
+              ) : (
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                  No search runs yet — run a full search to see activity here.
+                </p>
+              )}
+              <Link
+                to="/search-activity"
+                className="text-sm font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+              >
+                View full activity →
+              </Link>
+            </Card>
+          </section>
         </>
       )}
     </div>
