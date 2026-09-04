@@ -30,11 +30,14 @@ freshness:
   recent_days: 7
 
 priority_weights:
-  match: 0.50
-  freshness: 0.20
+  match: 0.45
+  freshness: 0.15
   career_value: 0.15
   company_fit: 0.10
   application_ease: 0.05
+  # A bounded nudge from repeated save/apply behavior — see
+  # job_agent.candidate.learning / job_agent.matching.ranking.
+  behavioral_fit: 0.10
 
 scoring_weights:
   skills: 0.25

@@ -261,6 +261,33 @@ class CareerPathOut(BaseModel):
     recommended_priority: str
 
 
+class CareerProfileOut(BaseModel):
+    primary_direction: str | None
+    strengths: list[str]
+    growing_area: str | None
+    skill_gaps: list[str]
+    best_locations: list[str]
+
+
+class CareerPathComparisonRowOut(BaseModel):
+    label: str
+    current_fit: int
+    job_volume: int
+    career_upside: str
+    skill_gap: str
+    interview_rate: float | None
+    interview_sample_size: int
+    overall: int
+
+
+class SkillGapEntryOut(BaseModel):
+    skill: str
+    frequency_count: int
+    frequency_pct: float
+    unlocks_count: int
+    relevant_career_paths: list[str]
+
+
 # --------------------------------------------------------------------------
 # Resume tailoring / cover letter / (assistant is above)
 # --------------------------------------------------------------------------
@@ -413,6 +440,11 @@ class RankedJobOut(BaseModel):
     recommendation: str
 
 
+class NewSinceLastVisitOut(BaseModel):
+    previous_visit_at: datetime | None
+    jobs: list[RankedJobOut]
+
+
 # --------------------------------------------------------------------------
 # Follow-up intelligence (Phase 13)
 # --------------------------------------------------------------------------
@@ -423,6 +455,32 @@ class FollowUpRecommendationOut(BaseModel):
     job: JobOut
     applied_days_ago: int
     suggested_action: str
+
+
+# --------------------------------------------------------------------------
+# Morning briefing (FINAL GOD MODE Part 1.3)
+# --------------------------------------------------------------------------
+
+
+class BriefingHighlightOut(BaseModel):
+    job_id: int
+    title: str
+    company: str
+    location: str | None
+    rank_score: float
+    freshness_label: str
+    why: str | None
+
+
+class MorningBriefingOut(BaseModel):
+    total_opportunities: int
+    exceptional_count: int
+    strong_count: int
+    possible_count: int
+    top_highlights: list[BriefingHighlightOut]
+    follow_up_summaries: list[str]
+    career_insight: str | None
+    recommendation: str | None
 
 
 # --------------------------------------------------------------------------

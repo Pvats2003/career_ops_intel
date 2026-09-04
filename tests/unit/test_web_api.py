@@ -115,6 +115,7 @@ def _seed_job(
     source_name: str | None = None,
     lifecycle_status: str = "ACTIVE",
     posted_at=None,
+    discovered_at=None,
 ) -> int:
     engine = get_engine(f"sqlite:///{db_path}")
     init_db(engine)
@@ -149,6 +150,8 @@ def _seed_job(
         )
         session.add(job)
         session.flush()
+        if discovered_at is not None:
+            job.discovered_at = discovered_at
         job_id = job.id
         session.commit()
     return job_id
@@ -879,3 +882,101 @@ def test_insights_surfaces_notable_pattern_from_saved_jobs(tmp_path, monkeypatch
     assert any("remote" in s.lower() for s in body["summary"])
     remote_category = next(c for c in body["categories"] if c["category"] == "remote")
     assert remote_category["saved"] == 4
+
+
+def test_new_since_last_visit_shows_everything_on_first_visit(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="first-visit-job")
+
+    r = client.get("/api/dashboard/new-since-last-visit")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["previous_visit_at"] is None
+    assert len(body["jobs"]) == 1
+
+
+def test_new_since_last_visit_never_repeats_the_same_job(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="repeat-check-job")
+
+    first = client.get("/api/dashboard/new-since-last-visit")
+    assert len(first.json()["jobs"]) == 1
+
+    second = client.get("/api/dashboard/new-since-last-visit")
+    assert second.json()["previous_visit_at"] is not None
+    assert second.json()["jobs"] == []
+
+
+def test_new_since_last_visit_shows_only_jobs_discovered_after_previous_visit(
+    tmp_path, monkeypatch, real_config
+):
+    from datetime import UTC, datetime, timedelta
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="old-job")
+    client.get("/api/dashboard/new-since-last-visit")
+
+    fresh_job_id = _seed_job(
+        db_path, fingerprint="fresh-job", discovered_at=datetime.now(UTC) + timedelta(minutes=1)
+    )
+
+    r = client.get("/api/dashboard/new-since-last-visit")
+    body = r.json()
+    assert len(body["jobs"]) == 1
+    assert body["jobs"][0]["job"]["id"] == fresh_job_id
+
+
+def test_career_profile_grounded_in_real_career_paths(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/candidate/career-profile")
+    assert r.status_code == 200
+    body = r.json()
+    assert "primary_direction" in body
+    assert "best_locations" in body
+    # Never fabricated when the synthetic candidate has no real skills/paths.
+    if body["primary_direction"] is None:
+        assert body["strengths"] == []
+
+
+def test_career_path_comparison_empty_when_no_paths(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/candidate/career-paths/compare")
+    assert r.status_code == 200
+    assert isinstance(r.json(), list)
+
+
+def test_skill_gaps_empty_by_default(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/candidate/skill-gaps")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_morning_briefing_empty_by_default(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/dashboard/briefing")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_opportunities"] == 0
+    assert body["top_highlights"] == []
+    assert body["follow_up_summaries"] == []
+
+
+def test_morning_briefing_counts_and_highlights_reflect_real_matches(
+    tmp_path, monkeypatch, real_config
+):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    apply_job = _seed_job(db_path, fingerprint="briefing-apply")
+    review_job = _seed_job(db_path, fingerprint="briefing-review")
+    _seed_match(db_path, apply_job, candidate_id, overall_score=95, decision="APPLY")
+    _seed_match(db_path, review_job, candidate_id, overall_score=70, decision="REVIEW")
+
+    r = client.get("/api/dashboard/briefing")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["exceptional_count"] == 1
+    assert body["strong_count"] == 1
+    assert body["total_opportunities"] == 2
+    assert len(body["top_highlights"]) >= 1
+    assert body["top_highlights"][0]["job_id"] == apply_job

@@ -39,6 +39,31 @@ def application_for(session: Session, job_id: int, candidate_id: int) -> Applica
     ).scalar_one_or_none()
 
 
+def matched_jobs_with_applications(
+    session: Session, candidate_id: int
+) -> list[tuple[JobRow, Application | None]]:
+    """Every job this candidate has been MATCHED against (i.e. actually
+    shown a score for), paired with their `Application` row if they
+    engaged with it (save/shortlist/apply — anything), else `None`. The
+    one shared "what has this candidate seen and what did they do about
+    it" query — used by both behavioral insights (`web/routers/
+    candidate.py`) and the ranking engine's behavioral-fit signal
+    (`job_agent.matching.ranking`), so the two never compute this from
+    two different, potentially-drifting queries."""
+    matched_job_ids = list(
+        session.execute(
+            select(JobMatch.job_id).where(JobMatch.candidate_id == candidate_id).distinct()
+        ).scalars()
+    )
+    pairs: list[tuple[JobRow, Application | None]] = []
+    for job_id in matched_job_ids:
+        job = session.get(JobRow, job_id)
+        if job is None:
+            continue
+        pairs.append((job, application_for(session, job_id, candidate_id)))
+    return pairs
+
+
 def match_out(row: JobMatch | None) -> MatchOut | None:
     if row is None:
         return None

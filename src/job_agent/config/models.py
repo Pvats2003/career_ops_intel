@@ -148,11 +148,16 @@ class FreshnessSettings(StrictModel):
 
 
 class PriorityWeights(StrictModel):
-    match: float = 0.50
-    freshness: float = 0.20
+    match: float = 0.45
+    freshness: float = 0.15
     career_value: float = 0.15
     company_fit: float = 0.10
     application_ease: float = 0.05
+    # CAREER OS FINAL GOD MODE Part 1.1 — a bounded nudge from repeated
+    # save/apply behavior (job_agent.candidate.learning), never large
+    # enough on its own to turn a weak match into a strong one or
+    # override a hard-stop exclusion the matcher already applied.
+    behavioral_fit: float = 0.10
 
 
 class ScoringWeights(StrictModel):

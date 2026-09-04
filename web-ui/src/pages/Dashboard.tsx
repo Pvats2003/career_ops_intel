@@ -7,12 +7,18 @@ import type {
   DashboardSummaryOut,
   FollowUpRecommendationOut,
   InsightsOut,
+  MorningBriefingOut,
+  NewSinceLastVisitOut,
   RankedJobOut,
 } from '../types'
 
+const TIER_ICON: Record<string, string> = { exceptional: '🔥', strong: '🟢', possible: '🟡' }
+
 export default function Dashboard() {
   const [summary, setSummary] = useState<DashboardSummaryOut | null>(null)
+  const [briefing, setBriefing] = useState<MorningBriefingOut | null>(null)
   const [applyNow, setApplyNow] = useState<RankedJobOut[]>([])
+  const [newSinceVisit, setNewSinceVisit] = useState<NewSinceLastVisitOut | null>(null)
   const [top10, setTop10] = useState<RankedJobOut[]>([])
   const [followUps, setFollowUps] = useState<FollowUpRecommendationOut[]>([])
   const [insights, setInsights] = useState<InsightsOut | null>(null)
@@ -25,11 +31,19 @@ export default function Dashboard() {
       .dashboardSummary()
       .then(setSummary)
       .catch((e) => setError(e instanceof ApiError ? e.message : 'Failed to load dashboard.'))
+    api.morningBriefing().then(setBriefing).catch(() => setBriefing(null))
     api.applyNowQueue().then(setApplyNow).catch(() => setApplyNow([]))
     api.top10().then(setTop10).catch(() => setTop10([]))
     api.followUps().then(setFollowUps).catch(() => setFollowUps([]))
     api.insights().then(setInsights).catch(() => setInsights(null))
   }
+
+  // Separate from `load()`: this call advances the server's "last visited"
+  // marker, so it must fire exactly once per real page visit, never as
+  // part of a refresh triggered by scan/match/search actions below.
+  useEffect(() => {
+    api.newSinceLastVisit().then(setNewSinceVisit).catch(() => setNewSinceVisit(null))
+  }, [])
 
   useEffect(load, [])
 
@@ -82,16 +96,9 @@ export default function Dashboard() {
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold text-slate-900 dark:text-slate-50">
-            Good morning
-          </h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            {summary
-              ? `${summary.apply_priority_count} job${summary.apply_priority_count === 1 ? '' : 's'} worth applying to today, out of ${summary.job_matches} matched.`
-              : "Here's what's worth your attention right now."}
-          </p>
-        </div>
+        <h1 className="text-2xl font-semibold text-slate-900 dark:text-slate-50">
+          Good morning 👋
+        </h1>
         <div className="flex flex-wrap gap-2">
           <Button variant="secondary" onClick={runScan} disabled={busy !== null}>
             {busy === 'scan' ? 'Scanning…' : 'Scan for jobs'}
@@ -106,6 +113,104 @@ export default function Dashboard() {
       </div>
 
       {error && <ErrorBanner message={error} />}
+
+      {briefing && (
+        <Card className="p-6">
+          {briefing.total_opportunities === 0 ? (
+            <p className="text-sm text-slate-600 dark:text-slate-400">
+              Career OS hasn't found any opportunities worth your attention yet — run a search to
+              get started.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-slate-700 dark:text-slate-300">
+                Career OS found{' '}
+                <span className="font-semibold text-slate-900 dark:text-slate-50">
+                  {briefing.total_opportunities}
+                </span>{' '}
+                opportunit{briefing.total_opportunities === 1 ? 'y' : 'ies'} worth your attention.
+              </p>
+              <div className="mt-2 flex flex-wrap gap-4 text-sm">
+                <span>
+                  {TIER_ICON.exceptional} {briefing.exceptional_count} exceptional match
+                  {briefing.exceptional_count === 1 ? '' : 'es'}
+                </span>
+                <span>
+                  {TIER_ICON.strong} {briefing.strong_count} strong match
+                  {briefing.strong_count === 1 ? '' : 'es'}
+                </span>
+                <span>
+                  {TIER_ICON.possible} {briefing.possible_count} possible match
+                  {briefing.possible_count === 1 ? '' : 'es'}
+                </span>
+              </div>
+            </>
+          )}
+
+          {briefing.top_highlights.length > 0 && (
+            <div className="mt-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Your top {briefing.top_highlights.length}
+              </div>
+              <ol className="mt-2 flex flex-col gap-2">
+                {briefing.top_highlights.map((h, i) => (
+                  <li key={h.job_id} className="text-sm">
+                    <Link
+                      to={`/jobs/${h.job_id}`}
+                      className="font-medium text-slate-900 hover:text-indigo-600 dark:text-slate-50 dark:hover:text-indigo-400"
+                    >
+                      {i + 1}. {h.rank_score.toFixed(0)}% — {h.title}
+                    </Link>
+                    <span className="text-slate-500 dark:text-slate-400">
+                      {' '}
+                      · {h.company}
+                      {h.location ? ` · ${h.location}` : ''} · {h.freshness_label}
+                    </span>
+                    {h.why && (
+                      <p className="text-slate-500 dark:text-slate-400">Why: {h.why}</p>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+
+          {briefing.follow_up_summaries.length > 0 && (
+            <div className="mt-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Application follow-ups
+              </div>
+              <ul className="mt-1 list-inside list-disc text-sm text-slate-600 dark:text-slate-400">
+                {briefing.follow_up_summaries.map((s) => (
+                  <li key={s}>{s}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {briefing.career_insight && (
+            <div className="mt-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Career insight
+              </div>
+              <p className="mt-1 text-sm text-slate-700 dark:text-slate-300">
+                {briefing.career_insight}
+              </p>
+            </div>
+          )}
+
+          {briefing.recommendation && (
+            <div className="mt-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Recommendation
+              </div>
+              <p className="mt-1 text-sm font-medium text-indigo-700 dark:text-indigo-400">
+                {briefing.recommendation}
+              </p>
+            </div>
+          )}
+        </Card>
+      )}
 
       {summary && (
         <>
@@ -142,6 +247,25 @@ export default function Dashboard() {
               </div>
             )}
           </section>
+
+          {newSinceVisit && newSinceVisit.previous_visit_at !== null && (
+            <section>
+              <h2 className="mb-3 text-lg font-semibold text-slate-900 dark:text-slate-50">
+                🆕 New since last visit
+              </h2>
+              {newSinceVisit.jobs.length === 0 ? (
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                  Nothing new since your last visit.
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  {newSinceVisit.jobs.map((r) => (
+                    <JobCard key={r.job.id} job={r.job} onSave={() => api.saveJob(r.job.id).then(load)} />
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
 
           <section>
             <h2 className="mb-3 text-lg font-semibold text-slate-900 dark:text-slate-50">

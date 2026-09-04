@@ -23,6 +23,7 @@ from job_agent.applications.answer_engine import classify_question, generate_ans
 from job_agent.applications.cover_letter import generate_cover_letter
 from job_agent.applications.repository import get_or_create_application
 from job_agent.applications.schema import ApplicationQuestion
+from job_agent.candidate.learning import compute_learned_preferences
 from job_agent.config.loader import AppConfig
 from job_agent.db.models import Job as JobRow
 from job_agent.db.models import JobSource as JobSourceRow
@@ -209,7 +210,12 @@ def _ranked_jobs(
 ) -> list[RankedJobOut]:
     jobs = list(session.execute(select(JobRow)).scalars())
     pairs = [(job, _latest_match(session, job.id, candidate_id)) for job in jobs]
-    ranked = rank_jobs(pairs, config.automation.priority_weights, limit=limit)
+    preferences = compute_learned_preferences(
+        job_view.matched_jobs_with_applications(session, candidate_id)
+    )
+    ranked = rank_jobs(
+        pairs, config.automation.priority_weights, preferences=preferences, limit=limit
+    )
     out = []
     for r in ranked:
         application = _application_for(session, r.job.id, candidate_id)

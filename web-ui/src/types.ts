@@ -237,6 +237,33 @@ export interface CareerPathOut {
   recommended_priority: string
 }
 
+export interface CareerProfileOut {
+  primary_direction: string | null
+  strengths: string[]
+  growing_area: string | null
+  skill_gaps: string[]
+  best_locations: string[]
+}
+
+export interface CareerPathComparisonRowOut {
+  label: string
+  current_fit: number
+  job_volume: number
+  career_upside: string
+  skill_gap: string
+  interview_rate: number | null
+  interview_sample_size: number
+  overall: number
+}
+
+export interface SkillGapEntryOut {
+  skill: string
+  frequency_count: number
+  frequency_pct: number
+  unlocks_count: number
+  relevant_career_paths: string[]
+}
+
 // --------------------------------------------------------------------------
 // Search runs / ranking (Phase 8)
 // --------------------------------------------------------------------------
@@ -261,6 +288,32 @@ export interface RankedJobOut {
   why: string[]
   gaps: string[]
   recommendation: string
+}
+
+export interface NewSinceLastVisitOut {
+  previous_visit_at: string | null
+  jobs: RankedJobOut[]
+}
+
+export interface BriefingHighlightOut {
+  job_id: number
+  title: string
+  company: string
+  location: string | null
+  rank_score: number
+  freshness_label: string
+  why: string | null
+}
+
+export interface MorningBriefingOut {
+  total_opportunities: number
+  exceptional_count: number
+  strong_count: number
+  possible_count: number
+  top_highlights: BriefingHighlightOut[]
+  follow_up_summaries: string[]
+  career_insight: string | null
+  recommendation: string | null
 }
 
 // --------------------------------------------------------------------------

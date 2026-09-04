@@ -18,22 +18,29 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, UploadFile
 from sqlalchemy import select
 
+from job_agent.candidate.career_comparison import compare_career_paths
 from job_agent.candidate.career_paths import discover_career_paths
+from job_agent.candidate.career_profile import build_career_profile
 from job_agent.candidate.learning import discover_insights
 from job_agent.candidate.schema import CandidateProfile
+from job_agent.candidate.skill_gap import discover_skill_gaps
 from job_agent.db.models import Application as ApplicationRow
 from job_agent.db.models import Job as JobRow
 from job_agent.db.models import JobMatch as JobMatchRow
 from job_agent.resume.errors import ResumeExtractionError
 from job_agent.resume.repository import list_versions
 from job_agent.resume.service import create_profile_version
+from job_agent.web import job_view
 from job_agent.web.deps import CandidateDep, ConfigDep, SessionDep
 from job_agent.web.schemas import (
     CandidateProfileOut,
+    CareerPathComparisonRowOut,
     CareerPathOut,
+    CareerProfileOut,
     CategoryInsightOut,
     InsightsOut,
     ResumeUploadResult,
+    SkillGapEntryOut,
 )
 
 router = APIRouter(prefix="/api/candidate", tags=["candidate"])
@@ -162,6 +169,87 @@ def get_career_paths(candidate: CandidateDep) -> list[CareerPathOut]:
     ]
 
 
+@router.get("/career-profile", response_model=CareerProfileOut)
+def get_career_profile(candidate: CandidateDep) -> CareerProfileOut:
+    """FINAL GOD MODE Part 2.4 — "what kind of career is this candidate
+    building", derived entirely from `discover_career_paths` (never a
+    second, separate judgment) plus the candidate's own stated location
+    preferences. Recomputed fresh every call — no stored, staleness-prone
+    snapshot."""
+    profile, _ = candidate
+    career_paths = discover_career_paths(profile)
+    result = build_career_profile(profile, career_paths)
+    return CareerProfileOut(
+        primary_direction=result.primary_direction, strengths=list(result.strengths),
+        growing_area=result.growing_area, skill_gaps=list(result.skill_gaps),
+        best_locations=list(result.best_locations),
+    )
+
+
+@router.get("/career-paths/compare", response_model=list[CareerPathComparisonRowOut])
+def get_career_path_comparison(
+    session: SessionDep, candidate: CandidateDep
+) -> list[CareerPathComparisonRowOut]:
+    """FINAL GOD MODE Part 2.5 — career paths compared side by side on
+    real signals only. `interview_rate` is `None` ("Insufficient data")
+    below a minimum sample of real applications — see `job_agent.
+    candidate.career_comparison` for every threshold used."""
+    profile, candidate_id = candidate
+    career_paths = discover_career_paths(profile)
+    active_jobs = list(
+        session.execute(select(JobRow).where(JobRow.lifecycle_status == "ACTIVE")).scalars()
+    )
+    applications = list(
+        session.execute(
+            select(ApplicationRow).where(ApplicationRow.candidate_id == candidate_id)
+        ).scalars()
+    )
+    applications_with_jobs = []
+    for application in applications:
+        job = session.get(JobRow, application.job_id)
+        if job is not None:
+            applications_with_jobs.append((application, job))
+
+    rows = compare_career_paths(career_paths, active_jobs, applications_with_jobs)
+    return [
+        CareerPathComparisonRowOut(
+            label=r.label, current_fit=r.current_fit, job_volume=r.job_volume,
+            career_upside=r.career_upside, skill_gap=r.skill_gap,
+            interview_rate=r.interview_rate, interview_sample_size=r.interview_sample_size,
+            overall=r.overall,
+        )
+        for r in rows
+    ]
+
+
+@router.get("/skill-gaps", response_model=list[SkillGapEntryOut])
+def get_skill_gaps(session: SessionDep, candidate: CandidateDep) -> list[SkillGapEntryOut]:
+    """FINAL GOD MODE Part 2.6 — the candidate's real, already-computed
+    `JobMatch.missing_requirements` aggregated across their strongest
+    matches. See `job_agent.candidate.skill_gap` for the exact, honest
+    "opportunities unlocked" definition — never a guessed uplift number."""
+    profile, candidate_id = candidate
+    matched_job_ids = list(
+        session.execute(
+            select(JobMatchRow.job_id).where(JobMatchRow.candidate_id == candidate_id).distinct()
+        ).scalars()
+    )
+    matches = [
+        m
+        for job_id in matched_job_ids
+        if (m := job_view.latest_match(session, job_id, candidate_id)) is not None
+    ]
+    career_paths = discover_career_paths(profile)
+    entries = discover_skill_gaps(matches, career_paths)
+    return [
+        SkillGapEntryOut(
+            skill=e.skill, frequency_count=e.frequency_count, frequency_pct=e.frequency_pct,
+            unlocks_count=e.unlocks_count, relevant_career_paths=list(e.relevant_career_paths),
+        )
+        for e in entries
+    ]
+
+
 @router.get("/insights", response_model=InsightsOut)
 def get_insights(session: SessionDep, candidate: CandidateDep) -> InsightsOut:
     """Phase 12 section 21 — explainable behavioral patterns over jobs the
@@ -171,23 +259,7 @@ def get_insights(session: SessionDep, candidate: CandidateDep) -> InsightsOut:
     candidate.learning` for how "notable" is decided — never a vague or
     overconfident claim from a handful of jobs."""
     _, candidate_id = candidate
-    matched_job_ids = list(
-        session.execute(
-            select(JobMatchRow.job_id).where(JobMatchRow.candidate_id == candidate_id).distinct()
-        ).scalars()
-    )
-    jobs_with_applications: list[tuple[JobRow, ApplicationRow | None]] = []
-    for job_id in matched_job_ids:
-        job = session.get(JobRow, job_id)
-        if job is None:
-            continue
-        application = session.execute(
-            select(ApplicationRow).where(
-                ApplicationRow.job_id == job_id, ApplicationRow.candidate_id == candidate_id
-            )
-        ).scalar_one_or_none()
-        jobs_with_applications.append((job, application))
-
+    jobs_with_applications = job_view.matched_jobs_with_applications(session, candidate_id)
     categories, summary = discover_insights(jobs_with_applications)
     return InsightsOut(
         categories=[

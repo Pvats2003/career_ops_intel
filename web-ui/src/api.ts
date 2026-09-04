@@ -2,7 +2,9 @@ import type {
   AnalyticsOut,
   AssistantResponseOut,
   CandidateProfileOut,
+  CareerPathComparisonRowOut,
   CareerPathOut,
+  CareerProfileOut,
   CompanyOut,
   CoverLetterOut,
   DashboardSummaryOut,
@@ -11,6 +13,8 @@ import type {
   JobDetailOut,
   JobListOut,
   MatchRunOut,
+  MorningBriefingOut,
+  NewSinceLastVisitOut,
   NotificationOut,
   PipelineItemOut,
   PipelineUpdateIn,
@@ -20,6 +24,7 @@ import type {
   SearchPreferencesIn,
   SearchPreferencesOut,
   SearchRunOut,
+  SkillGapEntryOut,
   TailoredResumeOut,
   WatchlistEntryIn,
   WatchlistEntryOut,
@@ -56,6 +61,8 @@ export const api = {
   health: () => request<{ status: string }>('/health'),
 
   dashboardSummary: () => request<DashboardSummaryOut>('/dashboard/summary'),
+  newSinceLastVisit: () => request<NewSinceLastVisitOut>('/dashboard/new-since-last-visit'),
+  morningBriefing: () => request<MorningBriefingOut>('/dashboard/briefing'),
 
   candidateProfile: () => request<CandidateProfileOut>('/candidate/profile'),
   uploadResume: (file: File) => {
@@ -102,6 +109,10 @@ export const api = {
   followUps: () => request<FollowUpRecommendationOut[]>('/pipeline/follow-ups'),
 
   careerPaths: () => request<CareerPathOut[]>('/candidate/career-paths'),
+  careerProfile: () => request<CareerProfileOut>('/candidate/career-profile'),
+  careerPathComparison: () =>
+    request<CareerPathComparisonRowOut[]>('/candidate/career-paths/compare'),
+  skillGaps: () => request<SkillGapEntryOut[]>('/candidate/skill-gaps'),
   insights: () => request<InsightsOut>('/candidate/insights'),
 
   listCompanies: () => request<CompanyOut[]>('/companies'),

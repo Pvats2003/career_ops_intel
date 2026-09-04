@@ -1,5 +1,6 @@
 import { NavLink, Route, Routes } from 'react-router-dom'
 import Analytics from './pages/Analytics'
+import Career from './pages/Career'
 import Companies from './pages/Companies'
 import CompanyDetail from './pages/CompanyDetail'
 import Dashboard from './pages/Dashboard'
@@ -15,6 +16,7 @@ const NAV = [
   { to: '/jobs', label: 'Jobs' },
   { to: '/pipeline', label: 'Applications' },
   { to: '/companies', label: 'Companies' },
+  { to: '/career', label: 'Career' },
   { to: '/resume', label: 'Resume' },
   { to: '/analytics', label: 'Analytics' },
   { to: '/notifications', label: 'Notifications' },
@@ -84,6 +86,7 @@ export default function App() {
             <Route path="/pipeline" element={<Pipeline />} />
             <Route path="/companies" element={<Companies />} />
             <Route path="/companies/:id" element={<CompanyDetail />} />
+            <Route path="/career" element={<Career />} />
             <Route path="/resume" element={<Resume />} />
             <Route path="/analytics" element={<Analytics />} />
             <Route path="/notifications" element={<Notifications />} />

@@ -1,7 +1,8 @@
 """Opportunity ranking — Career OS Phase 8 sections 9-10 (Today's Top 10 /
 Apply Now). Combines the candidate-fit score `job_agent.matching` already
-computes with freshness, career value, application viability, and company
-fit into ONE composite score, using the exact weights already defined in
+computes with freshness, career value, application viability, company
+fit, and (FINAL GOD MODE Part 1.1) a bounded behavioral-fit signal into
+ONE composite score, using the exact weights already defined in
 `config/automation.yaml`'s `priority_weights` block (`job_agent.config.
 models.PriorityWeights`) — never a second, ad-hoc weighting scheme.
 
@@ -11,8 +12,9 @@ computes a match score itself and never calls an LLM.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from job_agent.candidate.learning import LearnedPreferences, behavioral_fit_signal
 from job_agent.config.models import PriorityWeights
 from job_agent.db.models import Job as JobRow
 from job_agent.db.models import JobMatch as JobMatchRow
@@ -39,6 +41,8 @@ _CAREER_VALUE_SIGNAL: dict[str, float] = {
     "SKIP": 0.0,
 }
 
+_NEUTRAL_PREFERENCES = LearnedPreferences(baseline_rate=0.0, dimension_rates={})
+
 
 @dataclass(frozen=True)
 class RankedJob:
@@ -48,6 +52,11 @@ class RankedJob:
     why: tuple[str, ...]
     gaps: tuple[str, ...]
     recommendation: str
+    # Each factor's contribution to `rank_score` (weight * signal * 100,
+    # rounded) — grounds both `explain()`'s prose and the "WHY?" /
+    # explainable-AI view in the exact numbers that produced the score,
+    # never a second, retroactively-invented justification.
+    components: dict[str, float] = field(default_factory=dict)
 
 
 def _company_fit_signal(job: JobRow) -> float:
@@ -62,30 +71,58 @@ def _application_ease_signal(job: JobRow) -> float:
     return 1.0 if job.application_url else 0.3
 
 
-def rank_score(job: JobRow, match: JobMatchRow | None, weights: PriorityWeights) -> float:
-    match_signal = (match.overall_score / 100) if match else 0.0
-    freshness_signal = _FRESHNESS_SIGNAL.get(job.freshness_status, 0.3)
-    career_signal = _CAREER_VALUE_SIGNAL.get(match.decision, 0.0) if match else 0.0
-    company_signal = _company_fit_signal(job)
-    ease_signal = _application_ease_signal(job)
-
-    return round(
-        100
-        * (
-            weights.match * match_signal
-            + weights.freshness * freshness_signal
-            + weights.career_value * career_signal
-            + weights.company_fit * company_signal
-            + weights.application_ease * ease_signal
-        ),
-        1,
+def _signals(
+    job: JobRow, match: JobMatchRow | None, preferences: LearnedPreferences
+) -> tuple[dict[str, float], str | None]:
+    behavioral_signal, behavioral_reason = behavioral_fit_signal(job, preferences)
+    return (
+        {
+            "match": (match.overall_score / 100) if match else 0.0,
+            "freshness": _FRESHNESS_SIGNAL.get(job.freshness_status, 0.3),
+            "career_value": _CAREER_VALUE_SIGNAL.get(match.decision, 0.0) if match else 0.0,
+            "company_fit": _company_fit_signal(job),
+            "application_ease": _application_ease_signal(job),
+            "behavioral_fit": behavioral_signal,
+        },
+        behavioral_reason,
     )
 
 
-def explain(job: JobRow, match: JobMatchRow | None) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+def _component_breakdown(
+    job: JobRow,
+    match: JobMatchRow | None,
+    weights: PriorityWeights,
+    preferences: LearnedPreferences,
+) -> tuple[dict[str, float], str | None]:
+    signals, behavioral_reason = _signals(job, match, preferences)
+    components = {
+        name: round(100 * getattr(weights, name) * value, 1) for name, value in signals.items()
+    }
+    return components, behavioral_reason
+
+
+def rank_score(
+    job: JobRow,
+    match: JobMatchRow | None,
+    weights: PriorityWeights,
+    *,
+    preferences: LearnedPreferences = _NEUTRAL_PREFERENCES,
+) -> float:
+    components, _ = _component_breakdown(job, match, weights, preferences)
+    return round(sum(components.values()), 1)
+
+
+def explain(
+    job: JobRow,
+    match: JobMatchRow | None,
+    *,
+    weights: PriorityWeights | None = None,
+    preferences: LearnedPreferences = _NEUTRAL_PREFERENCES,
+) -> tuple[tuple[str, ...], tuple[str, ...], str]:
     """(why, gaps, recommendation) — grounded entirely in the match's own
     `reasoning`/`missing_requirements`/`concerns` fields (never invented
-    here) plus the job's freshness label."""
+    here) plus the job's freshness label and any learned behavioral
+    pattern that actually applies to this job."""
     why: list[str] = []
     gaps: list[str] = []
     if match is not None:
@@ -97,6 +134,11 @@ def explain(job: JobRow, match: JobMatchRow | None) -> tuple[tuple[str, ...], tu
         why.append("Freshly posted — early applications are often reviewed first.")
     if not job.application_url:
         gaps.append("No direct application link found for this posting.")
+
+    if weights is not None:
+        _, behavioral_reason = _component_breakdown(job, match, weights, preferences)
+        if behavioral_reason:
+            why.append(behavioral_reason)
 
     if match is not None and match.decision == "APPLY":
         recommendation = "Apply today."
@@ -114,17 +156,28 @@ def rank_jobs(
     jobs_with_matches: list[tuple[JobRow, JobMatchRow | None]],
     weights: PriorityWeights,
     *,
+    preferences: LearnedPreferences = _NEUTRAL_PREFERENCES,
     limit: int | None = None,
 ) -> list[RankedJob]:
     """Ranks ACTIVE jobs only (never recommends a CLOSED/EXPIRED posting —
-    section 7) by composite `rank_score`, highest first."""
+    section 7) by composite `rank_score`, highest first. `preferences`
+    (from `job_agent.candidate.learning.compute_learned_preferences`) is
+    optional and neutral by default — passing it in is what lets
+    behavioral history nudge the ranking, bounded to a fraction of the
+    total score via `weights.behavioral_fit` and never able to override
+    a hard-stop exclusion the matcher already applied."""
     ranked = []
     for job, match in jobs_with_matches:
         if job.lifecycle_status != "ACTIVE":
             continue
-        score = rank_score(job, match, weights)
-        why, gaps, recommendation = explain(job, match)
-        ranked.append(RankedJob(job=job, match=match, rank_score=score, why=why, gaps=gaps,
-                                 recommendation=recommendation))
+        components, _ = _component_breakdown(job, match, weights, preferences)
+        score = round(sum(components.values()), 1)
+        why, gaps, recommendation = explain(job, match, weights=weights, preferences=preferences)
+        ranked.append(
+            RankedJob(
+                job=job, match=match, rank_score=score, why=why, gaps=gaps,
+                recommendation=recommendation, components=components,
+            )
+        )
     ranked.sort(key=lambda r: r.rank_score, reverse=True)
     return ranked[:limit] if limit is not None else ranked

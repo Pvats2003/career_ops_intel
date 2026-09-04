@@ -121,3 +121,99 @@ def discover_insights(
         )
     summary = [i.explanation for i in all_insights if i.explanation.startswith("Career OS noticed")]
     return all_insights, summary
+
+
+# --------------------------------------------------------------------------
+# Behavioral ranking signal — CAREER OS FINAL GOD MODE Part 1.1.
+#
+# A SEPARATE, more conservative computation from `discover_insights` above:
+# insights are narrative ("tell the candidate something"), this feeds a
+# NUMBER into the ranking formula, so it needs a stricter sample floor
+# (never reacts to one or two clicks) and a hard-bounded magnitude (never
+# large enough to override a hard-stop exclusion or turn a weak match into
+# a strong one on its own — see `job_agent.matching.ranking`, where this
+# is one of several weighted signals, not a gate).
+# --------------------------------------------------------------------------
+
+_MIN_SAMPLE_FOR_PREFERENCE = 5
+_MAX_PREFERENCE_SWING = 0.4  # signal stays within [0.5 - 0.4, 0.5 + 0.4] = [0.1, 0.9]
+_NOTABLE_LIFT = 0.15  # minimum |rate - baseline| worth mentioning in an explanation
+
+
+@dataclass(frozen=True)
+class LearnedPreferences:
+    """`baseline_rate`: overall save-rate across every matched job this
+    candidate has seen. `dimension_rates`: for each dimension, only the
+    values with enough sample size to say something real (>=
+    `_MIN_SAMPLE_FOR_PREFERENCE` matched jobs) map to their own save rate.
+    A dimension/value with insufficient data is simply absent — read as
+    "no learned preference yet", not zero."""
+
+    baseline_rate: float
+    dimension_rates: dict[str, dict[str, float]]
+
+
+def compute_learned_preferences(
+    jobs_with_applications: list[tuple[JobRow, ApplicationRow | None]],
+    *,
+    min_sample: int = _MIN_SAMPLE_FOR_PREFERENCE,
+) -> LearnedPreferences:
+    total = len(jobs_with_applications)
+    if total == 0:
+        return LearnedPreferences(baseline_rate=0.0, dimension_rates={})
+    baseline_rate = sum(1 for _, app in jobs_with_applications if app is not None) / total
+
+    dimension_rates: dict[str, dict[str, float]] = {}
+    for dimension_label, value_fn in _DIMENSIONS.items():
+        buckets: dict[str, list[ApplicationRow | None]] = {}
+        for job, app in jobs_with_applications:
+            value = value_fn(job)
+            if value:
+                buckets.setdefault(value, []).append(app)
+        rates = {
+            value: sum(1 for app in apps if app is not None) / len(apps)
+            for value, apps in buckets.items()
+            if len(apps) >= min_sample
+        }
+        if rates:
+            dimension_rates[dimension_label] = rates
+    return LearnedPreferences(baseline_rate=baseline_rate, dimension_rates=dimension_rates)
+
+
+def behavioral_fit_signal(
+    job: JobRow, preferences: LearnedPreferences
+) -> tuple[float, str | None]:
+    """(signal in [0.1, 0.9], explanation or None). 0.5 = neutral — either
+    no learned data at all, or this job's own dimension values simply
+    have none yet. The signal is a plain average of the bounded per-
+    dimension lifts (`rate - baseline`, clamped to +/- 0.4) for whichever
+    dimensions this job actually has learned data for; a job matching
+    none of the candidate's learned dimensions is neutral, never
+    penalized for "no signal"."""
+    if not preferences.dimension_rates:
+        return 0.5, None
+
+    signals: list[float] = []
+    reasons: list[str] = []
+    for dimension_label, value_fn in _DIMENSIONS.items():
+        rates = preferences.dimension_rates.get(dimension_label)
+        if not rates:
+            continue
+        value = value_fn(job)
+        if not value or value not in rates:
+            continue
+        lift = rates[value] - preferences.baseline_rate
+        bounded_lift = max(-_MAX_PREFERENCE_SWING, min(_MAX_PREFERENCE_SWING, lift))
+        signals.append(0.5 + bounded_lift)
+        if abs(lift) >= _NOTABLE_LIFT:
+            label = dimension_label.replace("_", " ")
+            verb = "favor" if lift > 0 else "tend to pass on"
+            reasons.append(f'you {verb} {label} "{value}" roles')
+
+    if not signals:
+        return 0.5, None
+
+    explanation = (
+        f"Behavioral fit: based on your history, {', and '.join(reasons)}." if reasons else None
+    )
+    return sum(signals) / len(signals), explanation

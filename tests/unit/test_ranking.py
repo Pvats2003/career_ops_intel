@@ -3,12 +3,15 @@ Apply Now (Career OS Phase 8 sections 9-10)."""
 
 from __future__ import annotations
 
+from job_agent.candidate.learning import compute_learned_preferences
 from job_agent.config.models import PriorityWeights
+from job_agent.db.models import Application as ApplicationRow
 from job_agent.db.models import Job as JobRow
 from job_agent.db.models import JobMatch as JobMatchRow
 from job_agent.matching.ranking import explain, rank_jobs, rank_score
 
-WEIGHTS = PriorityWeights()  # default: match .5, freshness .2, career .15, company .1, ease .05
+# default: match .45, freshness .15, career .15, company .1, ease .05, behavioral .1
+WEIGHTS = PriorityWeights()
 
 
 def _job(**overrides) -> JobRow:
@@ -103,3 +106,66 @@ def test_explain_with_no_match_never_crashes_and_recommends_low_priority():
 def test_explain_flags_missing_application_url_as_a_gap():
     _, gaps, _ = explain(_job(application_url=None), _match())
     assert any("application link" in g.lower() for g in gaps)
+
+
+# --------------------------------------------------------------------------
+# Behavioral fit integration — CAREER OS FINAL GOD MODE Part 1.1
+# --------------------------------------------------------------------------
+
+
+def _app(**overrides) -> ApplicationRow:
+    base = dict(job_id=1, candidate_id=1, status="DISCOVERED", pipeline_stage="SAVED")
+    base.update(overrides)
+    return ApplicationRow(**base)
+
+
+def _strong_remote_preference():
+    rows = [(_job(job_fingerprint=f"r{i}", remote_type="remote"), _app()) for i in range(6)]
+    rows += [(_job(job_fingerprint=f"o{i}", remote_type="onsite"), None) for i in range(6)]
+    return compute_learned_preferences(rows, min_sample=5)
+
+
+def test_rank_score_defaults_to_neutral_behavioral_signal():
+    ranked = rank_jobs([(_job(remote_type="remote"), _match())], WEIGHTS)
+    expected_neutral_contribution = round(100 * WEIGHTS.behavioral_fit * 0.5, 1)
+    assert ranked[0].components["behavioral_fit"] == expected_neutral_contribution
+
+
+def test_behavioral_preference_lifts_score_for_favored_dimension():
+    prefs = _strong_remote_preference()
+    neutral = rank_score(_job(remote_type="remote"), _match(), WEIGHTS)
+    with_pref = rank_score(_job(remote_type="remote"), _match(), WEIGHTS, preferences=prefs)
+    assert with_pref > neutral
+
+
+def test_behavioral_preference_never_flips_a_hard_stop_decision():
+    """A SKIP decision job never outranks an APPLY decision job just
+    because of a favorable behavioral signal — bounded influence only."""
+    prefs = _strong_remote_preference()
+    skip_but_favored = rank_score(
+        _job(remote_type="remote"), _match(overall_score=10, decision="SKIP"), WEIGHTS,
+        preferences=prefs,
+    )
+    apply_but_unfavored = rank_score(
+        _job(remote_type="onsite"), _match(overall_score=95, decision="APPLY"), WEIGHTS,
+        preferences=prefs,
+    )
+    assert apply_but_unfavored > skip_but_favored
+
+
+def test_rank_jobs_components_sum_to_rank_score():
+    ranked = rank_jobs([(_job(), _match())], WEIGHTS)
+    assert ranked[0].rank_score == round(sum(ranked[0].components.values()), 1)
+    assert "behavioral_fit" in ranked[0].components
+
+
+def test_explain_includes_behavioral_reason_when_weights_and_prefs_given():
+    prefs = _strong_remote_preference()
+    why, _, _ = explain(_job(remote_type="remote"), _match(), weights=WEIGHTS, preferences=prefs)
+    assert any("behavioral fit" in w.lower() for w in why)
+
+
+def test_explain_without_weights_never_mentions_behavioral_fit():
+    prefs = _strong_remote_preference()
+    why, _, _ = explain(_job(remote_type="remote"), _match(), preferences=prefs)
+    assert not any("behavioral fit" in w.lower() for w in why)
