@@ -233,6 +233,13 @@ class Job(Base, TimestampMixin):
         Index("ix_jobs_company_name", "company_name"),
         Index("ix_jobs_title", "title"),
         Index("ix_jobs_posted_at", "posted_at"),
+        # Both filters below were full `SCAN jobs` in EXPLAIN QUERY PLAN
+        # (Part 16 performance audit) — source_id backs every per-source
+        # scan/dedup lookup (jobs/service.py, jobs/repository.py) and
+        # lifecycle_status backs the staleness sweep and every "ACTIVE
+        # jobs only" query, both of which walk the whole table today.
+        Index("ix_jobs_source_id", "source_id"),
+        Index("ix_jobs_lifecycle_status", "lifecycle_status"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -278,6 +285,13 @@ class JobMatch(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_job_matches_score", "overall_score"),
         Index("ix_job_matches_decision", "decision"),
+        # `job_view.latest_match()` — the single most-called query in the
+        # web layer, once per job on every job list/detail/company/
+        # compare view — filters on (job_id, candidate_id) and orders by
+        # created_at DESC LIMIT 1. Without this, EXPLAIN QUERY PLAN showed
+        # it using only the single-column job_id index and then sorting
+        # via a temp B-tree (Part 16 performance audit).
+        Index("ix_job_matches_job_candidate_created", "job_id", "candidate_id", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
