@@ -332,6 +332,24 @@ export interface SearchRunOut {
   qualified: number
   errors: string[]
   status: string
+  top_matches: JobOut[]
+}
+
+export interface SourceHealthOut {
+  name: string
+  kind: string
+  enabled: boolean
+  status: 'HEALTHY' | 'UNHEALTHY' | 'UNKNOWN'
+  last_error: string | null
+  suggested_action: string | null
+  last_success_at: string | null
+  last_checked_at: string | null
+}
+
+export interface SchedulerStatusOut {
+  frequency_hours: number
+  last_run_completed_at: string | null
+  next_run_due_at: string | null
 }
 
 export interface RankedJobOut {

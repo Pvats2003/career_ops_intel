@@ -514,6 +514,28 @@ class SearchRunOut(BaseModel):
     qualified: int
     errors: list[str]
     status: str
+    # FINAL GOD MODE Part 6.18's Search Activity page: the candidate's own
+    # top matches from JOBS touched by this run — reconstructed from the
+    # real JobMatch rows created in this run's own time window, never a
+    # second stored copy.
+    top_matches: list[JobOut]
+
+
+class SourceHealthOut(BaseModel):
+    name: str
+    kind: str
+    enabled: bool
+    status: str  # "HEALTHY" | "UNHEALTHY" | "UNKNOWN"
+    last_error: str | None
+    suggested_action: str | None
+    last_success_at: datetime | None
+    last_checked_at: datetime | None
+
+
+class SchedulerStatusOut(BaseModel):
+    frequency_hours: int
+    last_run_completed_at: datetime | None
+    next_run_due_at: datetime | None
 
 
 # --------------------------------------------------------------------------

@@ -150,6 +150,7 @@ def scan_source(session: Session, config: AppConfig, source: JobSource) -> ScanR
 
     source_row.last_health_check_at = checked_at
     source_row.last_health_status = "healthy"
+    source_row.last_success_at = checked_at
 
     result.fetched = len(raw_postings)
     seen_source_job_ids: set[str] = set()

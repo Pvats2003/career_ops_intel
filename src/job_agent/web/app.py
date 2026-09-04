@@ -23,6 +23,7 @@ from job_agent.web.routers import (
     notifications,
     pipeline,
     settings,
+    sources,
     watchlist,
 )
 
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(watchlist.router)
     app.include_router(notifications.router)
     app.include_router(settings.router)
+    app.include_router(sources.router)
 
     @app.get("/api/health")
     def health() -> dict:

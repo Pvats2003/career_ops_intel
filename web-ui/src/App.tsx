@@ -9,7 +9,9 @@ import Jobs from './pages/Jobs'
 import Notifications from './pages/Notifications'
 import Pipeline from './pages/Pipeline'
 import Resume from './pages/Resume'
+import SearchActivity from './pages/SearchActivity'
 import Settings from './pages/Settings'
+import SourceHealth from './pages/SourceHealth'
 
 const NAV = [
   { to: '/', label: 'Dashboard', end: true },
@@ -19,6 +21,8 @@ const NAV = [
   { to: '/career', label: 'Career' },
   { to: '/resume', label: 'Resume' },
   { to: '/analytics', label: 'Analytics' },
+  { to: '/search-activity', label: 'Search Activity' },
+  { to: '/source-health', label: 'Source Health' },
   { to: '/notifications', label: 'Notifications' },
   { to: '/settings', label: 'Settings' },
 ]
@@ -89,6 +93,8 @@ export default function App() {
             <Route path="/career" element={<Career />} />
             <Route path="/resume" element={<Resume />} />
             <Route path="/analytics" element={<Analytics />} />
+            <Route path="/search-activity" element={<SearchActivity />} />
+            <Route path="/source-health" element={<SourceHealth />} />
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>

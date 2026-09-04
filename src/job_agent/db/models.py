@@ -216,6 +216,14 @@ class JobSource(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     last_health_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # FINAL GOD MODE Part 6.19's Source Health page needs "last successful
+    # run" to survive a subsequent failure — last_health_check_at above is
+    # overwritten on EVERY check regardless of outcome, so a source that's
+    # been failing for days would otherwise show its last (failed) check
+    # time as if it were a success. Set only when a check succeeds.
+    last_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class Job(Base, TimestampMixin):

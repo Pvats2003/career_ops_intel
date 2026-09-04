@@ -12,6 +12,7 @@ empty list, honestly, rather than seeded/demo data.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -175,7 +176,37 @@ def list_jobs(
     return JobListOut(total=total, items=page)
 
 
-def _search_run_out(run: SearchRunRow) -> SearchRunOut:
+def _top_matches_for_run(
+    session: Session, run: SearchRunRow, candidate_id: int, *, limit: int = 5
+) -> list[JobOut]:
+    """Reconstructs "top matches" for a search run from the real
+    `JobMatch` rows created in that run's own time window — never a
+    second, separately-stored copy of what the run found."""
+    window_end = run.completed_at or datetime.now(UTC)
+    match_rows = (
+        session.execute(
+            select(JobMatchRow)
+            .where(
+                JobMatchRow.candidate_id == candidate_id,
+                JobMatchRow.created_at >= run.started_at,
+                JobMatchRow.created_at <= window_end,
+            )
+            .order_by(JobMatchRow.overall_score.desc())
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    out = []
+    for match_row in match_rows:
+        job = session.get(JobRow, match_row.job_id)
+        if job is None:
+            continue
+        out.append(_job_out(job, match_row, _application_for(session, job.id, candidate_id)))
+    return out
+
+
+def _search_run_out(session: Session, run: SearchRunRow, candidate_id: int) -> SearchRunOut:
     return SearchRunOut(
         id=run.id,
         started_at=run.started_at,
@@ -188,6 +219,7 @@ def _search_run_out(run: SearchRunRow) -> SearchRunOut:
         qualified=run.qualified,
         errors=list(run.errors),
         status=run.status,
+        top_matches=_top_matches_for_run(session, run, candidate_id),
     )
 
 
@@ -200,7 +232,7 @@ def run_search(session: SessionDep, candidate: CandidateDep, config: ConfigDep) 
     profile, candidate_id = candidate
     llm = build_llm_provider(config)
     run = execute_search_run(session, config, profile, candidate_id, llm=llm)
-    return _search_run_out(run)
+    return _search_run_out(session, run, candidate_id)
 
 
 # NOTE: every route below with a static path segment (search-runs, top10,
@@ -211,12 +243,15 @@ def run_search(session: SessionDep, candidate: CandidateDep, config: ConfigDep) 
 # that reason; do not move it below without moving `/{job_id}` down too.
 @router.get("/search-runs", response_model=list[SearchRunOut])
 def list_search_runs(
-    session: SessionDep, limit: int = Query(default=20, ge=1, le=100)
+    session: SessionDep,
+    candidate: CandidateDep,
+    limit: int = Query(default=20, ge=1, le=100),
 ) -> list[SearchRunOut]:
+    _, candidate_id = candidate
     runs = session.execute(
         select(SearchRunRow).order_by(SearchRunRow.started_at.desc()).limit(limit)
     ).scalars()
-    return [_search_run_out(r) for r in runs]
+    return [_search_run_out(session, r, candidate_id) for r in runs]
 
 
 def _ranked_jobs(

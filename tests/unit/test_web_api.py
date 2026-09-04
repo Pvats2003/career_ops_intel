@@ -1257,3 +1257,130 @@ def test_morning_briefing_counts_and_highlights_reflect_real_matches(
     assert body["total_opportunities"] == 2
     assert len(body["top_highlights"]) >= 1
     assert body["top_highlights"][0]["job_id"] == apply_job
+
+
+def test_search_runs_empty_by_default(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/jobs/search-runs")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_search_run_top_matches_reflects_matches_created_in_its_window(
+    tmp_path, monkeypatch, real_config
+):
+    """Part 6.18: top_matches is reconstructed from real JobMatch rows
+    created inside the run's own [started_at, completed_at] window —
+    never a fabricated or separately-stored list."""
+    from datetime import UTC, datetime, timedelta
+
+    from job_agent.db.models import SearchRun
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="search-run-top-match")
+    _seed_match(db_path, job_id, candidate_id, overall_score=91, decision="APPLY")
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    init_db(engine)
+    with get_session_factory(engine)() as session:
+        match_created_at = session.execute(select(JobMatch.created_at)).scalar_one()
+        run = SearchRun(
+            started_at=match_created_at - timedelta(minutes=5),
+            completed_at=datetime.now(UTC) + timedelta(minutes=5),
+            sources=["greenhouse"],
+            queries=["Business Analyst"],
+            jobs_found=1,
+            duplicates_removed=0,
+            expired_removed=0,
+            qualified=1,
+            errors=[],
+            status="COMPLETED",
+        )
+        session.add(run)
+        session.commit()
+
+    r = client.get("/api/jobs/search-runs")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert len(body[0]["top_matches"]) == 1
+    assert body[0]["top_matches"][0]["id"] == job_id
+    assert body[0]["top_matches"][0]["match"]["overall_score"] == 91
+
+
+def test_source_health_unknown_for_never_checked_source(tmp_path, monkeypatch, real_config):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    engine = get_engine(f"sqlite:///{db_path}")
+    init_db(engine)
+    with get_session_factory(engine)() as session:
+        session.add(JobSourceRow(name="greenhouse", kind="ats_api", enabled=True))
+        session.commit()
+
+    r = client.get("/api/sources/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body[0]["status"] == "UNKNOWN"
+    assert body[0]["last_error"] is None
+
+
+def test_source_health_reports_unhealthy_with_error_and_suggestion(
+    tmp_path, monkeypatch, real_config
+):
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    engine = get_engine(f"sqlite:///{db_path}")
+    init_db(engine)
+    with get_session_factory(engine)() as session:
+        session.add(
+            JobSourceRow(
+                name="adzuna",
+                kind="ats_api",
+                enabled=True,
+                last_health_status="unhealthy: 429 Too Many Requests",
+            )
+        )
+        session.commit()
+
+    r = client.get("/api/sources/health")
+    body = r.json()
+    assert body[0]["status"] == "UNHEALTHY"
+    assert body[0]["last_error"] == "429 Too Many Requests"
+    assert body[0]["suggested_action"] is not None
+
+
+def test_source_health_healthy_source_shows_last_success(tmp_path, monkeypatch, real_config):
+    from datetime import UTC, datetime
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    now = datetime.now(UTC)
+    engine = get_engine(f"sqlite:///{db_path}")
+    init_db(engine)
+    with get_session_factory(engine)() as session:
+        session.add(
+            JobSourceRow(
+                name="lever",
+                kind="ats_api",
+                enabled=True,
+                last_health_status="healthy",
+                last_health_check_at=now,
+                last_success_at=now,
+            )
+        )
+        session.commit()
+
+    r = client.get("/api/sources/health")
+    body = r.json()
+    assert body[0]["status"] == "HEALTHY"
+    assert body[0]["last_success_at"] is not None
+
+
+def test_scheduler_status_reflects_configured_frequency(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    client.put("/api/settings/search-preferences", json={"search_frequency_hours": 6})
+
+    r = client.get("/api/sources/scheduler-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["frequency_hours"] == 6
+    assert body["last_run_completed_at"] is None
+    assert body["next_run_due_at"] is not None
