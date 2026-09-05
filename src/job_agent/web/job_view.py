@@ -117,6 +117,10 @@ def match_out(row: JobMatch | None) -> MatchOut | None:
         excluded_reasons=list(row.excluded_reasons or []),
         reasoning=row.reasoning or "",
         semantic_available=bool(row.semantic_available),
+        raw_fit_score=int(row.raw_fit_score) if row.raw_fit_score is not None else int(
+            row.overall_score
+        ),
+        risk_flags=list(row.risk_flags or []),
     )
 
 

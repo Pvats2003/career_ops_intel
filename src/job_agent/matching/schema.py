@@ -47,6 +47,17 @@ class JobMatchResult(BaseModel):
     hard_stop_reasons: tuple[str, ...] = Field(default_factory=tuple)
     excluded_reasons: tuple[str, ...] = Field(default_factory=tuple)
 
+    # Matching Engine V2 (audit item G — "numeric score must agree with
+    # decision"). `raw_fit_score` is the uncapped weighted-average score
+    # exactly as before; `overall_score` above is the FINAL, capped score
+    # actually used for the decision and shown as the headline number.
+    # Never hides the raw evidence — both are kept, always. A strong
+    # negative signal (`risk_flags`, e.g. an incompatible role family)
+    # caps `overall_score` without forcing HUMAN_REQUIRED the way a real
+    # hard stop does; see job_agent.matching.scoring._apply_score_caps.
+    raw_fit_score: int = Field(ge=0, le=100, default=0)
+    risk_flags: tuple[str, ...] = Field(default_factory=tuple)
+
     semantic_available: bool
     prompt_version: str | None = None
     model_used: str | None = None

@@ -135,9 +135,12 @@ class AutomationSettings(StrictModel):
 
 
 class MatchingThresholds(StrictModel):
-    auto_apply_threshold: int = Field(ge=0, le=100, default=90)
-    review_threshold: int = Field(ge=0, le=100, default=80)
-    save_threshold: int = Field(ge=0, le=100, default=70)
+    # Matching Engine V2 recalibration — see config/automation.yaml's
+    # `matching` block for the full rationale. These are fallback
+    # defaults only; production is always driven by automation.yaml.
+    auto_apply_threshold: int = Field(ge=0, le=100, default=85)
+    review_threshold: int = Field(ge=0, le=100, default=65)
+    save_threshold: int = Field(ge=0, le=100, default=50)
     semantic_blend_weight: float = Field(ge=0.0, le=1.0, default=0.4)
 
 

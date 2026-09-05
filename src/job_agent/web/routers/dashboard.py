@@ -34,11 +34,20 @@ from job_agent.web.schemas import (
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 _APPLY_PRIORITY_DECISIONS = {"APPLY"}
+# Matching Engine V2 (audit item J): a "qualified match" is a job that
+# cleared the save_threshold and isn't excluded/hard-stopped into
+# HUMAN_REQUIRED — NOT merely "a JobMatch row exists for it" (the old
+# `job_matches` metric's actual meaning, which counted every scored job
+# regardless of quality, including outright SKIPs).
+_QUALIFIED_DECISIONS = {"APPLY", "REVIEW", "SAVE"}
+_HIGH_CONFIDENCE_DECISIONS = {"APPLY", "REVIEW"}
 _APPLIED_STAGES = {"APPLIED", "ASSESSMENT", "INTERVIEW", "OFFER", "REJECTED"}
 
 
 @router.get("/summary", response_model=DashboardSummaryOut)
-def dashboard_summary(session: SessionDep, candidate: CandidateDep) -> DashboardSummaryOut:
+def dashboard_summary(
+    session: SessionDep, candidate: CandidateDep, config: ConfigDep
+) -> DashboardSummaryOut:
     _, candidate_id = candidate
     jobs = list(session.execute(select(JobRow)).scalars())
     applications = list(
@@ -57,20 +66,42 @@ def dashboard_summary(session: SessionDep, candidate: CandidateDep) -> Dashboard
     matches_by_job = job_view.latest_matches_by_job(
         session, [job.id for job in jobs], candidate_id
     )
-    scored: list[tuple[JobRow, JobMatch]] = []
+    jobs_scored = 0
+    qualified_matches = 0
+    high_confidence_matches = 0
     apply_priority_count = 0
+    # Matching Engine V2 (audit item I): only decisions worth a human's
+    # attention are even candidates for Top Opportunities — a SKIP must
+    # NEVER appear there, so it's excluded here rather than relying on
+    # ranking alone to bury it.
+    rankable_pairs: list[tuple[JobRow, JobMatch | None]] = []
     for job in jobs:
         match_row = matches_by_job.get(job.id)
         if match_row is not None:
-            scored.append((job, match_row))
+            jobs_scored += 1
+            if match_row.decision in _QUALIFIED_DECISIONS:
+                qualified_matches += 1
+            if match_row.decision in _HIGH_CONFIDENCE_DECISIONS:
+                high_confidence_matches += 1
             if match_row.decision in _APPLY_PRIORITY_DECISIONS:
                 apply_priority_count += 1
+            if match_row.decision != "SKIP":
+                rankable_pairs.append((job, match_row))
 
-    scored.sort(key=lambda pair: pair[1].overall_score, reverse=True)
-    top = scored[:10]
+    # Reuses the exact same composite ranking `new_since_last_visit`/
+    # `morning_briefing` already use (job_agent.matching.ranking.
+    # rank_jobs) instead of the old raw overall_score sort — rank_jobs'
+    # own decision-aware career_value weighting means a HUMAN_REQUIRED
+    # job is naturally deprioritized under APPLY/REVIEW/SAVE, never
+    # ranked above them just for having a higher raw number.
+    preferences = compute_learned_preferences(
+        job_view.matched_jobs_with_applications(session, candidate_id)
+    )
+    ranked = rank_jobs(
+        rankable_pairs, config.automation.priority_weights, preferences=preferences, limit=10
+    )
     top_out = [
-        _job_out(job, match_row, _application_for(session, job.id, candidate_id))
-        for job, match_row in top
+        _job_out(r.job, r.match, _application_for(session, r.job.id, candidate_id)) for r in ranked
     ]
 
     shortlisted = sum(
@@ -83,7 +114,13 @@ def dashboard_summary(session: SessionDep, candidate: CandidateDep) -> Dashboard
     return DashboardSummaryOut(
         resume_parsed=True,
         resume_validation_status=version.validation_status if version else None,
-        job_matches=len(scored),
+        # Redefined per audit item J — see _QUALIFIED_DECISIONS above.
+        # `jobs_scored` keeps the OLD meaning available under its own,
+        # honestly-named field for any consumer that actually wants it.
+        job_matches=qualified_matches,
+        jobs_scored=jobs_scored,
+        qualified_matches=qualified_matches,
+        high_confidence_matches=high_confidence_matches,
         shortlisted=shortlisted,
         applied=applied,
         interviewing=interviewing,

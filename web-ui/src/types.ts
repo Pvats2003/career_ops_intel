@@ -18,6 +18,8 @@ export interface MatchOut {
   excluded_reasons: string[]
   reasoning: string
   semantic_available: boolean
+  raw_fit_score: number
+  risk_flags: string[]
 }
 
 export interface DataConfidenceOut {
@@ -198,7 +200,11 @@ export interface ResumeUploadResult {
 export interface DashboardSummaryOut {
   resume_parsed: boolean
   resume_validation_status: string | null
+  /** Kept for backward compatibility — same value as qualified_matches. */
   job_matches: number
+  jobs_scored: number
+  qualified_matches: number
+  high_confidence_matches: number
   shortlisted: number
   applied: number
   interviewing: number

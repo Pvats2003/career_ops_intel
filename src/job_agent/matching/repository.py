@@ -46,6 +46,8 @@ def save_job_match(
         prompt_version=result.prompt_version,
         model_used=result.model_used,
         cache_key=cache_key,
+        raw_fit_score=result.raw_fit_score,
+        risk_flags=list(result.risk_flags),
     )
     session.add(row)
     session.flush()

@@ -68,6 +68,13 @@ class MatchOut(BaseModel):
     excluded_reasons: list[str]
     reasoning: str
     semantic_available: bool
+    # Matching Engine V2 (audit item G) — the pre-cap weighted-average
+    # score and the strong-negative-signal flags that can cap
+    # `overall_score` below it. Never hides the raw evidence: both numbers
+    # are always present, `raw_fit_score == overall_score` whenever no cap
+    # applied.
+    raw_fit_score: int
+    risk_flags: list[str]
 
 
 class DataConfidenceOut(BaseModel):
@@ -242,7 +249,15 @@ class PipelineUpdateIn(BaseModel):
 class DashboardSummaryOut(BaseModel):
     resume_parsed: bool
     resume_validation_status: str | None
+    # Matching Engine V2 (audit item J — "Job Matches: 539" was actually
+    # counting every SCORED job, not genuine matches). `job_matches` is
+    # kept for API backward compatibility but now means the same thing as
+    # `qualified_matches` below; `jobs_scored` carries the OLD meaning
+    # under its own honest name for any consumer that wants it.
     job_matches: int
+    jobs_scored: int
+    qualified_matches: int
+    high_confidence_matches: int
     shortlisted: int
     applied: int
     interviewing: int

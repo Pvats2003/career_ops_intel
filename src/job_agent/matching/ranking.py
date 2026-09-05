@@ -36,8 +36,16 @@ _FRESHNESS_SIGNAL: dict[str, float] = {
 _CAREER_VALUE_SIGNAL: dict[str, float] = {
     "APPLY": 1.0,
     "REVIEW": 0.65,
-    "HUMAN_REQUIRED": 0.45,
     "SAVE": 0.3,
+    # Matching Engine V2 (forensic false-positive audit, item I):
+    # HUMAN_REQUIRED means the matcher found something that specifically
+    # needs a human's judgment (a hard stop), not "this is nearly as good
+    # as REVIEW" — it used to sit ABOVE SAVE here, which is how a
+    # hard-stopped job with an inflated raw score could still surface
+    # prominently in "Top Opportunities". Lowered below SAVE so it's only
+    # ever prominent when everything else about the job is genuinely
+    # exceptional, never merely because of its raw match score.
+    "HUMAN_REQUIRED": 0.15,
     "SKIP": 0.0,
 }
 

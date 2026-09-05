@@ -321,6 +321,15 @@ class JobMatch(Base, TimestampMixin):
     # instead of paying for another deterministic+LLM pass. NULL for any
     # row written before this column existed — never treated as a match.
     cache_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Matching Engine V2 (forensic false-positive audit, item G) — the
+    # uncapped weighted-average score alongside the (possibly lower)
+    # `overall_score` actually used for the decision, so a hard-stop/
+    # risk-flagged job's raw evidence stays visible rather than hidden
+    # behind the capped number. NULL for any row written before this
+    # column existed (pre-V2 rows recompute automatically on the next
+    # matching run — see job_agent.matching.cache.MATCH_LOGIC_VERSION).
+    raw_fit_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_flags: Mapped[list | None] = mapped_column(JSON, nullable=True, default=list)
 
 
 # --------------------------------------------------------------------------

@@ -224,7 +224,7 @@ export default function Dashboard() {
         <>
           <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
             <StatTile label="Jobs discovered" value={summary.total_jobs_discovered} />
-            <StatTile label="Job matches" value={summary.job_matches} />
+            <StatTile label="Qualified matches" value={summary.qualified_matches} />
             <StatTile label="Apply priority" value={summary.apply_priority_count} accent />
             <StatTile label="Shortlisted" value={summary.shortlisted} />
             <StatTile label="Applied" value={summary.applied} />

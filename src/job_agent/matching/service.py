@@ -56,6 +56,11 @@ def _job_text_from_row(row: JobRow) -> JobText:
         location=row.location,
         remote_type=row.remote_type,
         employment_type=row.employment_type,
+        # Matching Engine V2: Arbeitnow is the one source that reports
+        # visa_sponsorship as a verified per-listing fact (see
+        # job_agent.jobs.sources.arbeitnow) — this used to be captured on
+        # the Job row and then never actually read by the matcher.
+        visa_information=row.visa_information,
     )
 
 
@@ -127,6 +132,16 @@ def _outcome_from_cached_row(job_row: JobRow, row: JobMatchRow) -> MatchOutcome:
         semantic_available=bool(row.semantic_available),
         prompt_version=row.prompt_version,
         model_used=row.model_used,
+        # NULL on any row written before Matching Engine V2 — the score
+        # itself is unaffected either way (raw_fit_score is display-only
+        # supplementary evidence, not read by decide()/anything gating a
+        # decision), and such a row's cache_key is already stale under
+        # the bumped MATCH_LOGIC_VERSION, so it gets a real recompute
+        # (with a real raw_fit_score) the moment matching runs again.
+        raw_fit_score=(
+            int(row.raw_fit_score) if row.raw_fit_score is not None else int(row.overall_score)
+        ),
+        risk_flags=tuple(row.risk_flags or []),
     )
     return MatchOutcome(
         job_id=job_row.id, title=job_row.title, company=job_row.company_name,

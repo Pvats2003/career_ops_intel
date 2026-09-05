@@ -13,6 +13,28 @@ from job_agent.config.models import MatchingThresholds
 from job_agent.matching.schema import Decision, JobMatchResult
 from job_agent.matching.scoring import ScoredMatch
 
+# Matching Engine V2 (audit item H): production has no LLM configured, so
+# "semantic didn't run" can no longer be the ONLY way to unlock APPLY —
+# that would make APPLY permanently unreachable for every deterministic-
+# only deployment regardless of how strong the evidence actually is.
+# Deterministic-only evidence can unlock APPLY, but only when it is
+# genuinely strong: a primary-tier role-family match (not a marginal or
+# adjacent-but-unconfirmed one), real specific-skill evidence (not just
+# generic keyword overlap), and zero risk flags of any kind. When semantic
+# DID run, it still counts as an independent, sufficient path to APPLY —
+# exactly as before — since that's real additional confirmation on top of
+# the deterministic score, never a requirement for it.
+_DETERMINISTIC_APPLY_MIN_ROLE_MATCH = 85
+_DETERMINISTIC_APPLY_MIN_SPECIFIC_MATCHES = 2
+
+
+def _deterministic_confidence_is_high(scored: ScoredMatch) -> bool:
+    return (
+        not scored.risk_flags
+        and scored.role_match >= _DETERMINISTIC_APPLY_MIN_ROLE_MATCH
+        and scored.specific_matched_count >= _DETERMINISTIC_APPLY_MIN_SPECIFIC_MATCHES
+    )
+
 
 def decide(scored: ScoredMatch, thresholds: MatchingThresholds) -> Decision:
     if scored.excluded_reasons:
@@ -21,7 +43,9 @@ def decide(scored: ScoredMatch, thresholds: MatchingThresholds) -> Decision:
         return Decision.HUMAN_REQUIRED
 
     if scored.overall_score >= thresholds.auto_apply_threshold:
-        return Decision.APPLY if scored.semantic_available else Decision.REVIEW
+        if scored.semantic_available or _deterministic_confidence_is_high(scored):
+            return Decision.APPLY
+        return Decision.REVIEW
     if scored.overall_score >= thresholds.review_threshold:
         return Decision.REVIEW
     if scored.overall_score >= thresholds.save_threshold:
@@ -49,4 +73,6 @@ def finalize(scored: ScoredMatch, thresholds: MatchingThresholds) -> JobMatchRes
         semantic_available=scored.semantic_available,
         prompt_version=scored.prompt_version,
         model_used=scored.model_used,
+        raw_fit_score=scored.raw_fit_score,
+        risk_flags=tuple(scored.risk_flags),
     )

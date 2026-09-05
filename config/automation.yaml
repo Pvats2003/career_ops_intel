@@ -14,9 +14,23 @@ dry_run: true
 live_mode: false
 
 matching:
-  auto_apply_threshold: 90
-  review_threshold: 80
-  save_threshold: 70
+  # Matching Engine V2 (forensic false-positive audit) recalibration: the
+  # old 90/80/70 thresholds were tuned against the pre-V2 scorer, which
+  # routinely inflated overall_score via generic-keyword overlap (see the
+  # audit report). Under the corrected, more conservative scoring, a
+  # false-positive job (wrong role family, e.g. an unrelated engineering
+  # discipline) now caps out around 45 even in its best case, while a
+  # genuinely strong, honestly-evidenced match for this candidate's real
+  # target roles lands in the high 50s-60s on a realistically detailed
+  # posting — verified empirically via tests/unit/test_matching_v2.py and
+  # the synthetic benchmark in tests/unit/test_matching_benchmark.py.
+  # These thresholds are set with a deliberate safety margin ABOVE the
+  # false-positive ceiling (role_family_mismatch caps overall_score at 45
+  # in job_agent.matching.scoring — always strictly below save_threshold)
+  # so a role-mismatched job can never reach SAVE purely by recalibration.
+  auto_apply_threshold: 85
+  review_threshold: 65
+  save_threshold: 50
   # Below save_threshold -> SKIP
   # How much weight the LLM-based semantic refinement gets vs. the
   # deterministic keyword/regex score, for the three dimensions it refines

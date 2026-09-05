@@ -288,6 +288,47 @@ def test_dashboard_summary_empty_by_default(tmp_path, monkeypatch, real_config):
     assert body["top_opportunities"] == []
 
 
+def test_dashboard_top_opportunities_never_shows_skip(tmp_path, monkeypatch, real_config):
+    """Matching Engine V2 (audit item I): Top Opportunities used to sort
+    purely by raw overall_score, so a SKIP-decision job with an inflated
+    score could rank above a genuinely qualified SAVE-decision job. A SKIP
+    must never appear in top_opportunities at all, regardless of score."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    skip_job_id = _seed_job(db_path, fingerprint="skip-high-score", title="Senior GNC Engineer")
+    _seed_match(db_path, skip_job_id, candidate_id, overall_score=95, decision="SKIP")
+    save_job_id = _seed_job(db_path, fingerprint="save-genuine", title="Business Analyst")
+    _seed_match(db_path, save_job_id, candidate_id, overall_score=55, decision="SAVE")
+
+    r = client.get("/api/dashboard/summary")
+    assert r.status_code == 200
+    top_ids = [job["id"] for job in r.json()["top_opportunities"]]
+    assert skip_job_id not in top_ids
+    assert save_job_id in top_ids
+
+
+def test_dashboard_metrics_distinguish_scored_from_qualified(tmp_path, monkeypatch, real_config):
+    """Matching Engine V2 (audit item J): "Job Matches: 539" used to mean
+    "539 jobs were scored", not "539 genuine matches". jobs_scored counts
+    every scored job; job_matches/qualified_matches must count only
+    APPLY/REVIEW/SAVE decisions, never SKIP."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    decisions = ["SKIP", "SKIP", "SAVE", "REVIEW", "APPLY"]
+    for i, decision in enumerate(decisions):
+        job_id = _seed_job(db_path, fingerprint=f"metric-{i}", title=f"Role {i}")
+        _seed_match(db_path, job_id, candidate_id, overall_score=60, decision=decision)
+
+    r = client.get("/api/dashboard/summary")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["jobs_scored"] == 5
+    assert body["qualified_matches"] == 3  # SAVE + REVIEW + APPLY, not the 2 SKIPs
+    assert body["job_matches"] == 3  # kept in sync with qualified_matches, not jobs_scored
+    assert body["high_confidence_matches"] == 2  # REVIEW + APPLY only
+    assert body["apply_priority_count"] == 1  # APPLY only
+
+
 def test_dashboard_summary_does_not_query_matches_once_per_job(tmp_path, monkeypatch, real_config):
     """Production-audit finding: `dashboard_summary()` used to call
     `_latest_match()` once per discovered job — an unbounded N+1 query

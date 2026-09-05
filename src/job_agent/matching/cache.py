@@ -24,7 +24,7 @@ from job_agent.config.loader import AppConfig
 from job_agent.db.models import Job as JobRow
 from job_agent.resume.versioning import compute_profile_hash
 
-MATCH_LOGIC_VERSION = "match_cache.v1"
+MATCH_LOGIC_VERSION = "match_cache.v2"
 
 
 def compute_match_cache_key(profile: CandidateProfile, config: AppConfig, job_row: JobRow) -> str:

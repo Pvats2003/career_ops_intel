@@ -43,10 +43,56 @@ class ScoredMatch:
     semantic_available: bool = False
     prompt_version: str | None = None
     model_used: str | None = None
+    # Matching Engine V2 (audit item G) — see JobMatchResult for the full
+    # rationale. `raw_fit_score` is the pre-cap weighted average;
+    # `overall_score` above is what actually drives the decision.
+    raw_fit_score: int = 0
+    risk_flags: list[str] = field(default_factory=list)
+    specific_matched_count: int = 0
 
 
 def _blend(deterministic_score: int, semantic_score: int, weight: float) -> int:
     return round(deterministic_score * (1 - weight) + semantic_score * weight)
+
+
+# Audit item G: a job with a hard stop or a clearly incompatible role
+# family must never DISPLAY as an apparently excellent numeric match, even
+# though neither condition disqualifies it outright on its own (an
+# incompatible role family is deliberately never a hard stop by itself —
+# see job_agent.matching.deterministic._role_alignment). These caps only
+# ever LOWER the score, never raise it, and `raw_fit_score` always keeps
+# the uncapped number around so the underlying evidence is never hidden.
+_ROLE_FAMILY_MISMATCH_CAP = 45
+_HARD_STOP_CAP = 50
+_EXCLUDED_CAP = 20
+
+
+def _apply_score_caps(raw_score: int, deterministic: DeterministicMatch) -> int:
+    cap = 100
+    if "role_family_mismatch" in deterministic.risk_flags:
+        cap = min(cap, _ROLE_FAMILY_MISMATCH_CAP)
+    if deterministic.hard_stop_reasons:
+        cap = min(cap, _HARD_STOP_CAP)
+    if deterministic.excluded_reasons:
+        cap = min(cap, _EXCLUDED_CAP)
+    return min(raw_score, cap)
+
+
+def _explain_requirements(deterministic: DeterministicMatch) -> str:
+    parts = []
+    if deterministic.matched_requirements:
+        parts.append(
+            "Matched core requirements: "
+            + ", ".join(deterministic.matched_requirements)
+            + f" ({len(deterministic.matched_requirements)})."
+        )
+    if deterministic.missing_requirements:
+        parts.append(
+            "Missing/unconfirmed requirements: "
+            + ", ".join(deterministic.missing_requirements)
+            + f" ({len(deterministic.missing_requirements)})."
+        )
+    return " ".join(parts)
 
 
 def combine_match(
@@ -106,7 +152,7 @@ def combine_match(
         "eligibility_match": deterministic.eligibility_match,
     }
 
-    overall_score = round(
+    raw_fit_score = round(
         sub_scores["skills_match"] * weights.skills
         + sub_scores["experience_match"] * weights.experience
         + sub_scores["role_match"] * weights.role_alignment
@@ -116,7 +162,20 @@ def combine_match(
         + sub_scores["seniority_match"] * weights.seniority
         + sub_scores["eligibility_match"] * weights.eligibility
     )
-    overall_score = max(0, min(100, overall_score))
+    raw_fit_score = max(0, min(100, raw_fit_score))
+    overall_score = _apply_score_caps(raw_fit_score, deterministic)
+
+    requirements_note = _explain_requirements(deterministic)
+    if requirements_note:
+        reasoning_parts.append(requirements_note)
+    if deterministic.risk_flags:
+        reasoning_parts.append(f"Risk flags: {', '.join(deterministic.risk_flags)}.")
+    if overall_score != raw_fit_score:
+        reasoning_parts.append(
+            f"Raw fit score {raw_fit_score} capped to {overall_score} due to the risk "
+            "flags/hard stops above — the number shown reflects that risk, not just "
+            "the weighted sub-scores."
+        )
 
     return ScoredMatch(
         overall_score=overall_score,
@@ -129,4 +188,7 @@ def combine_match(
         semantic_available=semantic.available,
         prompt_version=prompt_version,
         model_used=model_used,
+        raw_fit_score=raw_fit_score,
+        risk_flags=list(deterministic.risk_flags),
+        specific_matched_count=deterministic.specific_matched_count,
     )
