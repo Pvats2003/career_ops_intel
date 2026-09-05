@@ -5,17 +5,22 @@ a truthful candidate knowledge base, and (in later phases) prepares and
 submits applications — with humans in the loop by default and every
 generated fact traceable to a source.
 
-**This repository is at the end of Phase 6A (Provider Architecture &
-Contracts).** Phase 6A is architecture/contracts only — see "Architecture
-(Phase 6A" below. It widens the `ApplicationProvider` interface, adds a
-`SUBMISSION_UNCERTAIN` state, and wires `config/rules.yaml`'s safety rules
-into actual enforcement for the first time — but ships **no real provider,
-no browser automation, no credential handling, and no new way to reach
-SUBMITTED/VERIFIED**. `ManualReviewProvider` remains the only shipped
-`ApplicationProvider`, and its `submit()` still always refuses. Resume
-variant selection/tailoring, real ATS/browser-automation integrations, and
-live submission do not exist yet. **Nothing in this codebase can submit a
-real job application.**
+**Setting this up on your own machine?** Start with
+[`docs/LOCAL_SETUP.md`](docs/LOCAL_SETUP.md) (exact commands, in order) and
+[`docs/FIRST_RUN_CHECKLIST.md`](docs/FIRST_RUN_CHECKLIST.md) (the shortest
+possible path to your first real search). Run `job-agent doctor` at any
+point to see exactly what's configured, what's missing, and how to fix it.
+
+The system today includes a working FastAPI + React web dashboard, real
+(keyless) job-source adapters (Remotive, Arbeitnow), an Adzuna adapter ready
+for free API credentials, deterministic + LLM-assisted matching, resume
+tailoring, cover-letter generation, an application assistant, and an
+autonomous scheduler — all covered by the phase-by-phase architecture notes
+below, which are kept for historical/design context. Submitting an actual
+job application always requires an explicit human action; nothing in this
+codebase submits automatically. See `docs/LOCAL_ACTIVATION_REPORT.md` for a
+current, honest breakdown of what's verified vs. what still needs your
+machine/credentials/decisions.
 
 ## Core principle
 
@@ -621,11 +626,20 @@ Copy `.env.example` to `.env` (or run `job-agent init`) and fill in secrets.
 
 ## Running it
 
+See `docs/LOCAL_SETUP.md` for the full, exact-commands walkthrough
+(Windows and Linux/Mac). Short version:
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-alembic upgrade head        # create the SQLite schema (data/job_agent.db)
+job-agent init               # scaffolds .env from .env.example, creates data/,
+                              # and runs the Alembic migration to head
+job-agent doctor              # one-command diagnostic: exactly what's
+                              # configured, what's missing, how to fix it
+job-agent db upgrade          # re-run after any `git pull` that adds a new
+                              # alembic/versions/ migration (safe no-op otherwise)
+job-agent db current          # show the database's current Alembic revision
 
 job-agent status            # show effective dry-run/live-mode/automation-level state
 job-agent health            # config loads + candidate profile parses + DB reachable
