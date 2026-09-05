@@ -31,6 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 if TYPE_CHECKING:
+    from alembic.config import Config as AlembicConfig
     from playwright.sync_api import Browser
 
 from job_agent.applications.allowlist import (
@@ -102,12 +103,14 @@ app = typer.Typer(help="Autonomous global job discovery and application agent.")
 profile_app = typer.Typer(help="Candidate profile commands.")
 jobs_app = typer.Typer(help="Job discovery commands (Phase 2+).")
 applications_app = typer.Typer(help="Application pipeline commands (Phase 5+).")
+db_app = typer.Typer(help="Database schema commands.")
 allowlist_app = typer.Typer(
     help="Exact-posting submission allowlist (Phase 6C — controlled real-world execution)."
 )
 app.add_typer(profile_app, name="profile")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(applications_app, name="applications")
+app.add_typer(db_app, name="db")
 applications_app.add_typer(allowlist_app, name="allowlist")
 
 console = Console()
@@ -156,6 +159,63 @@ def init() -> None:
         console.print(".env already exists or no .env.example found — leaving as-is.")
 
     console.print("[green]init complete.[/green] config/ and candidate/ are ready.")
+
+    cfg = load_config()
+    _run_alembic_upgrade(cfg.env.database_url)
+    console.print("[green]Database schema is up to date.[/green]")
+
+
+def _alembic_config(database_url: str) -> AlembicConfig:
+    from alembic.config import Config as AlembicConfig
+
+    cfg = AlembicConfig(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", database_url)
+    return cfg
+
+
+def _run_alembic_upgrade(database_url: str) -> None:
+    """Bring the database schema up to date via Alembic — the one real
+    schema-migration path this repo has, previously reachable only by
+    running the `alembic` CLI by hand from the repo root (undocumented,
+    and never run automatically by anything `job-agent` itself does).
+    `init_db()` (used everywhere else) creates tables that don't exist
+    yet via `Base.metadata.create_all()`, but never ALTERs an existing
+    table to add a column a later migration introduced — so upgrading
+    this codebase against a database that already has data would
+    otherwise leave the app hitting "no such column" errors at runtime.
+    Real-world production-deployment audit finding: `job-agent init` now
+    runs this automatically, and `job-agent db upgrade` runs it on
+    demand (e.g. after `git pull` brings in a new migration)."""
+    from alembic import command as alembic_command
+
+    alembic_command.upgrade(_alembic_config(database_url), "head")
+
+
+@db_app.command("upgrade")
+def db_upgrade() -> None:
+    """Apply any outstanding Alembic migrations to bring the database
+    schema up to date. Safe to run any time, including on a database
+    that's already current (no-op). Run this after every `git pull` that
+    adds a file under `alembic/versions/`."""
+    cfg = load_config()
+    console.print(f"Upgrading [cyan]{cfg.env.database_url}[/cyan] to the latest schema...")
+    _run_alembic_upgrade(cfg.env.database_url)
+    console.print("[green]Database schema is up to date.[/green]")
+
+
+@db_app.command("current")
+def db_current() -> None:
+    """Show the database's current Alembic revision."""
+    from alembic.runtime.migration import MigrationContext
+
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    with engine.connect() as connection:
+        context = MigrationContext.configure(connection)
+        revision = context.get_current_revision()
+    console.print(f"Database: [cyan]{cfg.env.database_url}[/cyan]")
+    console.print(f"Current revision: [green]{revision or '(none — never migrated)'}[/green]")
 
 
 @profile_app.command("parse")
