@@ -1,30 +1,17 @@
-# Cloud deployment — Career OS on Render
+# Cloud deployment — Career OS at $0/month
+
+**Committed architecture**: Render Free Web Service + Neon Free
+PostgreSQL + this GitHub repository + an optional free UptimeRobot/
+cron-job.org keep-alive. Browser-only access. No paid Render resources.
+Mandatory hosting cost: **$0/month**.
 
 Deploy the existing Career OS so it runs entirely in the cloud: open a
-browser, go to one URL, and everything — dashboard, job search, matching,
-resume tailoring, cover letters, the application pipeline, the autonomous
-scheduler — is already running. No Python, Node, or terminal on the
-machine you use it from.
+browser, go to one URL, log in, and everything — dashboard, job search,
+matching, resume tailoring, cover letters, the application pipeline, the
+autonomous scheduler — is already running. Nothing beyond a browser is
+needed on the machine you use it from.
 
-This guide targets **Render** (render.com). Why Render and not Railway,
-Fly.io, or something else: Career OS is a single FastAPI process that
-already serves the built frontend and runs its own scheduler in a
-background thread (see `src/job_agent/jobs/scheduler.py`) — there is no
-separate frontend host, no separate worker process, and no complex
-multi-service topology to configure. Render's "one web service + one
-managed database" model is the simplest fit for exactly that shape, its
-free tier is enough to evaluate the whole flow before paying anything, and
-connecting a GitHub repo through its dashboard requires no CLI tooling on
-your machine. Railway and Fly.io could run the same Dockerfile with
-similar steps if you already prefer one of them.
-
-Two ready-made recipes are included: `render.yaml` (paid, ~$14/mo,
-always-on and fully persistent — steps 1-12 below) and `render.free.yaml`
-(genuinely $0/month using a free external Postgres and a free keep-alive
-ping — see "Free-tier alternative" after step 12). Pick whichever fits;
-the rest of this guide otherwise applies to both.
-
-## Architecture (what actually runs where)
+## $0 architecture (what actually runs where)
 
 ```
                     YOUR BROWSER
@@ -32,23 +19,28 @@ the rest of this guide otherwise applies to both.
                          ▼
               https://career-os-xxxx.onrender.com
                          │
+                    (HTTP Basic Auth:
+                     APP_USERNAME/APP_PASSWORD)
+                         │
                          ▼
         ┌────────────────────────────────────┐
-        │   Render Web Service (this repo's   │
-        │   Dockerfile, one container)        │
+        │   Render FREE Web Service           │
+        │   (this repo's Dockerfile,          │
+        │    one container, plan: free)        │
         │                                      │
         │   FastAPI (API + built frontend)     │
         │        +                             │
         │   APScheduler (in-process thread)    │
-        │   -- daily job search, no browser    │
-        │      or separate process needed      │
         └───────────────┬──────────────────────┘
-                         │
+                         │  DATABASE_URL
                          ▼
         ┌────────────────────────────────────┐
-        │  Render managed PostgreSQL          │
-        │  (candidate, jobs, matches,         │
-        │   applications, search history)     │
+        │  Neon FREE PostgreSQL                │
+        │  (external to Render — does NOT      │
+        │   expire like Render's own free      │
+        │   Postgres does)                     │
+        │  candidate, jobs, matches,           │
+        │  applications, search history        │
         └────────────────────────────────────┘
                          │
                          ▼
@@ -56,102 +48,109 @@ the rest of this guide otherwise applies to both.
         Arbeitnow, Adzuna) and, if configured,
         the Anthropic API — the key for which
         lives only on the server, never the browser.
+
+        ┌────────────────────────────────────┐
+        │  Optional: UptimeRobot/cron-job.org  │
+        │  free monitor → GET /api/health      │
+        │  every 5-10 min → keeps the free      │
+        │  container from spinning down         │
+        └────────────────────────────────────┘
 ```
 
-Nothing here requires your office laptop to run anything except the
-browser tab. The scheduler keeps searching daily whether or not that tab
-is open.
+Your office laptop needs only a browser and an internet connection —
+nothing here runs on it.
 
 ## Before you start
 
-- A GitHub account with this repository pushed to it (fork it if it's not
-  already yours).
-- A credit card, even to use Render's free tier for evaluation — real,
-  unattended daily operation needs the paid `starter` plan (~$7/mo per
-  service, ~$14/mo total for the web service + database). See the plan
-  note in `render.yaml` and step 9 below for why free-tier is not
-  sufficient for "runs even when my browser is closed."
+- A GitHub account with this repository pushed to it.
+- A Render account (no credit card needed for the free plan).
+- A Neon account (no credit card needed for the free plan).
 
-## Steps
+No paid account, credit card, or local install of Python/Node/Docker/Git
+is required for any of this.
 
-### 1. Create a Render account
+---
 
-Go to https://render.com and sign up (GitHub sign-in is the fastest path
-and doubles as step 2).
+# $0 DEPLOYMENT — EXACT STEPS
 
-### 2. Connect your GitHub repository
+### 1. Create a Neon account
 
-From the Render dashboard: **New +** → **Blueprint**. Authorize Render to
-access your GitHub account if prompted, then select this repository.
+Go to https://neon.tech and sign up free (GitHub sign-in is fastest).
 
-### 3. Choose the deployment service
+### 2. Create a Neon project
 
-Render reads `render.yaml` from the repo root automatically and shows you
-a preview: one **Web Service** (`career-os`, built from this repo's
-`Dockerfile`) and one **PostgreSQL** database (`career-os-db`). Click
-**Apply** to create both. This one file is doing the work of "configure
-backend," "configure frontend," and "configure database" below — they're
-already wired together in `render.yaml`, described here so you understand
-what got created.
+From the Neon dashboard, click **Create a project**. Give it any name
+(e.g. "career-os"). Neon creates the project and a default database in
+one step.
 
-### 4. Backend configuration (already done by render.yaml)
+### 3. Create the PostgreSQL database
 
-The web service builds this repo's `Dockerfile`, which installs the
-backend (`pip install -e .`) and runs `job-agent serve --host 0.0.0.0
---port $PORT` as its start command. `$PORT` is injected by Render — you
-don't set it. Nothing to do here beyond confirming the service shows
-"Live" after step 9.
+Neon creates a default database for you as part of step 2 (usually named
+`neondb`) — you don't need a separate step to create it unless you want a
+differently-named one, in which case use Neon's **Databases** tab →
+**New Database**.
 
-### 5. Frontend configuration (already done by render.yaml)
+### 4. Copy the connection string
 
-The same `Dockerfile` builds the React frontend (`npm run build`) in its
-first stage and copies the result into the image; the one FastAPI process
-serves it from the same origin as the API, so there's no separate frontend
-host, no CORS configuration, and no second URL to remember.
+Neon dashboard → your project → **Connection Details** (sometimes labeled
+**Connection string**). Copy the string that starts with `postgresql://`
+— it already includes `?sslmode=require`. Keep this tab open; you'll
+paste it in step 10.
 
-### 6. Database configuration (already done by render.yaml)
+### 5. Open Render
 
-Render provisions the `career-os-db` Postgres instance and injects its
-connection string into the web service as `DATABASE_URL` automatically
-(see the `fromDatabase` entry in `render.yaml`) — you never type a
-database URL or password by hand. This is real persistence: the database
-is a separate managed resource from the web service's container, so
-redeploying, restarting, or even deleting and recreating the web service
-does not touch its data.
+Go to https://render.com and sign up free (GitHub sign-in is fastest).
 
-### 7. Scheduler configuration (already done — no separate service)
+### 6. Create a Blueprint
 
-The autonomous scheduler runs inside the same web service process (see
-the architecture diagram above) and is on by default (`job-agent serve`'s
-`--scheduler` flag, default enabled). It searches once per
-`search_frequency_hours` (default 24h, changeable from the dashboard's
-Settings page once you're logged in) — no cron job, no second Render
-service, and no open browser tab required.
+From the Render dashboard: **New +** → **Blueprint**.
 
-### 8. Add environment variables
+### 7. Select the repository
 
-In the Render dashboard, open the `career-os` web service → **Environment**.
-`render.yaml` already declared these; fill in real values:
+Authorize Render to access your GitHub account if prompted, then select
+this repository (`career_ops_intel`).
 
-| Variable | Required? | What it does |
-|---|---|---|
-| `APP_USERNAME` / `APP_PASSWORD` | **Yes, before you tell anyone the URL** | Gates the entire dashboard behind HTTP Basic Auth. This is a personal dashboard with your name, resume, and salary expectations on it — without these set, anyone who finds the URL can open it. |
-| `ANTHROPIC_API_KEY` | Optional | Enables LLM-refined matching/tailoring/cover letters/career chat. Get one at https://console.anthropic.com/. Everything works without it, deterministically. |
-| `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` | Optional | Enables the Adzuna job source. Free at https://developer.adzuna.com/. Remotive and Arbeitnow need no credentials and work without these. |
+### 8. Select the correct branch
 
-`DATABASE_URL`, `DRY_RUN`, `LIVE_MODE`, `LOG_LEVEL`, `LOG_FORMAT` are
-already set by `render.yaml` — leave them as-is unless you specifically
-mean to change them (see README.md's safety-rules section before ever
-touching `DRY_RUN`/`LIVE_MODE`).
+Render asks which branch to deploy. Choose your repository's default
+branch (typically `main`) once this work is merged into it — or whichever
+branch you intend to keep deploying from. This isn't hardcoded anywhere;
+you choose it in this step, and Render remembers it for future
+auto-deploys on push.
 
-Click **Save Changes** — Render redeploys automatically when you do.
+### 9. Select `render.free.yaml`
 
-### 9. Deploy
+Render defaults to reading `render.yaml` (the paid recipe) from the repo
+root. In the Blueprint creation screen, look for the blueprint file field
+and change it to **`render.free.yaml`** instead — this is what makes the
+web service use Render's free plan and skip creating a Render-managed
+Postgres database.
 
-If you haven't already saved environment variables (which triggers a
-redeploy), click **Manual Deploy** → **Deploy latest commit** on the
-`career-os` service. Watch the **Logs** tab; a successful deploy ends with
-lines like:
+### 10. Configure environment variables
+
+Render shows the web service `render.free.yaml` defines
+(`career-os`) with its declared environment variables. Fill in:
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | Paste the Neon connection string from step 4, exactly as copied |
+| `APP_USERNAME` | Choose your own login username |
+| `APP_PASSWORD` | Choose your own login password (not reused elsewhere) |
+| `ANTHROPIC_API_KEY` | Optional — leave blank for deterministic-only matching/tailoring |
+| `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` | Optional — leave blank to skip the Adzuna source |
+
+`DRY_RUN`, `LIVE_MODE`, `LOG_LEVEL`, `LOG_FORMAT`, `LLM_PROVIDER` are
+already set to safe defaults by `render.free.yaml` — nothing to do there.
+
+### 11. Deploy
+
+Click **Apply** (or **Create Web Service**, depending on Render's current
+UI wording). Render builds the Docker image and starts the container.
+
+### 12. Wait for the build
+
+Watch the **Logs** tab. A Docker build (Node stage + Python stage) takes a
+few minutes on the free plan. A successful deploy ends with lines like:
 
 ```
 Ensuring database schema is up to date...
@@ -159,23 +158,12 @@ Career OS dashboard starting at http://0.0.0.0:$PORT
 Autonomous scheduled search enabled.
 ```
 
-**Before relying on this for daily use**, switch both the web service and
-the database from Render's `free` plan to `starter` (Settings → Instance
-Type, for each resource) if you started on free. Render's free web
-service plan spins the container down after ~15 minutes with no incoming
-request — which also stops the in-process scheduler thread — and free
-Postgres instances auto-expire and get deleted after a fixed number of
-days. Neither of those is compatible with "keeps searching daily whether
-or not I've opened the dashboard," which is the whole point of this
-deployment.
+### 13. Open `/api/health`
 
-### 10. Verify health
-
-Once the service shows "Live," open `https://<your-service>.onrender.com/api/health`
-in a browser (this one endpoint is never gated by `APP_USERNAME`/
-`APP_PASSWORD` — a deployment platform's own health probe can't
-authenticate, so it has to stay open, and it never returns a credential or
-connection string). You should see something like:
+Once the service shows "Live," open
+`https://<your-service>.onrender.com/api/health` in a browser (no login
+needed — this path is intentionally exempt; see "Keep-alive" below). You
+should see:
 
 ```json
 {
@@ -187,94 +175,225 @@ connection string). You should see something like:
 }
 ```
 
-`"connected": true` and `"migrations_current": true` confirm the database
-is real and current. `"llm": {"configured": false}` just means you haven't
-set `ANTHROPIC_API_KEY` — not an error.
+`"connected": true` and `"migrations_current": true` confirm Neon is
+really connected and the schema is current. If you instead see a
+connection error here, double-check the `DATABASE_URL` you pasted in step
+10 matches Neon's connection string exactly.
 
-### 11. Open the dashboard
+### 14. Open Career OS
 
-Visit `https://<your-service>.onrender.com` in a browser. If you set
-`APP_USERNAME`/`APP_PASSWORD`, the browser will prompt for them once
-(Basic Auth) — enter them and the browser remembers for the session.
-You should land on the Career OS dashboard.
+Visit `https://<your-service>.onrender.com` in a browser.
 
-### 12. Run your first real search
+### 15. Log in
 
-From the dashboard, trigger a search the same way you would locally, or
-wait for the scheduler's next cycle. To run one immediately without
-waiting: Render's dashboard → your service → **Shell** tab gives you a
-one-off terminal inside the running container, where you can run:
+Your browser prompts for a username and password (native HTTP Basic Auth
+— no custom login page). Enter the `APP_USERNAME`/`APP_PASSWORD` you set
+in step 10. The browser remembers this for the session.
 
+### 16. Configure preferences
+
+On the dashboard, go to **Settings** and fill in your work/location/
+salary/visa preferences (these start as `UNKNOWN` and are never guessed —
+see `config/preferences.yaml`'s field list in `docs/ENVIRONMENT_VARIABLES.md`'s
+companion doc, `docs/LOCAL_SETUP.md` step 8, for the full list).
+
+### 17. Run your first real search
+
+You don't have to do anything here — see "First real search" below for
+why. If you want one immediately rather than waiting: open the
+**Dashboard** and click **Run Search** (see `web-ui/src/pages/Dashboard.tsx`
+and the `POST /api/jobs/search-run` endpoint it calls) — a real button in
+the browser UI, no CLI or shell required.
+
+### 18. Configure keep-alive (optional but recommended)
+
+See "Keep-alive" below for exact setup. Recommended, not required — the
+app works correctly either way, just with less predictable scheduler
+timing without it.
+
+---
+
+## First real search
+
+**No manual action is actually required.** `job-agent serve`'s scheduler
+is configured to fire once immediately on process startup
+(`next_run_time=datetime.now(UTC)` in `src/job_agent/jobs/scheduler.py`),
+and since a brand-new deployment has no prior `SearchRun` row, the
+due-check (`last_run is None`) evaluates to "due" on that very first tick.
+In practice: your first real search runs automatically within moments of
+the container starting in step 11/12, before you ever open the dashboard.
+
+If you want to trigger another one on demand at any time — e.g. after
+changing preferences — the **Run Search** button on the Dashboard page
+calls `POST /api/jobs/search-run` directly from the browser. This is the
+same code path the CLI's `job-agent jobs search-run` and the scheduler's
+own tick both use; nothing about it is a lesser or fallback version.
+Neither path requires Python, PowerShell, or Render's Shell tab (which
+isn't available on the free plan in any case) on your office laptop.
+
+## Scheduler safety
+
+The scheduler runs in a background thread inside the same web service
+process. What actually happens under each condition, verified by reading
+`src/job_agent/jobs/scheduler.py` and `src/job_agent/jobs/search_run.py`:
+
+- **Render sleeps** (free plan, ~15 min idle): the background thread
+  simply isn't running while the container is stopped. Nothing breaks —
+  when the container next wakes (an inbound request, or your keep-alive
+  ping), the scheduler's next poll re-evaluates whether a search is due
+  by comparing `search_frequency_hours` against the last **completed**
+  run's real timestamp stored in the database, not against how long the
+  process has been running. A search that was "due" while asleep runs as
+  soon as the process wakes.
+- **Render restarts or redeploys**: same reasoning — the due-check is
+  entirely database-driven, so a fresh process picks up exactly where the
+  data left off. No special handling was needed and none exists, because
+  none is needed.
+- **The process crashes mid-search**: a `SearchRun` row is written with
+  `status="RUNNING"` before any real work starts, and only updated to
+  `COMPLETED`/`PARTIAL`/`FAILED` at the end. A hard crash (not a caught
+  exception) leaves that row stuck at `RUNNING` forever — but the
+  due-check only ever looks at rows with `status IN (COMPLETED, PARTIAL)`,
+  so a stuck `RUNNING` row is simply invisible to it. The next poll
+  correctly treats a search as still due, exactly as if the crashed run
+  had never started. Nothing gets permanently wedged.
+- **Multiple instances accidentally start**: not a practical concern on
+  this deployment — Render's free (and starter) web service plans run
+  exactly one instance; there is no autoscaling to worry about here. (For
+  completeness: if two instances ever did run concurrently, there is no
+  distributed lock between them, so both could decide a search is due at
+  the same moment and both would run one. This is a real, undocumented-
+  elsewhere limitation of the current single-process design, not
+  something this deployment's plan choice can trigger.)
+
+**What this does NOT guarantee**: an exact time of day, or that a search
+happens within any specific number of minutes of being "due." On the free
+plan without a keep-alive, a search that becomes due while the container
+is asleep runs whenever something next wakes it — which could be minutes
+or, in the worst case, longer if nothing pings or visits it. It is never
+skipped outright and never runs twice for the same due period; it can
+only run late.
+
+## Keep-alive
+
+Recommended target: `GET /api/health`.
+
+- **Fast**: a handful of in-process checks (config load, one DB
+  round-trip via `SELECT`, in-memory config reads) — no outbound network
+  calls of its own, typically sub-second.
+- **No authentication required**: this path is explicitly exempted from
+  the `APP_USERNAME`/`APP_PASSWORD` gate (see `_HEALTH_PATH` in
+  `src/job_agent/web/app.py`) — a monitoring service can't authenticate,
+  so gating it would make your own keep-alive lock itself out.
+- **No secrets, no candidate data**: the response contains only booleans
+  and short status strings (`connected`, `migrations_current`,
+  `available`, per-source enabled/disabled/credential status, LLM
+  configured true/false) — never a database URL, API key, name, email, or
+  any job/application content. Verified by `tests/unit/test_health_status.py`.
+
+**Setup**: sign up free at https://uptimerobot.com or https://cron-job.org,
+add an HTTP(S) monitor for `https://<your-service>.onrender.com/api/health`,
+interval 5 minutes (UptimeRobot's free-plan minimum; cron-job.org allows
+similar). That single monitor both confirms the service is up and, as a
+side effect, stops Render's free plan from ever fully spinning the
+container down, since a spun-down container only wakes on an inbound
+request — which this ping now supplies every 5 minutes.
+
+**If the ping fails or lapses**: nothing breaks catastrophically. The
+container spins down as it normally would on the free plan; the next
+real visitor (you, opening the dashboard) or the next successful ping
+wakes it back up, and the scheduler's database-driven due-check (see
+"Scheduler safety" above) catches up correctly rather than skipping or
+double-running. **A keep-alive does not guarantee zero downtime or exact
+scheduler timing** — it only makes both closer to continuous than leaving
+the free plan to spin down on its own.
+
+## Database backup and restore (Neon, browser-only)
+
+Because this is a $0 deployment, the simplest real backup strategy uses
+Neon's own browser-based tools — no local `pg_dump`/`psql` install needed:
+
+- **Branching (primary, recommended)**: Neon dashboard → your project →
+  **Branches** → **Create branch**. This creates an instant, full,
+  independent copy-on-write snapshot of your database at that moment —
+  useful before any risky change (e.g. before testing a schema migration
+  by hand, or before a bulk data cleanup). Restoring means pointing
+  `DATABASE_URL` at the branch's own connection string (Render →
+  Environment → `DATABASE_URL` → paste the branch's string → Save), or
+  using Neon's **Restore** action to reset the main branch to an earlier
+  point.
+- **Point-in-time restore**: Neon's free tier retains a limited history
+  window (this changes over time — check Neon's own pricing/limits page
+  for the current retention period on the free plan) that lets you
+  restore to any moment within that window directly from the dashboard,
+  with no export/import step at all.
+- **Optional: a real downloadable file backup**. If you specifically want
+  an offline `.sql` file (e.g. to keep outside Neon entirely), that does
+  require the standard Postgres client tools (`pg_dump`) on whatever
+  machine runs the export — not your office laptop by design, but some
+  machine with Python/a terminal. Command, run against the Neon
+  connection string from step 4: `pg_dump "$DATABASE_URL" > backup.sql` to
+  export, `psql "$DATABASE_URL" < backup.sql` to restore into a fresh
+  database. This is optional and not required for the $0 architecture to
+  be genuinely persistent — Neon's own branching already provides that
+  without needing local tools.
+
+## Free-tier resource limits (honest, not fabricated)
+
+Free-tier limits on any platform change over time and this session
+cannot browse Render's or Neon's current pricing pages to confirm exact
+numbers as of when you read this — check their pricing pages directly
+before relying on a specific figure. What's true by design, independent
+of whatever the current numbers are:
+
+- **Render Free**: the container spins down after a period of inbound-
+  request inactivity and cold-starts on the next request; free plans
+  have historically also carried a monthly usage-hour allowance shared
+  across a Render account's free services. Neither 24/7 uptime nor an
+  exact scheduler firing time is guaranteed on this plan (see "Scheduler
+  safety" above).
+- **Neon Free**: storage and monthly "compute" usage are capped (check
+  Neon's current numbers); a personal single-candidate job-search
+  database is small (candidate profile, jobs, matches, applications,
+  search history — plain text and small numeric/JSON fields, no large
+  binary blobs) and comfortably fits typical free-tier storage limits in
+  practice, but this session cannot verify Neon's exact current cap.
+- **UptimeRobot/cron-job.org free tiers**: typically cap the minimum
+  monitor interval (commonly 5 minutes) and the number of free monitors —
+  this deployment needs exactly one monitor, well within either service's
+  free allowance historically, but again, verify current limits directly.
+- **GitHub**: not used for any scheduled execution in this architecture
+  (the scheduler runs inside the Render container, not as a GitHub
+  Actions workflow) — no GitHub Actions minutes are consumed by this
+  deployment at all.
+
+This is not a promise of unlimited storage, unlimited job searches, or
+guaranteed 24/7 uptime — it's an honest $0 system with the tradeoffs
+above, not a disguised paid system.
+
+---
+
+## Environment variables — exact minimal set
+
+```text
+DATABASE_URL=
+APP_USERNAME=
+APP_PASSWORD=
 ```
-job-agent jobs search-run
+
+Optional (every one has a working fallback when left blank):
+
+```text
+ANTHROPIC_API_KEY=
+ADZUNA_APP_ID=
+ADZUNA_APP_KEY=
 ```
 
-From then on, the scheduler keeps this current automatically — no manual
-step needed for subsequent searches.
-
-## Free-tier alternative ($0/month)
-
-Everything above uses Render's paid `starter` plan (~$14/mo total)
-because it's the most robust option: an always-on container and a
-database that never expires. If you'd rather pay nothing, this recipe
-gets genuinely close for a single-candidate personal tool, at the cost of
-one extra account and a small chance of a slightly-delayed (never
-duplicated, never lost) scheduled search.
-
-**What's different from the paid recipe:**
-
-| | Paid (`render.yaml`) | Free (`render.free.yaml`) |
-|---|---|---|
-| Web service | Render `starter`, always running | Render `free`, spins down after ~15 min idle |
-| Database | Render managed Postgres, `starter` | Neon.tech free Postgres — does **not** expire |
-| Keeps the scheduler alive | Nothing needed — it's always running | A free external ping every 5-10 min |
-
-### Setup steps
-
-1. **Create the database first, separately from Render.** Go to
-   https://neon.tech, sign up free, create a project. Copy the connection
-   string it gives you (starts with `postgresql://`) — this is a real,
-   permanent Postgres instance, just hosted by Neon instead of Render.
-
-2. **Connect this repo to Render as a Blueprint**, same as step 2 above,
-   but when Render asks which blueprint file to use, choose
-   **`render.free.yaml`** instead of the default `render.yaml`.
-
-3. **Set environment variables** exactly as in step 8 above, plus paste
-   your Neon connection string into `DATABASE_URL` by hand (the paid
-   recipe gets this automatically from Render's own database; this one
-   doesn't have a Render-managed database to pull it from).
-
-4. **Deploy** (step 9 above) and **verify health** (step 10) the same way.
-
-5. **Set up a free keep-alive ping** so the scheduler doesn't go quiet
-   whenever nobody's opened the dashboard in a while:
-   - Sign up free at https://uptimerobot.com (or https://cron-job.org).
-   - Add a new monitor: HTTP(S), URL = `https://<your-service>.onrender.com/api/health`,
-     interval = 5 minutes (UptimeRobot's free-plan minimum).
-   - That's it — this single monitor does double duty as both an uptime
-     check and the thing that stops Render's free plan from ever
-     spinning the container down, since a spun-down container only wakes
-     up on an inbound request, and this one arrives every 5 minutes.
-
-**Why this is safe even if the ping ever lapses**: the scheduler decides
-whether to run based on `search_frequency_hours` compared against the
-real timestamp of the last completed search *stored in the database* —
-never on how long the process has been running. So even a container that
-spun down for a day and only woke up because you happened to open the
-dashboard will correctly realize "it's been over 24 hours" and run
-immediately, rather than silently skipping or double-running. Worst case
-on this free recipe is an occasional few-minutes-late search, never a
-duplicate and never a permanently missed one.
-
-## Credentials checklist
-
-- [ ] `APP_USERNAME` / `APP_PASSWORD` — required before sharing the URL with anyone, including yourself on another device.
-- [ ] `ANTHROPIC_API_KEY` — optional, from https://console.anthropic.com/.
-- [ ] `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` — optional, free, from https://developer.adzuna.com/.
-
-Nothing else needs a credential you supply — `DATABASE_URL` is generated
-and injected by Render itself.
+Full details (purpose, where each goes, where to obtain it, whether it's
+a secret) are in `docs/ENVIRONMENT_VARIABLES.md`. Never put real values
+in the repository — both `render.yaml` and `render.free.yaml` mark every
+secret `sync: false`, meaning Render always asks you to fill it in by
+hand rather than reading a committed value.
 
 ## What you'll do daily
 
@@ -295,19 +414,37 @@ you open the tab.
   served from the same origin (one Render URL), so the browser never
   makes a cross-origin request to begin with.
 - The access gate (`APP_USERNAME`/`APP_PASSWORD`) covers every route,
-  including the frontend shell itself, except `/api/health`.
+  including the frontend shell itself, except `/api/health` — verified by
+  `tests/unit/test_web_auth_gate.py`, including that neither a failed nor
+  a successful login attempt ever writes the real password (or a raw
+  Authorization header) into application logs.
 - SSRF protections on generated/redirect-followed application URLs
   (`job_agent/jobs/url_check.py`) and the resume-upload size cap
   (`job_agent/web/routers/candidate.py`) are unchanged by deployment —
   they apply identically in the cloud.
-- `DRY_RUN=true`/`LIVE_MODE=false` ship as the default in `render.yaml`:
-  no application can be auto-submitted regardless of where this runs.
+- `DRY_RUN=true`/`LIVE_MODE=false` ship as the default in both
+  `render.yaml` files: no application can be auto-submitted regardless of
+  where this runs.
+- Neon's connection string always includes `?sslmode=require` — the
+  connection to your database is encrypted in transit; nothing in this
+  codebase strips or overrides that.
 
 ## If something doesn't work
 
-Run through `docs/LOCAL_ACTIVATION_REPORT.md`'s categories mentally: is
-this a code problem (check Render's Logs tab for a traceback), a missing
-credential (check `/api/health` and the Environment tab), or a plan
-limitation (free-tier spin-down, most commonly)? `job-agent doctor` isn't
-reachable remotely, but the same underlying checks are what `/api/health`
-reports.
+Is this a code problem (check Render's **Logs** tab for a traceback), a
+missing/wrong credential (check `/api/health` and the Environment tab —
+`"connected": false` almost always means `DATABASE_URL` doesn't match
+what Neon gave you), or a plan limitation (free-tier spin-down, most
+commonly, showing up as a slow first request after idle time)?
+`job-agent doctor` isn't reachable remotely, but the same underlying
+checks are what `/api/health` reports.
+
+## Optional: upgrading later to the paid, always-on recipe
+
+If you later decide the $0 tradeoffs aren't worth it, `render.yaml` (the
+paid recipe, ~$14/mo total) is still in this repository and gets you an
+always-on container with a database that never expires, no keep-alive
+needed. Nothing about the $0 deployment locks you out of switching —
+export your Neon data (see "Database backup and restore" above) and
+follow `render.yaml`'s setup instead. This isn't required, and the $0
+recipe above is the currently committed architecture.

@@ -10,6 +10,7 @@ default) must leave today's local-dev behavior completely unchanged.
 from __future__ import annotations
 
 import base64
+import logging
 import shutil
 from pathlib import Path
 
@@ -114,3 +115,32 @@ def test_frontend_shell_is_also_gated_not_only_the_api(tmp_path, monkeypatch, re
 
     r = client.get("/", follow_redirects=False)
     assert r.status_code == 401
+
+
+def test_credentials_never_appear_in_logs_on_success_or_failure(
+    tmp_path, monkeypatch, real_config, caplog
+):
+    """Deployment audit: neither a failed nor a successful Basic Auth
+    attempt may ever put the real APP_PASSWORD (or a raw Authorization
+    header) into application logs."""
+    _configure_env(tmp_path, monkeypatch, real_config)
+    secret_password = "unmistakable-canary-password-xyz"
+    monkeypatch.setenv("APP_USERNAME", "candidate")
+    monkeypatch.setenv("APP_PASSWORD", secret_password)
+    client = TestClient(create_app())
+
+    with caplog.at_level(logging.DEBUG):
+        client.get("/api/health")  # exempt path, no credentials sent
+        client.get("/api/candidate/profile")  # anonymous, should 401
+        client.get(
+            "/api/candidate/profile", headers=_basic_auth_header("candidate", "wrong")
+        )  # wrong credentials, should 401
+        client.get(
+            "/api/candidate/profile",
+            headers=_basic_auth_header("candidate", secret_password),
+        )  # correct credentials, should 200
+
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret_password not in log_text
+    encoded = base64.b64encode(f"candidate:{secret_password}".encode()).decode()
+    assert encoded not in log_text

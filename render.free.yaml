@@ -1,6 +1,8 @@
-# Render Blueprint — FREE-TIER RECIPE. See docs/CLOUD_DEPLOYMENT.md's
-# "Free-tier alternative" section for the full walkthrough and honest
-# tradeoffs versus render.yaml (the paid, always-on recipe).
+# Render Blueprint — the COMMITTED $0/month recipe. See
+# docs/CLOUD_DEPLOYMENT.md for the full 18-step walkthrough, scheduler
+# safety notes, keep-alive setup, and honest tradeoffs versus render.yaml
+# (an optional paid, always-on recipe kept in this repo for later upgrade
+# but not the currently committed architecture).
 #
 # Differences from render.yaml:
 #   1. No `databases:` block — Render's own free Postgres auto-expires
