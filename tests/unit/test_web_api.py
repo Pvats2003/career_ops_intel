@@ -837,6 +837,27 @@ def test_resume_upload_accepts_valid_docx(tmp_path, monkeypatch, real_config):
     assert body["validation_status"] in ("PASSED", "FAILED")
 
 
+def test_resume_upload_rejects_oversized_file(tmp_path, monkeypatch, real_config):
+    """Deployment security audit: an unbounded `await file.read()` on a
+    now-potentially-public endpoint could exhaust memory/disk before any
+    other validation ever ran. Real resumes are a few hundred KB at most."""
+    from job_agent.web.routers.candidate import _MAX_RESUME_BYTES
+
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    oversized = b"0" * (_MAX_RESUME_BYTES + 1)
+    r = client.post(
+        "/api/candidate/resume",
+        files={
+            "file": (
+                "resume.docx",
+                oversized,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert r.status_code == 413
+
+
 def test_spa_fallback_serves_index_for_client_routes(tmp_path, monkeypatch, real_config):
     """React Router uses client-side (BrowserRouter) routing — a direct
     GET for a client-only path like /pipeline or /jobs/5 (a bookmark, a

@@ -1,0 +1,80 @@
+# Render Blueprint — see docs/CLOUD_DEPLOYMENT.md for the full walkthrough.
+#
+# One web service (this Dockerfile) + one managed Postgres database.
+# There is no separate worker/background-job service: the autonomous
+# scheduler runs in-process inside `job-agent serve` (see
+# src/job_agent/jobs/scheduler.py) and needs nothing else.
+#
+# After connecting this repo on https://dashboard.render.com/blueprints,
+# Render reads this file and provisions both resources. Everything under
+# `envVars` with `sync: false` must be filled in by hand in the Render
+# dashboard after the first deploy — never commit real values here.
+
+# IMPORTANT — plan choice is not cosmetic here:
+# Render's FREE web service plan spins the container down after ~15
+# minutes with no inbound HTTP request, and spins it back up (cold start)
+# on the next request. The autonomous scheduler runs as a background
+# thread INSIDE this same process (see src/job_agent/jobs/scheduler.py) —
+# a spun-down container runs no code at all, so a free-plan deployment
+# would silently stop running daily searches whenever nobody has loaded
+# the dashboard recently, which defeats "the scheduler must keep working
+# with my browser closed." The FREE Postgres plan also auto-expires after
+# a fixed number of days and is then deleted — the opposite of the
+# "persistent database" this deployment needs. `starter` (~$7/mo each,
+# two services) is what actually delivers what was asked for. Use `free`
+# only for a short-lived personal evaluation where losing data or missed
+# scheduled searches is acceptable.
+databases:
+  - name: career-os-db
+    databaseName: career_os
+    plan: starter
+
+services:
+  - type: web
+    name: career-os
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      # Provided automatically by Render from the database above — do not
+      # set this by hand.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: career-os-db
+          property: connectionString
+
+      # Safety-critical: submission stays impossible until you deliberately
+      # change both. Leave as-is unless you mean it (see README.md).
+      - key: DRY_RUN
+        value: "true"
+      - key: LIVE_MODE
+        value: "false"
+
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: LOG_FORMAT
+        value: "json"
+
+      # Fill in after the first deploy, in the Render dashboard (Environment
+      # tab) — never commit real values. Both required together: this is a
+      # personal single-candidate dashboard and must not be reachable by an
+      # anonymous visitor once it has a public URL (see docs/CLOUD_DEPLOYMENT.md
+      # step 8's security note).
+      - key: APP_USERNAME
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+
+      # Optional — leave unset for deterministic-only matching/tailoring.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: "anthropic"
+
+      # Optional — leave unset to skip the Adzuna source (Remotive/
+      # Arbeitnow need no credentials and work without these).
+      - key: ADZUNA_APP_ID
+        sync: false
+      - key: ADZUNA_APP_KEY
+        sync: false

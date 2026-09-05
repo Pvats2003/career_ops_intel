@@ -53,6 +53,10 @@ from job_agent.web.schemas import (
 router = APIRouter(prefix="/api/candidate", tags=["candidate"])
 
 _ALLOWED_RESUME_SUFFIXES = (".docx",)
+# A real resume .docx is a few hundred KB at most; capped well above that
+# (deployment security audit) so an oversized upload can't exhaust memory
+# or disk before `resume_path.write_bytes(body)` ever runs.
+_MAX_RESUME_BYTES = 10 * 1024 * 1024
 
 
 def _years_experience(profile: CandidateProfile) -> float:
@@ -127,9 +131,14 @@ async def upload_resume(
             status_code=422,
             detail="Only a .docx resume is supported (job_agent.resume.extractor).",
         )
-    body = await file.read()
+    body = await file.read(_MAX_RESUME_BYTES + 1)
     if not body:
         raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+    if len(body) > _MAX_RESUME_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Resume exceeds the {_MAX_RESUME_BYTES // (1024 * 1024)}MB upload limit.",
+        )
 
     resume_path = config.env.candidate_dir / "resume_master.docx"
     resume_path.parent.mkdir(parents=True, exist_ok=True)

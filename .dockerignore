@@ -1,0 +1,31 @@
+# Never bake these into the image.
+.git/
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-journal
+
+# Local dev / cache artifacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Frontend: node_modules and dist are rebuilt in the frontend-builder
+# stage; never copy a host-machine build into the image.
+web-ui/node_modules/
+web-ui/dist/
+
+# Not needed at runtime.
+tests/
+docs/
+README.md
