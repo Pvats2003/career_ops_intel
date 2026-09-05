@@ -10,20 +10,16 @@
 # `envVars` with `sync: false` must be filled in by hand in the Render
 # dashboard after the first deploy — never commit real values here.
 
-# IMPORTANT — plan choice is not cosmetic here:
-# Render's FREE web service plan spins the container down after ~15
-# minutes with no inbound HTTP request, and spins it back up (cold start)
-# on the next request. The autonomous scheduler runs as a background
-# thread INSIDE this same process (see src/job_agent/jobs/scheduler.py) —
-# a spun-down container runs no code at all, so a free-plan deployment
-# would silently stop running daily searches whenever nobody has loaded
-# the dashboard recently, which defeats "the scheduler must keep working
-# with my browser closed." The FREE Postgres plan also auto-expires after
-# a fixed number of days and is then deleted — the opposite of the
-# "persistent database" this deployment needs. `starter` (~$7/mo each,
-# two services) is what actually delivers what was asked for. Use `free`
-# only for a short-lived personal evaluation where losing data or missed
-# scheduled searches is acceptable.
+# This is the PAID recipe (~$14/mo total) — the most robust option:
+# always-on web service, database that never expires, scheduler runs on
+# schedule with no extra moving parts. See render.free.yaml (and
+# docs/CLOUD_DEPLOYMENT.md's "Free-tier alternative" section) for a
+# genuinely $0/month recipe using Render's free web service + a free
+# Neon.tech Postgres + a free external keep-alive ping — the tradeoff
+# being one more account to set up and a small chance of a missed
+# scheduler tick if the keep-alive ever lapses (never a duplicate run or
+# lost data either way, since the due-check is based on real elapsed
+# time stored in the database, not process uptime).
 databases:
   - name: career-os-db
     databaseName: career_os

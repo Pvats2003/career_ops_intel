@@ -1,0 +1,76 @@
+# Render Blueprint — FREE-TIER RECIPE. See docs/CLOUD_DEPLOYMENT.md's
+# "Free-tier alternative" section for the full walkthrough and honest
+# tradeoffs versus render.yaml (the paid, always-on recipe).
+#
+# Differences from render.yaml:
+#   1. No `databases:` block — Render's own free Postgres auto-expires
+#      and gets deleted after a fixed number of days, which is the
+#      opposite of "persistent." This recipe points DATABASE_URL at a
+#      Neon.tech free Postgres instead (permanently free, does not
+#      expire) — you paste that connection string in by hand after
+#      creating a Neon project, same as any other `sync: false` secret
+#      below.
+#   2. `plan: free` for the web service. Render's free plan spins the
+#      container down after ~15 minutes with no inbound request, which
+#      also stops the in-process autonomous scheduler while it's down.
+#      Set up a free external pinger (UptimeRobot or cron-job.org, both
+#      free) hitting this service's `/api/health` every 5-10 minutes to
+#      keep it from ever fully spinning down — see the docs section
+#      above for exact steps. Without that pinger, the scheduler only
+#      catches up when something happens to wake the service (e.g. you
+#      opening the dashboard), which is still safe (no duplicate runs,
+#      no missed jobs — the due-check is based on real elapsed time
+#      recorded in the database, not process uptime) but not "runs
+#      every day like clockwork."
+#
+# When connecting this repo on https://dashboard.render.com/blueprints,
+# choose "render.free.yaml" as the blueprint file (Render's New Blueprint
+# flow lets you pick a specific file instead of the default render.yaml).
+
+services:
+  - type: web
+    name: career-os
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      # Paste your Neon.tech connection string here after creating a free
+      # Neon project (Dashboard -> Connection Details -> copy the
+      # "postgresql://..." string). Neon's free tier does not expire.
+      - key: DATABASE_URL
+        sync: false
+
+      # Safety-critical: submission stays impossible until you deliberately
+      # change both. Leave as-is unless you mean it (see README.md).
+      - key: DRY_RUN
+        value: "true"
+      - key: LIVE_MODE
+        value: "false"
+
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: LOG_FORMAT
+        value: "json"
+
+      # Fill in after the first deploy, in the Render dashboard (Environment
+      # tab) — never commit real values. Both required together: this is a
+      # personal single-candidate dashboard and must not be reachable by an
+      # anonymous visitor once it has a public URL.
+      - key: APP_USERNAME
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+
+      # Optional — leave unset for deterministic-only matching/tailoring.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: "anthropic"
+
+      # Optional — leave unset to skip the Adzuna source (Remotive/
+      # Arbeitnow need no credentials and work without these).
+      - key: ADZUNA_APP_ID
+        sync: false
+      - key: ADZUNA_APP_KEY
+        sync: false

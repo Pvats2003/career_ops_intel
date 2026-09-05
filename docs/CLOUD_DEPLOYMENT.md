@@ -18,6 +18,12 @@ connecting a GitHub repo through its dashboard requires no CLI tooling on
 your machine. Railway and Fly.io could run the same Dockerfile with
 similar steps if you already prefer one of them.
 
+Two ready-made recipes are included: `render.yaml` (paid, ~$14/mo,
+always-on and fully persistent — steps 1-12 below) and `render.free.yaml`
+(genuinely $0/month using a free external Postgres and a free keep-alive
+ping — see "Free-tier alternative" after step 12). Pick whichever fits;
+the rest of this guide otherwise applies to both.
+
 ## Architecture (what actually runs where)
 
 ```
@@ -205,6 +211,61 @@ job-agent jobs search-run
 
 From then on, the scheduler keeps this current automatically — no manual
 step needed for subsequent searches.
+
+## Free-tier alternative ($0/month)
+
+Everything above uses Render's paid `starter` plan (~$14/mo total)
+because it's the most robust option: an always-on container and a
+database that never expires. If you'd rather pay nothing, this recipe
+gets genuinely close for a single-candidate personal tool, at the cost of
+one extra account and a small chance of a slightly-delayed (never
+duplicated, never lost) scheduled search.
+
+**What's different from the paid recipe:**
+
+| | Paid (`render.yaml`) | Free (`render.free.yaml`) |
+|---|---|---|
+| Web service | Render `starter`, always running | Render `free`, spins down after ~15 min idle |
+| Database | Render managed Postgres, `starter` | Neon.tech free Postgres — does **not** expire |
+| Keeps the scheduler alive | Nothing needed — it's always running | A free external ping every 5-10 min |
+
+### Setup steps
+
+1. **Create the database first, separately from Render.** Go to
+   https://neon.tech, sign up free, create a project. Copy the connection
+   string it gives you (starts with `postgresql://`) — this is a real,
+   permanent Postgres instance, just hosted by Neon instead of Render.
+
+2. **Connect this repo to Render as a Blueprint**, same as step 2 above,
+   but when Render asks which blueprint file to use, choose
+   **`render.free.yaml`** instead of the default `render.yaml`.
+
+3. **Set environment variables** exactly as in step 8 above, plus paste
+   your Neon connection string into `DATABASE_URL` by hand (the paid
+   recipe gets this automatically from Render's own database; this one
+   doesn't have a Render-managed database to pull it from).
+
+4. **Deploy** (step 9 above) and **verify health** (step 10) the same way.
+
+5. **Set up a free keep-alive ping** so the scheduler doesn't go quiet
+   whenever nobody's opened the dashboard in a while:
+   - Sign up free at https://uptimerobot.com (or https://cron-job.org).
+   - Add a new monitor: HTTP(S), URL = `https://<your-service>.onrender.com/api/health`,
+     interval = 5 minutes (UptimeRobot's free-plan minimum).
+   - That's it — this single monitor does double duty as both an uptime
+     check and the thing that stops Render's free plan from ever
+     spinning the container down, since a spun-down container only wakes
+     up on an inbound request, and this one arrives every 5 minutes.
+
+**Why this is safe even if the ping ever lapses**: the scheduler decides
+whether to run based on `search_frequency_hours` compared against the
+real timestamp of the last completed search *stored in the database* —
+never on how long the process has been running. So even a container that
+spun down for a day and only woke up because you happened to open the
+dashboard will correctly realize "it's been over 24 hours" and run
+immediately, rather than silently skipping or double-running. Worst case
+on this free recipe is an occasional few-minutes-late search, never a
+duplicate and never a permanently missed one.
 
 ## Credentials checklist
 
