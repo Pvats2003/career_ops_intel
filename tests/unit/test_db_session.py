@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from job_agent.db.models import Candidate, Job, JobMatch, JobSource
-from job_agent.db.session import get_engine, get_session_factory, init_db
+from job_agent.db.session import get_engine, get_session_factory, init_db, normalize_database_url
 
 
 def test_sqlite_foreign_keys_are_enforced():
@@ -57,3 +57,63 @@ def test_valid_references_still_insert_fine():
             )
         )
         session.commit()  # must not raise
+
+
+# --- normalize_database_url: Neon/Render compatibility ---------------------
+# Managed Postgres providers (Neon, Render, Heroku-style hosts) all hand out
+# a bare "postgres://" or "postgresql://" connection string. SQLAlchemy's
+# default driver for either is psycopg2, which this project never installs
+# (only psycopg -- v3). Pasting a real Neon connection string in unmodified
+# used to fail immediately with ModuleNotFoundError: No module named
+# 'psycopg2' the moment anything tried to connect.
+
+
+def test_bare_postgresql_scheme_is_rewritten_to_psycopg3():
+    result = normalize_database_url("postgresql://user:pw@host:5432/db")
+    assert result == "postgresql+psycopg://user:pw@host:5432/db"
+
+
+def test_heroku_style_postgres_scheme_is_rewritten_to_psycopg3():
+    result = normalize_database_url("postgres://user:pw@host:5432/db")
+    assert result == "postgresql+psycopg://user:pw@host:5432/db"
+
+
+def test_neon_query_string_is_preserved_exactly():
+    result = normalize_database_url(
+        "postgresql://user:pw@ep-cool-1234.us-east-2.aws.neon.tech/neondb?sslmode=require"
+    )
+    assert result == (
+        "postgresql+psycopg://user:pw@ep-cool-1234.us-east-2.aws.neon.tech/neondb"
+        "?sslmode=require"
+    )
+
+
+def test_already_explicit_psycopg_driver_is_left_alone():
+    result = normalize_database_url("postgresql+psycopg://user:pw@host/db")
+    assert result == "postgresql+psycopg://user:pw@host/db"
+
+
+def test_sqlite_urls_are_never_touched():
+    assert normalize_database_url("sqlite:///./data/job_agent.db") == (
+        "sqlite:///./data/job_agent.db"
+    )
+    assert normalize_database_url("sqlite:///:memory:") == "sqlite:///:memory:"
+
+
+def test_password_is_not_masked_in_the_normalized_url():
+    """`str(url)` (SQLAlchemy's default __str__) renders "***" for the
+    password -- fine for logging, fatal here since this string is what
+    actually opens the connection. A silent regression to `str(url)`
+    would make every real Postgres connection attempt fail auth."""
+    result = normalize_database_url("postgresql://user:s3cret@host/db")
+    assert "s3cret" in result
+    assert "***" not in result
+
+
+def test_get_engine_accepts_a_bare_postgresql_url_without_crashing():
+    """get_engine() must not raise ModuleNotFoundError('psycopg2') just
+    from building the Engine object for a bare postgresql:// URL -- the
+    exact scheme Neon/Render hand out. (Building an Engine is lazy and
+    doesn't itself require a reachable server; only .connect() would.)"""
+    engine = get_engine("postgresql://user:pw@127.0.0.1:1/nonexistent")
+    assert engine.dialect.driver == "psycopg"

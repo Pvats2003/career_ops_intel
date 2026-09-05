@@ -10,13 +10,33 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from job_agent.db.models import Base
 
 
+def normalize_database_url(database_url: str) -> str:
+    """Managed Postgres providers (Neon, Render, Heroku-style hosts) all
+    hand out a bare `postgres://` or `postgresql://` connection string —
+    never `postgresql+psycopg://`. SQLAlchemy's default driver for either
+    bare scheme is psycopg2, which this project never installs (only
+    `psycopg` — v3 — is a dependency); pasting a Neon/Render connection
+    string in unmodified would otherwise fail immediately with
+    `ModuleNotFoundError: No module named 'psycopg2'`. Rewriting the
+    driver here means the connection string can be pasted in exactly as
+    the provider gives it, with its query string (e.g. Neon's
+    `?sslmode=require`) preserved untouched."""
+    url = make_url(database_url)
+    if url.drivername in ("postgres", "postgresql"):
+        url = url.set(drivername="postgresql+psycopg")
+    # `str(url)` masks the password (renders "***") -- fine for logging,
+    # fatal here since this string is what actually opens the connection.
+    return url.render_as_string(hide_password=False)
+
+
 def get_engine(database_url: str) -> Engine:
+    database_url = normalize_database_url(database_url)
     connect_args = {}
     is_sqlite = database_url.startswith("sqlite")
     if is_sqlite:
