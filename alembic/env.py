@@ -16,7 +16,14 @@ from job_agent.db.models import Base  # noqa: E402
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers defaults to True, which SILENTLY DISABLES
+    # every logger that already exists at this point (e.g. job_agent's own
+    # loggers) for the rest of the process — a well-known Alembic gotcha
+    # when its migration commands are invoked from within a larger
+    # long-lived application (`job-agent init`/`job-agent db upgrade` call
+    # this via the Python API, in the same process as the rest of the
+    # CLI) rather than only ever as its own short-lived `alembic` process.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
