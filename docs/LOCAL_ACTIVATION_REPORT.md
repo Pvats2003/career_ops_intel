@@ -47,6 +47,42 @@ Actually run and checked, in this environment, this session:
   like "Basic SQL" would score as a match but the tailored resume would
   claim "SQL not found in your profile". Fixed and covered by regression
   tests (found in the prior activation-audit session).
+- **Postgres persistence (cloud-deployment readiness)**: a real local
+  PostgreSQL 16 instance was started in this sandbox and all 12 existing
+  Alembic migrations were applied to it from scratch with no errors;
+  `job-agent doctor`, `job-agent health`, and `job-agent profile parse`
+  all ran correctly against it, and credentials were confirmed redacted
+  in every output. `DATABASE_URL` is the only thing that changes to move
+  from SQLite to Postgres — no code path is SQLite-specific beyond
+  `get_engine()`'s existing branch for it.
+- `job-agent serve` now runs the Alembic upgrade automatically before it
+  starts accepting requests (verified with a test that starts `serve`
+  against a brand-new, never-migrated database and confirms it reaches
+  head — necessary because a cloud platform's start command is the only
+  thing that ever runs on a redeploy).
+- The HTTP Basic Auth access gate (`APP_USERNAME`/`APP_PASSWORD`):
+  verified it blocks every route (including the frontend shell) when
+  configured, accepts only exact matching credentials, stays fully
+  inactive when unset (local dev unchanged), and exempts `/api/health`
+  specifically (confirmed a deployment platform's own health probe,
+  which sends no credentials, would otherwise be locked out).
+- `/api/health`'s enriched response (database connectivity, real
+  migration-currency comparison against Alembic head, scheduler
+  availability, per-source configuration status, LLM configuration) —
+  verified it never contains a raw `database_url`, API key, or other
+  credential even when one is set.
+- The exact production start command, run directly (not inside Docker):
+  `job-agent serve --host 0.0.0.0 --port $PORT` correctly bound the given
+  port, served `/`, a client-side route (`/jobs`), a real 404 for an
+  unknown `/api/*` path, and `/api/health`.
+- The Anthropic API key was confirmed absent from the built frontend:
+  grepped `web-ui/dist/` for both `ANTHROPIC` and `sk-ant` after a real
+  `npm run build` — zero matches.
+- A real gap found during the deployment security audit:
+  `/api/candidate/resume` read an uploaded file into memory with no size
+  limit — harmless when only reachable from localhost, genuinely
+  exploitable once this dashboard has a public URL. Capped at 10MB with
+  a regression test.
 
 ## REQUIRES MY MACHINE
 
@@ -54,16 +90,34 @@ Cannot be verified from this sandboxed development environment because
 its network policy blocks all outbound HTTPS to job-source hosts
 (confirmed via direct `curl` and the environment's own proxy status —
 403 Forbidden on every one of remotive.com, arbeitnow.com, api.adzuna.com,
-api.greenhouse.io, api.lever.co):
+api.greenhouse.io, api.lever.co) — and, for the deployment work, blocks
+pulling Docker base images from Docker Hub entirely (`docker build`
+against this repo's `Dockerfile` failed with a 403 from the registry's
+CDN; the proxy's own allowlist covers pypi/npm/crates/Go module proxies
+but not container registries):
 
 - Whether Remotive/Arbeitnow/Adzuna actually return real job listings —
-  `job-agent doctor` always reports network as `UNKNOWN`, never `PASS`,
-  for exactly this reason. Run `job-agent jobs search-run` on your own
-  machine to find out.
+  `job-agent doctor`/`/api/health` always report network as
+  `UNKNOWN`/not-checked, never a fabricated `PASS`, for exactly this
+  reason. Run `job-agent jobs search-run` once deployed to find out.
 - Real end-to-end timing/performance of a live search (response times,
   parsing behavior against live API responses rather than fixtures).
 - Whether your specific network (corporate proxy, firewall, VPN) needs
   any additional configuration to reach these APIs.
+- **The actual `docker build .` of this repo's `Dockerfile`**, and
+  therefore the deployed container's runtime behavior end to end. Every
+  individual step the Dockerfile performs was verified by running it
+  directly outside Docker (`pip install -e .`, `npm run build`,
+  `job-agent serve --host 0.0.0.0 --port <PORT>`), but the image itself
+  was never actually built or run in this sandbox. Render (and any other
+  platform building from this same Dockerfile) builds it on its own
+  infrastructure, which does not share this sandbox's network
+  restriction — but this specific claim ("the Dockerfile builds cleanly
+  end to end") is unverified by this session, not merely
+  network-blocked-and-therefore-assumed-fine.
+- Whether the actual Render deployment succeeds, since deploying requires
+  a Render account, a payment method for the `starter` plan, and access
+  to Render's own infrastructure — none of which this session has.
 
 ## REQUIRES MY CREDENTIALS
 
@@ -94,6 +148,13 @@ fill them in, in `config/preferences.yaml`:
 - Earliest start date
 - Whether to enable the autonomous scheduler's default 24h cadence or
   change `search_frequency_hours` from the Settings page
+- Your own `APP_USERNAME`/`APP_PASSWORD` for the cloud deployment's access
+  gate — see `docs/CLOUD_DEPLOYMENT.md`. Required before the deployed
+  dashboard's URL is safe to open, let alone share.
+- Whether to run the cloud deployment on Render's `starter` plan (real,
+  always-on, persistent) or `free` (spins down when idle, database
+  auto-expires) — `render.yaml` defaults to `starter` with the reasoning
+  documented inline; only you can decide the tradeoff is worth ~$14/mo.
 
 ## NOT YET VERIFIED
 
