@@ -279,6 +279,32 @@ def test_jobs_scan_with_no_sources_enabled_is_honest_zero(tmp_path, monkeypatch,
     assert body["results"] == []
 
 
+def test_search_run_populates_resume_status_on_the_dashboard(tmp_path, monkeypatch, real_config):
+    """End-to-end regression for the production-audit finding: with no
+    sources enabled (so this makes no real network call), a real
+    POST /api/jobs/search-run must still leave the dashboard's
+    "Resume Status" tile populated afterward, via the same
+    create_profile_version() ensure this test's synthetic candidate/
+    resume files (a real, if minimal, .docx) can actually satisfy."""
+    _configure_env(tmp_path, monkeypatch, real_config)
+    sources_path = tmp_path / "config" / "sources.yaml"
+    data = yaml.safe_load(sources_path.read_text())
+    for source_cfg in data["sources"].values():
+        source_cfg["enabled"] = False
+    sources_path.write_text(yaml.dump(data))
+
+    client = TestClient(create_app())
+
+    before = client.get("/api/dashboard/summary").json()
+    assert before["resume_validation_status"] is None
+
+    r = client.post("/api/jobs/search-run")
+    assert r.status_code == 200
+
+    after = client.get("/api/dashboard/summary").json()
+    assert after["resume_validation_status"] in ("PASSED", "FAILED")
+
+
 def test_list_jobs_and_match_serialization(tmp_path, monkeypatch, real_config):
     client, db_path = _client(tmp_path, monkeypatch, real_config)
     profile_r = client.get("/api/candidate/profile")

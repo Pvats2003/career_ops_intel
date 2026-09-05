@@ -183,6 +183,22 @@ def run_matching(
                 session, job_id=job_row.id, candidate_id=candidate_id, result=outcome.result,
                 cache_key=cache_key,
             )
+            # Production-audit finding: this loop used to rely on the
+            # single `session.commit()` after the whole batch below to
+            # persist every job's match. `job_agent.jobs.service.
+            # scan_source` already commits per-source rather than
+            # accumulating the entire scan in one uncommitted
+            # transaction — matching didn't follow the same pattern, so
+            # a process interrupted partway through (e.g. a Render
+            # free-plan container reclaimed mid-run) would silently roll
+            # back EVERY job matched so far this run, not just the one
+            # in flight, even though jobs discovered earlier in the same
+            # search were already durably committed. Committing here
+            # makes each job's match durable the moment it's computed;
+            # cache_key already makes re-matching an already-matched job
+            # a cheap no-op, so this changes nothing about a run that
+            # completes normally.
+            session.commit()
         except Exception as exc:  # noqa: BLE001
             # One malformed/unexpected job must never abort the whole batch —
             # at "thousands of jobs" scale, that would mean a single bad

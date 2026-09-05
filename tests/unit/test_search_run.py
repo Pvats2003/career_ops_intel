@@ -116,6 +116,48 @@ def test_execute_search_run_records_a_completed_run(db_session, real_config):
     assert run.errors == []
 
 
+def test_execute_search_run_creates_a_profile_version_when_none_exists(db_session, real_config):
+    """Production-audit finding: `job-agent profile parse` is the only
+    thing that ever calls `create_profile_version` -- a CLI command, so
+    it can never run on a deployment with no shell access (e.g. Render's
+    free plan). Without this, `CandidateProfileVersion` -- and therefore
+    the dashboard's "Resume Status" -- would stay permanently blank on
+    such a deployment even though the real resume parses fine. A real
+    search run is the browser-reachable moment this must be ensured."""
+    from job_agent.resume.repository import get_latest_version
+
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    assert get_latest_version(db_session, candidate_id) is None
+
+    src = _StubJobSource([{"id": "1", "title": "Business Analyst"}])
+    execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+
+    version = get_latest_version(db_session, candidate_id)
+    assert version is not None
+    assert version.validation_status in ("PASSED", "FAILED")
+
+
+def test_execute_search_run_profile_versioning_is_idempotent_across_runs(
+    db_session, real_config
+):
+    """Real resume extraction only needs to happen once per actual
+    profile/resume change -- create_profile_version is already idempotent
+    (returns the existing row when nothing changed), so calling it on
+    every search run must not create a new version row each time."""
+    from job_agent.resume.repository import get_latest_version
+
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    src = _StubJobSource([{"id": "1", "title": "Business Analyst"}])
+
+    execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+    first_version_id = get_latest_version(db_session, candidate_id).id
+
+    execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+    second_version_id = get_latest_version(db_session, candidate_id).id
+
+    assert first_version_id == second_version_id
+
+
 def test_execute_search_run_survives_a_failing_source(db_session, real_config):
     profile, candidate_id = _seed_candidate(db_session, real_config)
     src = _StubJobSource([], fail=True)

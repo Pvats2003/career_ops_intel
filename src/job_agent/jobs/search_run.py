@@ -30,6 +30,8 @@ from job_agent.jobs.source import JobSource
 from job_agent.llm.provider import LLMProvider, NullLLMProvider
 from job_agent.logging.setup import get_logger, log_event
 from job_agent.matching.service import run_matching
+from job_agent.resume.errors import ResumeExtractionError
+from job_agent.resume.service import create_profile_version
 
 logger = get_logger("job_agent.jobs.search_run")
 
@@ -107,6 +109,28 @@ def execute_search_run(
     session.add(run)
     session.flush()
     session.commit()
+
+    # Production-audit finding: `job-agent profile parse` (the only thing
+    # that ever calls `create_profile_version`) is a CLI command — on a
+    # deployment with no shell access (e.g. Render's free plan), it can
+    # never run, so `CandidateProfileVersion` — and therefore the
+    # dashboard's "Resume Status" — would stay permanently blank even
+    # though the real resume is baked into the deployed image and parses
+    # fine. `create_profile_version` is already idempotent (a no-op
+    # returning the existing row when nothing about the profile/resume
+    # changed since last time), so ensuring it here on every real search
+    # run — the other place `CandidateDep`'s candidate/profile pipeline
+    # already runs in the web app — costs nothing extra on repeat runs.
+    # A missing/corrupt resume file must not block job discovery/matching
+    # itself, so this is isolated in its own try/except rather than
+    # folded into the main run below.
+    try:
+        create_profile_version(session, config, profile, candidate_id)
+    except ResumeExtractionError as exc:
+        log_event(
+            logger, component="jobs.search_run", action="ensure_profile_version",
+            result="failure", error=str(exc),
+        )
 
     try:
         # Delegates the whole scan — including building the HTTP client,
