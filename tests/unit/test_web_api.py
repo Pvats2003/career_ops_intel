@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from job_agent.candidate.schema import (
     CandidateProfile,
@@ -31,6 +31,7 @@ from job_agent.db.models import JobSource as JobSourceRow
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.jobs.notifications import generate_notifications
 from job_agent.web.app import create_app
+from job_agent.web.deps import _cached_engine
 
 SYNTHETIC_VALUES = {
     "full_name": "Test Candidate",
@@ -208,8 +209,42 @@ def _client(tmp_path: Path, monkeypatch, real_config) -> tuple[TestClient, Path]
 
 
 def test_health(tmp_path, monkeypatch, real_config):
+    """Render health-check-timeout production incident: `/api/health` must
+    do NO I/O of any kind (no database query, no config file read) --
+    exactly `{"status": "ok"}` -- so it can never itself time out because
+    an external system (the database) is briefly slow or cold-starting.
+    Richer diagnostics live at `/api/status` instead (see below)."""
     client, _ = _client(tmp_path, monkeypatch, real_config)
     r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_health_endpoint_never_touches_config_or_database(tmp_path, monkeypatch, real_config):
+    """Structural guarantee, not just a response-shape check: `/api/health`
+    must not even CALL into config loading or database code, so a broken
+    .env, an unreachable database, or a cold-starting Neon compute cannot
+    make this specific endpoint slow or fail -- proven by making both
+    raise if invoked at all."""
+    import job_agent.web.app as app_module
+
+    _configure_env(tmp_path, monkeypatch, real_config)
+    client = TestClient(create_app())
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("/api/health must not call this")
+
+    monkeypatch.setattr(app_module, "load_config", _boom)
+    monkeypatch.setattr(app_module, "get_health_status", _boom)
+
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_status_endpoint_carries_the_full_diagnostics(tmp_path, monkeypatch, real_config):
+    client, _ = _client(tmp_path, monkeypatch, real_config)
+    r = client.get("/api/status")
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ok"
@@ -226,8 +261,7 @@ def test_health(tmp_path, monkeypatch, real_config):
     assert body["job_sources"]["remotive"] == "enabled"
     assert body["llm"]["configured"] is False
     # Never a raw connection string, credential, or API key anywhere in
-    # the response -- this endpoint is exempt from the access gate and
-    # must be safe to expose on a public URL with zero auth.
+    # the response.
     body_text = str(body)
     assert "sqlite://" not in body_text
     assert "postgresql://" not in body_text
@@ -252,6 +286,51 @@ def test_dashboard_summary_empty_by_default(tmp_path, monkeypatch, real_config):
     assert body["job_matches"] == 0
     assert body["total_jobs_discovered"] == 0
     assert body["top_opportunities"] == []
+
+
+def test_dashboard_summary_does_not_query_matches_once_per_job(tmp_path, monkeypatch, real_config):
+    """Production-audit finding: `dashboard_summary()` used to call
+    `_latest_match()` once per discovered job — an unbounded N+1 query
+    pattern that grows with the job count and, on Neon, turns into real
+    added network latency per job rather than SQLite's local-disk-cache
+    overhead. Seeds several jobs each with a match and counts how many
+    SELECTs actually hit `job_matches` while serving one dashboard
+    request: it must be a small constant, never one per job. Fails
+    against the pre-fix per-job loop (5 jobs -> 5 SELECTs against
+    job_matches) and passes against the batched query (1 SELECT total)."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_count = 5
+    for i in range(job_count):
+        job_id = _seed_job(db_path, fingerprint=f"n-plus-one-{i}")
+        _seed_match(db_path, job_id, candidate_id)
+
+    # Must be the SAME `Engine` object `get_session()` hands the running
+    # app (`web.deps._cached_engine`, keyed by database_url) -- a fresh
+    # `get_engine(...)` call here would be a distinct instance with its
+    # own connection pool, so an event listener on it would never see any
+    # query the app actually runs.
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    job_matches_query_count = 0
+
+    def _count_job_matches_queries(conn, cursor, statement, *args):
+        nonlocal job_matches_query_count
+        if "job_matches" in statement:
+            job_matches_query_count += 1
+
+    event.listen(engine, "before_cursor_execute", _count_job_matches_queries)
+    try:
+        r = client.get("/api/dashboard/summary")
+    finally:
+        event.remove(engine, "before_cursor_execute", _count_job_matches_queries)
+
+    assert r.status_code == 200
+    assert r.json()["job_matches"] == job_count
+    assert job_matches_query_count < job_count, (
+        f"expected a bounded number of job_matches queries regardless of job "
+        f"count ({job_count}), got {job_matches_query_count} — looks like a "
+        f"reintroduced N+1 query"
+    )
 
 
 def test_jobs_scan_with_no_sources_enabled_is_honest_zero(tmp_path, monkeypatch, real_config):

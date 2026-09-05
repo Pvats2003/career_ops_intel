@@ -107,13 +107,34 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict:
-        """Deployment health check — application running, database
+        """Liveness probe for the deployment platform (Render's
+        `healthCheckPath`) and for an external keep-alive ping — see
+        docs/CLOUD_DEPLOYMENT.md. Deliberately does NO I/O of any kind
+        (no database query, no config file read): a probe that depends on
+        an external system's health (the database) can time out because
+        THAT system is briefly slow or cold-starting (Neon's free tier
+        suspends its compute when idle and incurs a real reconnect delay
+        on the next query) even though this web process itself is
+        perfectly healthy and responsive -- and a platform reacting to
+        that by restarting the process doesn't fix a slow database, it
+        just adds churn on top of it. This must stay a pure, synchronous,
+        in-memory response so it can never itself be the slow thing.
+        Exempt from the access-gate middleware above (see `_HEALTH_PATH`)
+        since a deployment platform's own health probe never authenticates.
+        Richer diagnostics (database connectivity, migrations, job
+        sources, LLM config) live at `/api/status` instead."""
+        return {"status": "ok"}
+
+    @app.get("/api/status")
+    def status() -> dict:
+        """Full deployment status — application running, database
         connected, migrations current, scheduler availability, job-source
         configuration status, and LLM configuration status. Never
-        includes a `database_url`, API key, or any other credential;
-        exempt from the access-gate middleware above (see `_HEALTH_PATH`)
-        since a deployment platform's own health probe never authenticates.
-        """
+        includes a `database_url`, API key, or any other credential. This
+        is the endpoint to open by hand when troubleshooting a deployment
+        (see docs/CLOUD_DEPLOYMENT.md) -- unlike `/api/health`, it's
+        allowed to do real work (a database round-trip) since nothing
+        automated depends on it responding within a few seconds."""
         try:
             cfg = load_config()
         except Exception as exc:  # noqa: BLE001

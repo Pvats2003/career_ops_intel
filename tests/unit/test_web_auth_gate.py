@@ -107,6 +107,20 @@ def test_health_endpoint_is_exempt_so_the_deployment_platform_never_gets_locked_
     assert r.status_code == 200
 
 
+def test_status_endpoint_is_not_exempt_unlike_health(tmp_path, monkeypatch, real_config):
+    """Only `/api/health` (Render's automated liveness probe) is exempt.
+    `/api/status` carries real diagnostics and is only ever opened by hand
+    by a logged-in candidate, so it must stay behind the same gate as
+    every other route."""
+    _configure_env(tmp_path, monkeypatch, real_config)
+    monkeypatch.setenv("APP_USERNAME", "candidate")
+    monkeypatch.setenv("APP_PASSWORD", "correct-horse-battery-staple")
+    client = TestClient(create_app())
+
+    r = client.get("/api/status")
+    assert r.status_code == 401
+
+
 def test_frontend_shell_is_also_gated_not_only_the_api(tmp_path, monkeypatch, real_config):
     _configure_env(tmp_path, monkeypatch, real_config)
     monkeypatch.setenv("APP_USERNAME", "candidate")

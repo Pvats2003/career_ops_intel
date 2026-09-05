@@ -5,7 +5,7 @@ two never grow two separate, drifting serializations of the same job row.
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from job_agent.db.models import Application, JobMatch
@@ -31,6 +31,37 @@ def latest_match(session: Session, job_id: int, candidate_id: int) -> JobMatch |
         .order_by(JobMatch.created_at.desc())
         .limit(1)
     ).scalar_one_or_none()
+
+
+def latest_matches_by_job(
+    session: Session, job_ids: list[int], candidate_id: int
+) -> dict[int, JobMatch]:
+    """The same "latest match per job" `latest_match()` computes, batched
+    into one query instead of one-per-job — production-audit finding: a
+    dashboard covering N jobs called `latest_match()` once per job (an
+    unbounded N+1 query pattern that only gets worse as more jobs are
+    discovered, and on Neon's free tier each extra round-trip carries real
+    network latency, not just local-disk-cache overhead like SQLite in
+    tests). Only used where every job's match is needed at once
+    (`dashboard_summary()`); call sites that only ever need ONE job's
+    match (job detail, a single row) still use `latest_match()` — a
+    single extra query per real page view is not the problem this fixes."""
+    if not job_ids:
+        return {}
+    latest_per_job = (
+        select(JobMatch.job_id, func.max(JobMatch.created_at).label("max_created_at"))
+        .where(JobMatch.candidate_id == candidate_id, JobMatch.job_id.in_(job_ids))
+        .group_by(JobMatch.job_id)
+        .subquery()
+    )
+    rows = session.execute(
+        select(JobMatch).join(
+            latest_per_job,
+            (JobMatch.job_id == latest_per_job.c.job_id)
+            & (JobMatch.created_at == latest_per_job.c.max_created_at),
+        )
+    ).scalars()
+    return {row.job_id: row for row in rows}
 
 
 def application_for(session: Session, job_id: int, candidate_id: int) -> Application | None:

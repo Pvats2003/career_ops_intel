@@ -49,10 +49,18 @@ def dashboard_summary(session: SessionDep, candidate: CandidateDep) -> Dashboard
 
     version = get_latest_version(session, candidate_id)
 
+    # Production-audit finding: this used to call `_latest_match()` once
+    # per job (one query per row in `jobs`, unbounded N+1) — on Neon each
+    # extra round-trip is real network latency, not just SQLite's local
+    # disk-cache overhead the test suite runs against. One batched query
+    # via `latest_matches_by_job()` regardless of how many jobs exist.
+    matches_by_job = job_view.latest_matches_by_job(
+        session, [job.id for job in jobs], candidate_id
+    )
     scored: list[tuple[JobRow, JobMatch]] = []
     apply_priority_count = 0
     for job in jobs:
-        match_row = _latest_match(session, job.id, candidate_id)
+        match_row = matches_by_job.get(job.id)
         if match_row is not None:
             scored.append((job, match_row))
             if match_row.decision in _APPLY_PRIORITY_DECISIONS:

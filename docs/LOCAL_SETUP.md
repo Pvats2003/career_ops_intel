@@ -204,12 +204,16 @@ developing.
 job-agent doctor
 ```
 
-Or, while `job-agent serve` is running, open http://127.0.0.1:8000/api/health
+Or, while `job-agent serve` is running, open http://127.0.0.1:8000/api/status
 in a browser, or:
 
 ```powershell
-curl http://127.0.0.1:8000/api/health
+curl http://127.0.0.1:8000/api/status
 ```
+
+(`/api/health` also exists — a bare `{"status": "ok"}` liveness probe with
+no database check, meant for a deployment platform's automated health
+check, not for you to read by hand.)
 
 `job-agent doctor` never reports network reachability as PASS — it makes
 no outbound calls itself. The real test of connectivity is step 14.

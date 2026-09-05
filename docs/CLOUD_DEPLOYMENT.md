@@ -158,12 +158,12 @@ Career OS dashboard starting at http://0.0.0.0:$PORT
 Autonomous scheduled search enabled.
 ```
 
-### 13. Open `/api/health`
+### 13. Open `/api/status`
 
 Once the service shows "Live," open
-`https://<your-service>.onrender.com/api/health` in a browser (no login
-needed — this path is intentionally exempt; see "Keep-alive" below). You
-should see:
+`https://<your-service>.onrender.com/api/status` in a browser (this path
+is behind your `APP_USERNAME`/`APP_PASSWORD` from step 10 — like every
+route except `/api/health`, see "Keep-alive" below). You should see:
 
 ```json
 {
@@ -179,6 +179,11 @@ should see:
 really connected and the schema is current. If you instead see a
 connection error here, double-check the `DATABASE_URL` you pasted in step
 10 matches Neon's connection string exactly.
+
+(`/api/health` itself returns only `{"status": "ok"}` — deliberately no
+database round-trip, so Render's automated health check can never time
+out just because Neon's free-tier compute is cold-starting. `/api/status`
+is the endpoint that does the real diagnostics.)
 
 ### 14. Open Career OS
 
@@ -278,18 +283,26 @@ only run late.
 
 Recommended target: `GET /api/health`.
 
-- **Fast**: a handful of in-process checks (config load, one DB
-  round-trip via `SELECT`, in-memory config reads) — no outbound network
-  calls of its own, typically sub-second.
+- **Fast, no I/O of any kind**: no config load, no database round-trip —
+  a pure in-memory `{"status": "ok"}` response. It stays this way
+  deliberately: Render's own automated health check hits this exact path,
+  and if it did a database round-trip, a Neon free-tier cold-start
+  reconnect delay could make the platform time it out and restart an
+  otherwise-healthy instance. Verified by
+  `test_health_endpoint_never_touches_config_or_database` in
+  `tests/unit/test_web_api.py`.
 - **No authentication required**: this path is explicitly exempted from
   the `APP_USERNAME`/`APP_PASSWORD` gate (see `_HEALTH_PATH` in
   `src/job_agent/web/app.py`) — a monitoring service can't authenticate,
   so gating it would make your own keep-alive lock itself out.
-- **No secrets, no candidate data**: the response contains only booleans
-  and short status strings (`connected`, `migrations_current`,
-  `available`, per-source enabled/disabled/credential status, LLM
-  configured true/false) — never a database URL, API key, name, email, or
-  any job/application content. Verified by `tests/unit/test_health_status.py`.
+- **No secrets, no candidate data**: the response is always exactly
+  `{"status": "ok"}` — never a database URL, API key, name, email, or any
+  job/application content.
+- Real diagnostics (database connectivity, migrations, job sources, LLM
+  config) live at `/api/status` instead (see step 13 above) — that path
+  does do a database round-trip, which is fine since nothing automated
+  depends on it responding within a few seconds, only you, by hand, when
+  troubleshooting. Verified by `tests/unit/test_health_status.py`.
 
 **Setup**: sign up free at https://uptimerobot.com or https://cron-job.org,
 add an HTTP(S) monitor for `https://<your-service>.onrender.com/api/health`,
@@ -432,12 +445,13 @@ you open the tab.
 ## If something doesn't work
 
 Is this a code problem (check Render's **Logs** tab for a traceback), a
-missing/wrong credential (check `/api/health` and the Environment tab —
+missing/wrong credential (check `/api/status` and the Environment tab —
 `"connected": false` almost always means `DATABASE_URL` doesn't match
 what Neon gave you), or a plan limitation (free-tier spin-down, most
 commonly, showing up as a slow first request after idle time)?
 `job-agent doctor` isn't reachable remotely, but the same underlying
-checks are what `/api/health` reports.
+checks are what `/api/status` reports (`/api/health` itself only ever
+reports process liveness, not database/scheduler/source status).
 
 ## Optional: upgrading later to the paid, always-on recipe
 
