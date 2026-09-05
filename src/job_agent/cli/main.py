@@ -80,6 +80,7 @@ from job_agent.applications.service import (
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
+from job_agent.cli.doctor import run_doctor
 from job_agent.config.loader import REPO_ROOT, AppConfig, load_config
 from job_agent.db.models import Application, ApplicationAllowlistEntry, JobMatch
 from job_agent.db.models import Job as JobRow
@@ -421,6 +422,34 @@ def health() -> None:
     console.print(table)
     if not all_ok:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def doctor() -> None:
+    """Full local-activation diagnostic: Python, dependencies, config,
+    database, candidate profile, preferences, every job source, Anthropic,
+    frontend build, and scheduler readiness — one command that tells you
+    exactly what to fix before your first real search. Never reports
+    network reachability as PASS (this command makes no outbound calls);
+    verify that separately with `job-agent jobs search-run`."""
+    report = run_doctor()
+
+    style = {"PASS": "green", "WARN": "yellow", "ERROR": "red", "UNKNOWN": "cyan"}
+    console.print("[bold]CAREER OS DOCTOR[/bold]\n")
+    for check in report.checks:
+        color = style[check.status]
+        console.print(f"[{color}][{check.status}][/{color}] {check.name}: {check.detail}")
+
+    console.print()
+    if report.has_errors:
+        console.print("[red]One or more ERRORs must be fixed before Career OS can run.[/red]")
+        raise typer.Exit(code=1)
+    if report.worst_status == "WARN":
+        console.print(
+            "[yellow]No blocking errors. Review WARNs above before your first real search.[/yellow]"
+        )
+    else:
+        console.print("[green]All checks passed.[/green]")
 
 
 @app.command(name="dry-run")
