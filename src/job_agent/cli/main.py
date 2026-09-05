@@ -80,12 +80,12 @@ from job_agent.applications.service import (
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
-from job_agent.diagnostics import run_doctor
 from job_agent.config.loader import REPO_ROOT, AppConfig, load_config
 from job_agent.db.models import Application, ApplicationAllowlistEntry, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
+from job_agent.diagnostics import run_doctor
 from job_agent.jobs.repository import get_or_create_job_source, upsert_job
 from job_agent.jobs.scheduler import build_scheduler
 from job_agent.jobs.schema import FreshnessStatus
