@@ -12,6 +12,7 @@ empty list, honestly, rather than seeded/demo data.
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -254,16 +255,27 @@ def _top_matches_for_run(
         .scalars()
         .all()
     )
+    # Dashboard performance forensic fix: this used to call
+    # `session.get(JobRow, ...)` and `_application_for()` once per match
+    # row (up to `limit` unbatched round-trips each) — batched into one
+    # query each regardless of how many matches this run has.
+    job_ids = [m.job_id for m in match_rows]
+    jobs_by_id = {
+        j.id: j for j in session.execute(select(JobRow).where(JobRow.id.in_(job_ids))).scalars()
+    }
+    applications_by_job = job_view.applications_by_job(session, job_ids, candidate_id)
     out = []
     for match_row in match_rows:
-        job = session.get(JobRow, match_row.job_id)
+        job = jobs_by_id.get(match_row.job_id)
         if job is None:
             continue
-        out.append(_job_out(job, match_row, _application_for(session, job.id, candidate_id)))
+        out.append(_job_out(job, match_row, applications_by_job.get(job.id)))
     return out
 
 
-def _search_run_out(session: Session, run: SearchRunRow, candidate_id: int) -> SearchRunOut:
+def _search_run_out(
+    session: Session, run: SearchRunRow, candidate_id: int, *, include_top_matches: bool = True
+) -> SearchRunOut:
     return SearchRunOut(
         id=run.id,
         started_at=run.started_at,
@@ -276,7 +288,13 @@ def _search_run_out(session: Session, run: SearchRunRow, candidate_id: int) -> S
         qualified=run.qualified,
         errors=list(run.errors),
         status=run.status,
-        top_matches=_top_matches_for_run(session, run, candidate_id),
+        # Dashboard performance forensic fix: `include_top_matches=False`
+        # skips `_top_matches_for_run`'s query work entirely — added for
+        # callers (the Dashboard's "last run" summary) that never render
+        # `top_matches` at all. Defaults to True so every existing caller
+        # (Search Activity's full run history, `POST /jobs/search-run`'s
+        # own response) keeps its exact current behavior unchanged.
+        top_matches=_top_matches_for_run(session, run, candidate_id) if include_top_matches else [],
     )
 
 
@@ -289,6 +307,7 @@ def run_search(session: SessionDep, candidate: CandidateDep, config: ConfigDep) 
     profile, candidate_id = candidate
     llm = build_llm_provider(config)
     run = execute_search_run(session, config, profile, candidate_id, llm=llm)
+    _invalidate_ranking_cache(session, candidate_id)
     return _search_run_out(session, run, candidate_id)
 
 
@@ -303,12 +322,107 @@ def list_search_runs(
     session: SessionDep,
     candidate: CandidateDep,
     limit: int = Query(default=20, ge=1, le=100),
+    include_top_matches: bool = Query(
+        default=True,
+        description="Set false to skip computing top_matches (returned as an "
+        "empty list) for callers that don't render it — e.g. the Dashboard's "
+        "last-run summary, which only needs started_at/jobs_found/qualified/errors.",
+    ),
 ) -> list[SearchRunOut]:
     _, candidate_id = candidate
     runs = session.execute(
         select(SearchRunRow).order_by(SearchRunRow.started_at.desc()).limit(limit)
     ).scalars()
-    return [_search_run_out(session, r, candidate_id) for r in runs]
+    return [
+        _search_run_out(session, r, candidate_id, include_top_matches=include_top_matches)
+        for r in runs
+    ]
+
+
+# job_id, rank_score, why, gaps, recommendation
+_RankingDecision = tuple[int, float, list[str], list[str], str]
+
+# Dashboard performance forensic fix, round 2 (duplicated ranking work):
+# /top10 and /apply-now are two independent HTTP requests that both call
+# `_ranked_jobs`, and `Dashboard.tsx` fires them essentially simultaneously
+# — so the SAME full-active-jobs-table fetch, the SAME `matched_jobs_
+# with_applications` computation, and the SAME O(N log N) `rank_jobs` sort
+# used to run twice, back to back, for identical input. This cache stores
+# ONLY plain data (job id + rank_score + why/gaps/recommendation strings)
+# — deliberately never a live SQLAlchemy row — so a cache hit can never
+# serve a stale/detached ORM object; `_ranked_jobs` always re-fetches the
+# actual Job/JobMatch/Application rows fresh (cheap, batched, correctness-
+# critical) on every call regardless of a hit here. A short TTL (not an
+# unbounded cache) bounds staleness to a few seconds — long enough to
+# cover one Dashboard load's request burst, short enough that a save/
+# scan/match action is reflected on the next real page load either way.
+# Keyed by (engine identity, candidate_id) rather than candidate_id alone
+# — purely a test-isolation/multi-engine safety net (each test spins up
+# its own fresh in-memory-SQLite engine, so this guarantees one test can
+# never see another's cached ranking just because both happen to use
+# candidate_id=1); in production there is exactly one engine for the
+# process's lifetime, so this changes nothing about production behavior.
+_ranking_decision_cache: dict[tuple[int, int], tuple[float, list[_RankingDecision]]] = {}
+_RANKING_DECISION_CACHE_TTL_SECONDS = 5.0
+
+
+def _invalidate_all_ranking_cache() -> None:
+    """Like `_invalidate_ranking_cache`, for write paths (`scan_jobs`) that
+    change the shared `jobs` table without a candidate in scope — clears
+    every candidate's cached ranking rather than trying to target one."""
+    _ranking_decision_cache.clear()
+
+
+def _invalidate_ranking_cache(session: Session, candidate_id: int) -> None:
+    """Called by every write endpoint that can change what `_ranked_jobs`
+    computes (save/scan/match/search-run all touch `jobs`/`job_matches`/
+    `applications`, any of which can shift `rank_jobs`' output — including
+    subtly, via `compute_learned_preferences`' behavioral signal reacting
+    to a newly-saved application). Without this, a "Re-run matching"
+    click could show stale Top 10/Apply Now results for up to
+    `_RANKING_DECISION_CACHE_TTL_SECONDS`, defeating the point of the
+    action the candidate just took."""
+    _ranking_decision_cache.pop((id(session.get_bind()), candidate_id), None)
+
+
+def _compute_ranking_decisions(
+    session: Session, config: AppConfig, candidate_id: int
+) -> tuple[list[_RankingDecision], dict[int, JobMatchRow] | None]:
+    """Returns `(decisions, matches_by_job)`. `matches_by_job` is the dict
+    this call just fetched fresh when it actually recomputed (a cache
+    miss) — `_ranked_jobs` reuses it immediately, in this same request, to
+    avoid an otherwise-redundant second `latest_matches_by_job` call for
+    the exact same active-job set it was just computed from. It is `None`
+    on a cache hit: that dict is never itself part of what's cached (only
+    plain `decisions` data is), so a hit always forces a correctness-
+    critical fresh fetch in `_ranked_jobs` instead."""
+    cache_key = (id(session.get_bind()), candidate_id)
+    cached = _ranking_decision_cache.get(cache_key)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _RANKING_DECISION_CACHE_TTL_SECONDS:
+        return cached[1], None
+
+    # The job fetch itself is filtered to `lifecycle_status == "ACTIVE"` at
+    # the SQL level (dashboard performance forensic fix, round 2) rather
+    # than fetching every CLOSED/EXPIRED job ever discovered only to have
+    # `rank_jobs()` immediately discard them in Python — `rank_jobs()` has
+    # always excluded non-ACTIVE jobs (see its own docstring), so this
+    # changes nothing about which jobs can appear in the output, only how
+    # many rows get fetched/deserialized to compute it.
+    jobs = list(
+        session.execute(select(JobRow).where(JobRow.lifecycle_status == "ACTIVE")).scalars()
+    )
+    matches_by_job = job_view.latest_matches_by_job(session, [job.id for job in jobs], candidate_id)
+    pairs = [(job, matches_by_job.get(job.id)) for job in jobs]
+    preferences = compute_learned_preferences(
+        job_view.matched_jobs_with_applications(session, candidate_id)
+    )
+    ranked = rank_jobs(pairs, config.automation.priority_weights, preferences=preferences)
+    decisions = [
+        (r.job.id, r.rank_score, list(r.why), list(r.gaps), r.recommendation) for r in ranked
+    ]
+    _ranking_decision_cache[cache_key] = (now, decisions)
+    return decisions, matches_by_job
 
 
 def _ranked_jobs(
@@ -321,29 +435,42 @@ def _ranked_jobs(
     (539+ jobs) each extra round-trip is real Neon network latency, and
     `apply_now_queue`'s `limit=None` meant EVERY job got an `_application_for`
     call before the APPLY-only filter even ran. Both match and application
-    lookups are now batched into one query each regardless of job count."""
-    jobs = list(session.execute(select(JobRow)).scalars())
-    matches_by_job = job_view.latest_matches_by_job(session, [job.id for job in jobs], candidate_id)
-    pairs = [(job, matches_by_job.get(job.id)) for job in jobs]
-    preferences = compute_learned_preferences(
-        job_view.matched_jobs_with_applications(session, candidate_id)
+    lookups are now batched into one query each regardless of job count,
+    and the ranking decision itself may come from `_compute_ranking_
+    decisions`'s short-TTL cache (see its docstring) — but job/match/
+    application rows for whichever ids are actually returned are always
+    fetched fresh here, never from that cache, so saving/bookmarking a job
+    is reflected immediately."""
+    decisions, fresh_matches_by_job = _compute_ranking_decisions(session, config, candidate_id)
+    sliced = decisions[:limit] if limit is not None else decisions
+    job_ids = [job_id for job_id, *_ in sliced]
+
+    jobs_by_id = {
+        j.id: j for j in session.execute(select(JobRow).where(JobRow.id.in_(job_ids))).scalars()
+    }
+    # On a cache miss, `_compute_ranking_decisions` already fetched every
+    # active job's match a moment ago in this same call — reuse it instead
+    # of querying `job_matches` a second time for the same job set. On a
+    # cache hit it's None, so this is a fresh, correctness-critical fetch.
+    matches_by_job = (
+        fresh_matches_by_job
+        if fresh_matches_by_job is not None
+        else job_view.latest_matches_by_job(session, job_ids, candidate_id)
     )
-    ranked = rank_jobs(
-        pairs, config.automation.priority_weights, preferences=preferences, limit=limit
-    )
-    applications_by_job = job_view.applications_by_job(
-        session, [r.job.id for r in ranked], candidate_id
-    )
+    applications_by_job = job_view.applications_by_job(session, job_ids, candidate_id)
+
     out = []
-    for r in ranked:
-        application = applications_by_job.get(r.job.id)
+    for job_id, rank_score, why, gaps, recommendation in sliced:
+        job = jobs_by_id.get(job_id)
+        if job is None:
+            continue  # deleted between the cached ranking pass and now
         out.append(
             RankedJobOut(
-                job=_job_out(r.job, r.match, application),
-                rank_score=r.rank_score,
-                why=list(r.why),
-                gaps=list(r.gaps),
-                recommendation=r.recommendation,
+                job=_job_out(job, matches_by_job.get(job_id), applications_by_job.get(job_id)),
+                rank_score=rank_score,
+                why=why,
+                gaps=gaps,
+                recommendation=recommendation,
             )
         )
     return out
@@ -474,6 +601,7 @@ def save_job(
         session, job.id, candidate_id, dry_run=config.dry_run
     )
     session.commit()
+    _invalidate_ranking_cache(session, candidate_id)
     match_row = _latest_match(session, job.id, candidate_id)
     return _job_detail_out(job, match_row, application)
 
@@ -616,6 +744,7 @@ def scan_jobs(session: SessionDep, config: ConfigDep) -> ScanRunOut:
     finally:
         http.close()
     results = run_scan(session, config)
+    _invalidate_all_ranking_cache()
     return ScanRunOut(
         results=[
             ScanSourceResultOut(
@@ -642,6 +771,7 @@ def match_jobs(session: SessionDep, candidate: CandidateDep, config: ConfigDep) 
     profile, candidate_id = candidate
     llm = build_llm_provider(config)
     outcomes = run_matching(session, config, profile, candidate_id, llm=llm)
+    _invalidate_ranking_cache(session, candidate_id)
     counts = {"APPLY": 0, "REVIEW": 0, "SAVE": 0, "SKIP": 0, "HUMAN_REQUIRED": 0}
     for outcome in outcomes:
         counts[outcome.result.decision.value] = counts.get(outcome.result.decision.value, 0) + 1

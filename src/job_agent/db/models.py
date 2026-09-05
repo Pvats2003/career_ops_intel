@@ -52,6 +52,16 @@ class Candidate(Base, TimestampMixin):
     parsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     source_files: Mapped[list] = mapped_column(JSON, default=list)
 
+    # Dashboard performance forensic fix: `job_agent.resume.versioning.
+    # compute_profile_hash()`'s sha256 of the last-persisted profile's
+    # semantic content (excluding `parsed_at`, which changes on every
+    # parse regardless of real content). Lets `save_candidate_profile()`
+    # tell "nothing changed" across separate requests/processes and skip
+    # the delete/reinsert-everything cycle entirely. NULL means "unknown,
+    # must resync" (pre-migration rows, or a row never fingerprinted yet)
+    # — never treated as a match.
+    profile_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     # Career OS web dashboard (Phase 8+) — when the candidate last opened
     # the dashboard, used purely to compute "new since last visit" on read
     # (never gates or authorizes anything); set by the web layer, not by

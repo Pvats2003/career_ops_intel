@@ -40,8 +40,13 @@ export default function Dashboard() {
     api.top10().then(setTop10).catch(() => setTop10([]))
     api.followUps().then(setFollowUps).catch(() => setFollowUps([]))
     api.insights().then(setInsights).catch(() => setInsights(null))
+    // Dashboard performance forensic fix: only `runs[0]`'s summary fields
+    // are ever rendered here (see the "Search activity" section below) —
+    // `limit: 1` and `includeTopMatches: false` avoid computing/serializing
+    // 19 unused runs' worth of top-matches on every dashboard load. Search
+    // Activity's own `api.listSearchRuns()` call (no params) is unaffected.
     api
-      .listSearchRuns()
+      .listSearchRuns({ limit: 1, includeTopMatches: false })
       .then((runs) => setLastSearchRun(runs[0] ?? null))
       .catch(() => setLastSearchRun(null))
   }

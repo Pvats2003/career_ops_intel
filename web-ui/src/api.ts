@@ -156,7 +156,15 @@ export const api = {
       method: 'POST',
       timeoutMs: LONG_RUNNING_TIMEOUT_MS,
     }),
-  listSearchRuns: () => request<SearchRunOut[]>('/jobs/search-runs'),
+  listSearchRuns: (params?: { limit?: number; includeTopMatches?: boolean }) => {
+    const search = new URLSearchParams()
+    if (params?.limit !== undefined) search.set('limit', String(params.limit))
+    if (params?.includeTopMatches !== undefined) {
+      search.set('include_top_matches', String(params.includeTopMatches))
+    }
+    const qs = search.toString()
+    return request<SearchRunOut[]>(`/jobs/search-runs${qs ? `?${qs}` : ''}`)
+  },
   sourceHealth: () => request<SourceHealthOut[]>('/sources/health'),
   schedulerStatus: () => request<SchedulerStatusOut>('/sources/scheduler-status'),
   top10: () => request<RankedJobOut[]>('/jobs/top10'),

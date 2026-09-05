@@ -148,7 +148,11 @@ def new_since_last_visit(
     candidate_row = session.get(Candidate, candidate_id)
     previous_visit_at = candidate_row.last_dashboard_view_at if candidate_row else None
 
-    query = select(JobRow)
+    # Filtered to ACTIVE at the SQL level (dashboard performance forensic
+    # fix, round 2): `new_jobs` only ever feeds `rank_jobs()` below, which
+    # has always discarded non-ACTIVE rows anyway (see its docstring) — no
+    # output change, just fewer CLOSED/EXPIRED rows fetched and thrown away.
+    query = select(JobRow).where(JobRow.lifecycle_status == "ACTIVE")
     if previous_visit_at is not None:
         query = query.where(JobRow.discovered_at > previous_visit_at)
     new_jobs = list(session.execute(query).scalars())
@@ -197,12 +201,19 @@ def morning_briefing(
     what those other views show."""
     profile, candidate_id = candidate
 
-    jobs = list(session.execute(select(JobRow)).scalars())
     # Production-audit finding (dashboard-loading forensic audit): this
-    # used to call `_latest_match()` once per row in `jobs` — an
-    # unbounded N+1, the single largest contributor (alongside
+    # used to call `_latest_match()` once per row in the WHOLE `jobs`
+    # table — an unbounded N+1, the single largest contributor (alongside
     # `dashboard_summary`) to the multi-minute dashboard-load hang at
     # production job counts. Batched into one query regardless of count.
+    # Filtered to ACTIVE at the SQL level (round 2 of this fix): nothing
+    # else in this function derives a count from `jobs` — it only ever
+    # feeds `rank_jobs()`, which has always discarded non-ACTIVE rows
+    # anyway (see its docstring), so this changes zero output, only how
+    # many CLOSED/EXPIRED rows get fetched and immediately thrown away.
+    jobs = list(
+        session.execute(select(JobRow).where(JobRow.lifecycle_status == "ACTIVE")).scalars()
+    )
     matches_by_job = job_view.latest_matches_by_job(
         session, [job.id for job in jobs], candidate_id
     )

@@ -19,6 +19,7 @@ from job_agent.applications.repository import record_event
 from job_agent.applications.scorecard import compute_scorecard
 from job_agent.db.models import Application, ApplicationEvent, Resume
 from job_agent.db.models import Job as JobRow
+from job_agent.web import job_view
 from job_agent.web.deps import CandidateDep, SessionDep
 from job_agent.web.routers.jobs import _job_out, _latest_match
 from job_agent.web.schemas import (
@@ -240,13 +241,27 @@ def follow_up_recommendations(
             select(Application).where(Application.candidate_id == candidate_id)
         ).scalars()
     )
-    applications_with_jobs = []
-    for application in applications:
-        job = session.get(JobRow, application.job_id)
-        if job is not None:
-            applications_with_jobs.append((application, job))
+    # Dashboard performance forensic fix: this used to call
+    # `session.get(JobRow, application.job_id)` once per application (an
+    # unbounded N+1 that grows with the candidate's whole application
+    # history, not just today's page) and `_latest_match()` once per
+    # follow-up-eligible recommendation. Both batched into one query each.
+    jobs_by_id = {
+        job.id: job
+        for job in session.execute(
+            select(JobRow).where(JobRow.id.in_([a.job_id for a in applications]))
+        ).scalars()
+    }
+    applications_with_jobs = [
+        (application, jobs_by_id[application.job_id])
+        for application in applications
+        if application.job_id in jobs_by_id
+    ]
 
     recommendations = compute_follow_up_recommendations(applications_with_jobs)
+    matches_by_job = job_view.latest_matches_by_job(
+        session, [r.job.id for r in recommendations], candidate_id
+    )
     candidate_name = profile.identity_name.value or "your name"
     results = []
     for r in recommendations:
@@ -254,7 +269,7 @@ def follow_up_recommendations(
         results.append(
             FollowUpRecommendationOut(
                 application_id=r.application.id,
-                job=_job_out(r.job, _latest_match(session, r.job.id, candidate_id), r.application),
+                job=_job_out(r.job, matches_by_job.get(r.job.id), r.application),
                 applied_days_ago=r.applied_days_ago,
                 suggested_action=r.suggested_action,
                 message=FollowUpMessageOut(subject=message.subject, body=message.body),

@@ -16,6 +16,7 @@ here; it is never inferred from other data.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 from job_agent.candidate.schema import (
@@ -338,13 +339,70 @@ def _pref_fact(value: str, *, source: str) -> Fact[str]:
 # --------------------------------------------------------------------------
 # Top-level assembly
 # --------------------------------------------------------------------------
+_CANDIDATE_MD_FILE_NAMES = (
+    "profile.md",
+    "experience.md",
+    "projects.md",
+    "skills.md",
+    "education.md",
+    "achievements.md",
+)
+
+# Dashboard performance forensic fix: single-slot memoization, not an
+# unbounded dict — we only ever need to compare against the LAST parse, not
+# remember every historical (files, config) combination this process has
+# ever seen. `None` means "nothing cached yet".
+_last_parse: tuple[tuple, CandidateProfile] | None = None
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
 def parse_candidate_profile(
     config: AppConfig,
     candidate_dir: Path | None = None,
 ) -> CandidateProfile:
-    """Build the full CandidateProfile from candidate/*.md + config/*.yaml."""
+    """Build the full CandidateProfile from candidate/*.md + config/*.yaml.
+
+    Dashboard performance forensic fix: this runs on every web request via
+    `job_agent.web.deps.get_candidate()` (nearly every API endpoint depends
+    on it), so it used to re-read and re-parse all 6 candidate/*.md files
+    from disk on every single page view. Memoized on the (mtime, size) of
+    those 6 files plus the exact content of `config.profile`/`config.
+    preferences` — the only config sections this function reads (see
+    `job_agent.resume.versioning._CONFIG_FILE_NAMES`) — so an edit to any
+    of those 8 inputs is picked up on the very next call with no staleness
+    window, while an unchanged input skips every file read and all the
+    parsing below. `parsed_at` is always "now" regardless of a cache hit —
+    it's already excluded from `job_agent.resume.versioning.
+    compute_profile_hash`'s content hash for the same reason, and callers
+    (e.g. `GET /api/candidate/profile`) depend on it reading like "when
+    this request happened", not the time of some earlier request that
+    happened to have identical content.
+    """
+    global _last_parse
     cdir = candidate_dir or config.env.candidate_dir
 
+    cache_key = (
+        str(cdir),
+        tuple(_file_signature(cdir / name) for name in _CANDIDATE_MD_FILE_NAMES),
+        config.profile.model_dump_json(),
+        config.preferences.model_dump_json(),
+    )
+    if _last_parse is not None and _last_parse[0] == cache_key:
+        return _last_parse[1].model_copy(update={"parsed_at": datetime.now(UTC)})
+
+    profile = _parse_candidate_profile_uncached(config, cdir)
+    _last_parse = (cache_key, profile)
+    return profile
+
+
+def _parse_candidate_profile_uncached(config: AppConfig, cdir: Path) -> CandidateProfile:
     profile_fields = parse_profile(cdir / "profile.md")
     profile_source = _rel(cdir / "profile.md")
     experience = parse_experience(cdir / "experience.md")

@@ -499,6 +499,155 @@ def test_apply_now_batches_both_match_and_application_lookups(tmp_path, monkeypa
     )
 
 
+def test_follow_ups_does_not_query_jobs_or_matches_once_per_application(
+    tmp_path, monkeypatch, real_config
+):
+    """Dashboard performance forensic fix, round 2: `follow_up_recommendations()`
+    used to call `session.get(JobRow, ...)` once per application AND
+    `_latest_match()` once per follow-up-eligible recommendation. Both
+    batched. Seeds several stuck-in-APPLIED applications (8+ days old, so
+    every one is follow-up-eligible) via real save + pipeline update, never
+    fabricated rows."""
+    import datetime as _dt
+
+    from job_agent.db.models import Application
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_count = 5
+    application_ids = []
+    for i in range(job_count):
+        job_id = _seed_job(db_path, fingerprint=f"follow-up-n-plus-one-{i}")
+        _seed_match(db_path, job_id, candidate_id, decision="APPLY")
+        r = client.post(f"/api/jobs/{job_id}/save")
+        application_ids.append(r.json()["application_id"])
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    factory = get_session_factory(engine)
+    stuck_since = _dt.datetime.now(UTC) - _dt.timedelta(days=10)
+    with factory() as session:
+        for application_id in application_ids:
+            application = session.get(Application, application_id)
+            application.pipeline_stage = "APPLIED"
+            application.updated_at = stuck_since
+        session.commit()
+
+    with _counting_queries_touching(engine, "jobs", "job_matches") as counts:
+        r = client.get("/api/pipeline/follow-ups")
+
+    assert r.status_code == 200
+    assert len(r.json()) == job_count
+    assert counts["n"] < job_count, (
+        f"expected a bounded number of jobs/job_matches queries regardless of "
+        f"application count ({job_count}), got {counts['n']} — looks like a "
+        f"reintroduced N+1 query"
+    )
+
+
+def test_search_runs_include_top_matches_false_skips_the_expensive_work(
+    tmp_path, monkeypatch, real_config
+):
+    """Dashboard performance forensic fix, round 2: Dashboard.tsx only ever
+    renders `runs[0]`'s summary fields, never `top_matches` — but the
+    endpoint used to unconditionally compute `top_matches` (itself an N+1)
+    for every one of up to 20 runs regardless. `include_top_matches=false`
+    must return an empty list without doing that work; the default
+    (omitted) must still compute it, unchanged, for existing consumers
+    like Search Activity."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="search-run-lightweight")
+    _seed_match(db_path, job_id, candidate_id, decision="APPLY")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    factory = get_session_factory(engine)
+    with factory() as session:
+        import datetime as _dt
+
+        from job_agent.db.models import SearchRun
+
+        now = _dt.datetime.now(UTC)
+        # A wide window (well before/after the match's own insert
+        # timestamp) so this test doesn't depend on seeding order.
+        run = SearchRun(
+            started_at=now - _dt.timedelta(hours=1),
+            completed_at=now + _dt.timedelta(hours=1),
+            sources=["remotive"],
+            queries=["business analyst"], jobs_found=1, duplicates_removed=0,
+            expired_removed=0, qualified=1, errors=[], status="COMPLETED",
+        )
+        session.add(run)
+        session.commit()
+
+    default_r = client.get("/api/jobs/search-runs")
+    assert default_r.status_code == 200
+    assert len(default_r.json()[0]["top_matches"]) > 0
+
+    lightweight_r = client.get(
+        "/api/jobs/search-runs", params={"limit": 1, "include_top_matches": "false"}
+    )
+    assert lightweight_r.status_code == 200
+    assert len(lightweight_r.json()) == 1
+    assert lightweight_r.json()[0]["top_matches"] == []
+
+
+def test_top10_then_apply_now_share_the_ranking_computation(tmp_path, monkeypatch, real_config):
+    """Dashboard performance forensic fix, round 2 (duplicated ranking
+    work): /top10 and /apply-now are two independent HTTP requests that
+    Dashboard.tsx fires nearly simultaneously, both calling `_ranked_jobs`.
+    The second call, within the short-TTL cache window, must not redo the
+    full active-jobs fetch + rank_jobs sort — but must still return
+    fully correct, freshly-hydrated results."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_count = 5
+    for i in range(job_count):
+        job_id = _seed_job(db_path, fingerprint=f"ranking-cache-{i}")
+        _seed_match(db_path, job_id, candidate_id, overall_score=90, decision="APPLY")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    first = client.get("/api/jobs/top10")
+    assert first.status_code == 200
+    assert len(first.json()) == job_count
+
+    with _counting_queries_touching(engine, "jobs", "job_matches") as counts:
+        second = client.get("/api/jobs/apply-now")
+
+    assert second.status_code == 200
+    assert len(second.json()) == job_count
+    # A cache hit skips the full `SELECT * FROM jobs WHERE lifecycle_status
+    # = 'ACTIVE'` + `matched_jobs_with_applications` + rank_jobs sort
+    # entirely, leaving only two small, correctness-critical re-hydration
+    # queries (jobs-by-id, matches-by-id for the returned job ids). A full
+    # per-call recompute — whether today's bounded-but-independent
+    # per-endpoint fetch or the un-batched original — touches "jobs" and
+    # "job_matches" at least 3 times; a shared cache hit touches them at
+    # most 2, so this threshold genuinely distinguishes the two.
+    assert counts["n"] <= 2, (
+        f"expected the second call to reuse the first's cached ranking "
+        f"decision instead of recomputing it, got {counts['n']} jobs/"
+        f"job_matches queries (expected at most 2 for a cache hit)"
+    )
+
+
+def test_ranking_cache_does_not_hide_a_fresh_save(tmp_path, monkeypatch, real_config):
+    """The ranking-decision cache must never make a save/bookmark action
+    invisible: `_invalidate_ranking_cache` clears it on every `/save`."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="ranking-cache-save")
+    _seed_match(db_path, job_id, candidate_id, overall_score=90, decision="APPLY")
+
+    first = client.get("/api/jobs/top10")
+    assert first.json()[0]["job"]["pipeline_stage"] is None
+
+    save_r = client.post(f"/api/jobs/{job_id}/save")
+    assert save_r.status_code == 200
+
+    second = client.get("/api/jobs/top10")
+    assert second.json()[0]["job"]["pipeline_stage"] == "SAVED"
+
+
 def test_jobs_scan_with_no_sources_enabled_is_honest_zero(tmp_path, monkeypatch, real_config):
     """With every source explicitly disabled, scanning must report zero
     results, never fabricate a job listing, and must not attempt any
