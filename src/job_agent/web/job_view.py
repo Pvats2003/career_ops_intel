@@ -72,6 +72,29 @@ def application_for(session: Session, job_id: int, candidate_id: int) -> Applica
     ).scalar_one_or_none()
 
 
+def applications_by_job(
+    session: Session, job_ids: list[int], candidate_id: int
+) -> dict[int, Application]:
+    """The same "this candidate's application for this job, if any"
+    `application_for()` computes, batched into one query instead of
+    one-per-job — production-audit finding (dashboard-loading forensic
+    audit). `applications` enforces exactly one row per (job_id,
+    candidate_id) at the DB level (see `db.models.Application`'s
+    docstring), so unlike `latest_matches_by_job()` there is no "latest
+    of several" to resolve — a plain `IN (...)` filter is already exact.
+    Only used where every job's application state is needed at once; a
+    call site that only ever needs ONE job's application still uses
+    `application_for()`."""
+    if not job_ids:
+        return {}
+    rows = session.execute(
+        select(Application).where(
+            Application.candidate_id == candidate_id, Application.job_id.in_(job_ids)
+        )
+    ).scalars()
+    return {row.job_id: row for row in rows}
+
+
 def matched_jobs_with_applications(
     session: Session, candidate_id: int
 ) -> list[tuple[JobRow, Application | None]]:
@@ -82,18 +105,35 @@ def matched_jobs_with_applications(
     it" query — used by both behavioral insights (`web/routers/
     candidate.py`) and the ranking engine's behavioral-fit signal
     (`job_agent.matching.ranking`), so the two never compute this from
-    two different, potentially-drifting queries."""
+    two different, potentially-drifting queries.
+
+    Production-audit finding (dashboard-loading forensic audit): this
+    used to call `session.get(JobRow, job_id)` and `application_for()`
+    once per distinct matched job id — an unbounded N+1 on each. Both are
+    now batched into one query each regardless of how many jobs this
+    candidate has ever been matched against, while preserving the exact
+    same pairing (in the same job-id order) and "no application yet ->
+    None" semantics as before."""
     matched_job_ids = list(
         session.execute(
             select(JobMatch.job_id).where(JobMatch.candidate_id == candidate_id).distinct()
         ).scalars()
     )
+    if not matched_job_ids:
+        return []
+    jobs_by_id = {
+        job.id: job
+        for job in session.execute(
+            select(JobRow).where(JobRow.id.in_(matched_job_ids))
+        ).scalars()
+    }
+    applications = applications_by_job(session, matched_job_ids, candidate_id)
     pairs: list[tuple[JobRow, Application | None]] = []
     for job_id in matched_job_ids:
-        job = session.get(JobRow, job_id)
+        job = jobs_by_id.get(job_id)
         if job is None:
             continue
-        pairs.append((job, application_for(session, job_id, candidate_id)))
+        pairs.append((job, applications.get(job_id)))
     return pairs
 
 

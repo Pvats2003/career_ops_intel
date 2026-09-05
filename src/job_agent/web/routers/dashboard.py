@@ -22,7 +22,7 @@ from job_agent.matching.ranking import rank_jobs
 from job_agent.resume.repository import get_latest_version
 from job_agent.web import job_view
 from job_agent.web.deps import CandidateDep, ConfigDep, SessionDep
-from job_agent.web.routers.jobs import _application_for, _job_out, _latest_match
+from job_agent.web.routers.jobs import _application_for, _job_out
 from job_agent.web.schemas import (
     BriefingHighlightOut,
     DashboardSummaryOut,
@@ -153,15 +153,26 @@ def new_since_last_visit(
         query = query.where(JobRow.discovered_at > previous_visit_at)
     new_jobs = list(session.execute(query).scalars())
 
-    pairs = [(job, _latest_match(session, job.id, candidate_id)) for job in new_jobs]
+    # Production-audit finding (dashboard-loading forensic audit): this
+    # used to call `_latest_match()`/`_application_for()` once per job in
+    # `new_jobs` — on a first visit (no previous_visit_at) that's every
+    # active job, an unbounded N+1 on each. Both batched into one query
+    # each regardless of how many jobs are "new".
+    matches_by_job = job_view.latest_matches_by_job(
+        session, [job.id for job in new_jobs], candidate_id
+    )
+    pairs = [(job, matches_by_job.get(job.id)) for job in new_jobs]
     preferences = compute_learned_preferences(
         job_view.matched_jobs_with_applications(session, candidate_id)
     )
     ranked = rank_jobs(pairs, config.automation.priority_weights, preferences=preferences)
 
+    applications_by_job = job_view.applications_by_job(
+        session, [r.job.id for r in ranked], candidate_id
+    )
     out = [
         RankedJobOut(
-            job=_job_out(r.job, r.match, _application_for(session, r.job.id, candidate_id)),
+            job=_job_out(r.job, r.match, applications_by_job.get(r.job.id)),
             rank_score=r.rank_score, why=list(r.why), gaps=list(r.gaps),
             recommendation=r.recommendation,
         )
@@ -187,7 +198,15 @@ def morning_briefing(
     profile, candidate_id = candidate
 
     jobs = list(session.execute(select(JobRow)).scalars())
-    pairs = [(job, _latest_match(session, job.id, candidate_id)) for job in jobs]
+    # Production-audit finding (dashboard-loading forensic audit): this
+    # used to call `_latest_match()` once per row in `jobs` — an
+    # unbounded N+1, the single largest contributor (alongside
+    # `dashboard_summary`) to the multi-minute dashboard-load hang at
+    # production job counts. Batched into one query regardless of count.
+    matches_by_job = job_view.latest_matches_by_job(
+        session, [job.id for job in jobs], candidate_id
+    )
+    pairs = [(job, matches_by_job.get(job.id)) for job in jobs]
     jobs_with_applications = job_view.matched_jobs_with_applications(session, candidate_id)
     preferences = compute_learned_preferences(jobs_with_applications)
     ranked = rank_jobs(pairs, config.automation.priority_weights, preferences=preferences)

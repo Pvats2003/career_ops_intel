@@ -46,11 +46,51 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
-    headers: init?.body instanceof FormData ? undefined : { 'Content-Type': 'application/json' },
-    ...init,
-  })
+// Dashboard-loading forensic audit: `request()` used to call plain
+// `fetch()` with no timeout at all, so a genuinely slow backend response
+// (e.g. an N+1 query pattern at production job-count scale) left the
+// calling page's loading state stuck indefinitely with no way to fail
+// visibly. Two deliberately different deadlines, not one universal one —
+// a normal dashboard/read GET should fail fast enough to show an error
+// instead of hanging forever, but an intentionally long-running
+// operation (a full search, a scan, a matching run, or anything that
+// calls the LLM) must never be aborted just for taking longer than a
+// short UI read timeout would allow.
+const DEFAULT_TIMEOUT_MS = 20_000
+const LONG_RUNNING_TIMEOUT_MS = 5 * 60_000
+
+interface RequestOptions extends RequestInit {
+  /** Overrides the default read timeout — pass `LONG_RUNNING_TIMEOUT_MS`
+   * (via the endpoints below that already do) for anything that
+   * legitimately takes minutes, never a raw number scattered ad hoc. */
+  timeoutMs?: number
+}
+
+async function request<T>(path: string, init?: RequestOptions): Promise<T> {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...requestInit } = init ?? {}
+  const controller = new AbortController()
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs)
+
+  let res: Response
+  try {
+    res = await fetch(`/api${path}`, {
+      headers:
+        requestInit.body instanceof FormData ? undefined : { 'Content-Type': 'application/json' },
+      ...requestInit,
+      signal: controller.signal,
+    })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new ApiError(
+        0,
+        'The request took too long and was cancelled. Please check your connection and try again.',
+      )
+    }
+    throw err
+  } finally {
+    window.clearTimeout(timeoutId)
+  }
+
   if (!res.ok) {
     let detail = res.statusText
     try {
@@ -76,7 +116,12 @@ export const api = {
   uploadResume: (file: File) => {
     const form = new FormData()
     form.append('file', file)
-    return request<ResumeUploadResult>('/candidate/resume', { method: 'POST', body: form })
+    // Long-running: parses/validates the resume, which can call the LLM.
+    return request<ResumeUploadResult>('/candidate/resume', {
+      method: 'POST',
+      body: form,
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    })
   },
 
   listJobs: (params: Record<string, string | number | boolean | undefined>) => {
@@ -89,26 +134,49 @@ export const api = {
   },
   getJob: (id: number) => request<JobDetailOut>(`/jobs/${id}`),
   saveJob: (id: number) => request<JobDetailOut>(`/jobs/${id}/save`, { method: 'POST' }),
-  checkUrl: (id: number) => request<URLCheckResultOut>(`/jobs/${id}/check-url`, { method: 'POST' }),
+  // Long-running: makes a real outbound HTTP request to the job's own
+  // application_url, whose latency this app has no control over.
+  checkUrl: (id: number) =>
+    request<URLCheckResultOut>(`/jobs/${id}/check-url`, {
+      method: 'POST',
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    }),
   whyThisJob: (id: number) => request<WhyBreakdownOut>(`/jobs/${id}/why`),
   compareJobs: (ids: number[]) =>
     request<JobDetailOut[]>(`/jobs/compare?ids=${ids.join(',')}`),
-  scanJobs: () => request<ScanRunOut>('/jobs/scan', { method: 'POST' }),
-  matchJobs: () => request<MatchRunOut>('/jobs/match', { method: 'POST' }),
-  runSearch: () => request<SearchRunOut>('/jobs/search-run', { method: 'POST' }),
+  // Long-running: full source scan / matching run / end-to-end search —
+  // exactly the "intentionally long-running operations" this timeout
+  // mechanism must never abort early.
+  scanJobs: () =>
+    request<ScanRunOut>('/jobs/scan', { method: 'POST', timeoutMs: LONG_RUNNING_TIMEOUT_MS }),
+  matchJobs: () =>
+    request<MatchRunOut>('/jobs/match', { method: 'POST', timeoutMs: LONG_RUNNING_TIMEOUT_MS }),
+  runSearch: () =>
+    request<SearchRunOut>('/jobs/search-run', {
+      method: 'POST',
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    }),
   listSearchRuns: () => request<SearchRunOut[]>('/jobs/search-runs'),
   sourceHealth: () => request<SourceHealthOut[]>('/sources/health'),
   schedulerStatus: () => request<SchedulerStatusOut>('/sources/scheduler-status'),
   top10: () => request<RankedJobOut[]>('/jobs/top10'),
   applyNowQueue: () => request<RankedJobOut[]>('/jobs/apply-now'),
+  // Long-running: both call the LLM to generate real content.
   tailorResume: (jobId: number) =>
-    request<TailoredResumeOut>(`/jobs/${jobId}/tailor-resume`, { method: 'POST' }),
+    request<TailoredResumeOut>(`/jobs/${jobId}/tailor-resume`, {
+      method: 'POST',
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    }),
   coverLetter: (jobId: number) =>
-    request<CoverLetterOut>(`/jobs/${jobId}/cover-letter`, { method: 'POST' }),
+    request<CoverLetterOut>(`/jobs/${jobId}/cover-letter`, {
+      method: 'POST',
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    }),
   askAssistant: (jobId: number, questions: string[]) =>
     request<AssistantResponseOut>(`/jobs/${jobId}/assistant`, {
       method: 'POST',
       body: JSON.stringify({ questions }),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
     }),
 
   listPipeline: () => request<PipelineItemOut[]>('/pipeline'),
@@ -130,8 +198,13 @@ export const api = {
     request<CareerPathComparisonRowOut[]>('/candidate/career-paths/compare'),
   skillGaps: () => request<SkillGapEntryOut[]>('/candidate/skill-gaps'),
   insights: () => request<InsightsOut>('/candidate/insights'),
+  // Long-running: generates a real conversational reply via the LLM.
   careerChat: (body: CareerChatIn) =>
-    request<CareerChatOut>('/candidate/chat', { method: 'POST', body: JSON.stringify(body) }),
+    request<CareerChatOut>('/candidate/chat', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      timeoutMs: LONG_RUNNING_TIMEOUT_MS,
+    }),
 
   listCompanies: () => request<CompanyOut[]>('/companies'),
   getCompany: (id: number) => request<CompanyOut>(`/companies/${id}`),

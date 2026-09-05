@@ -314,17 +314,29 @@ def list_search_runs(
 def _ranked_jobs(
     session: Session, config: AppConfig, candidate_id: int, *, limit: int | None
 ) -> list[RankedJobOut]:
+    """Backs both /top10 and /apply-now. Production-audit finding
+    (dashboard-loading forensic audit): this used to call `_latest_match()`
+    and `_application_for()` once per job in the WHOLE `jobs` table (an
+    unbounded N+1 on each, independent of `limit`) — at production scale
+    (539+ jobs) each extra round-trip is real Neon network latency, and
+    `apply_now_queue`'s `limit=None` meant EVERY job got an `_application_for`
+    call before the APPLY-only filter even ran. Both match and application
+    lookups are now batched into one query each regardless of job count."""
     jobs = list(session.execute(select(JobRow)).scalars())
-    pairs = [(job, _latest_match(session, job.id, candidate_id)) for job in jobs]
+    matches_by_job = job_view.latest_matches_by_job(session, [job.id for job in jobs], candidate_id)
+    pairs = [(job, matches_by_job.get(job.id)) for job in jobs]
     preferences = compute_learned_preferences(
         job_view.matched_jobs_with_applications(session, candidate_id)
     )
     ranked = rank_jobs(
         pairs, config.automation.priority_weights, preferences=preferences, limit=limit
     )
+    applications_by_job = job_view.applications_by_job(
+        session, [r.job.id for r in ranked], candidate_id
+    )
     out = []
     for r in ranked:
-        application = _application_for(session, r.job.id, candidate_id)
+        application = applications_by_job.get(r.job.id)
         out.append(
             RankedJobOut(
                 job=_job_out(r.job, r.match, application),

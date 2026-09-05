@@ -9,6 +9,7 @@ or real `candidate/` files.
 from __future__ import annotations
 
 import shutil
+from contextlib import contextmanager
 from datetime import UTC
 from pathlib import Path
 
@@ -371,6 +372,130 @@ def test_dashboard_summary_does_not_query_matches_once_per_job(tmp_path, monkeyp
         f"expected a bounded number of job_matches queries regardless of job "
         f"count ({job_count}), got {job_matches_query_count} — looks like a "
         f"reintroduced N+1 query"
+    )
+
+
+@contextmanager
+def _counting_queries_touching(engine, *table_names: str):
+    """Dashboard-loading forensic audit: counts SQL statements executed
+    against `engine` that mention any of `table_names`, so a test can
+    assert the count stays a small constant as the seeded job count grows
+    — the discriminating signature of an eliminated N+1 — rather than
+    growing one-for-one with it."""
+    counts = {"n": 0}
+
+    def _listener(conn, cursor, statement, *args):
+        if any(name in statement for name in table_names):
+            counts["n"] += 1
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    try:
+        yield counts
+    finally:
+        event.remove(engine, "before_cursor_execute", _listener)
+
+
+def test_morning_briefing_does_not_query_matches_once_per_job(tmp_path, monkeypatch, real_config):
+    """Dashboard-loading forensic audit: `morning_briefing()` used to call
+    `_latest_match()` once per row in `jobs` — one of the largest
+    contributors, alongside `dashboard_summary`, to the multi-minute
+    dashboard-load hang at production job counts (539+). Fails against
+    the pre-fix per-job loop (5 jobs -> 5 SELECTs against job_matches)
+    and passes against the batched query (1 SELECT total)."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_count = 5
+    for i in range(job_count):
+        job_id = _seed_job(db_path, fingerprint=f"briefing-n-plus-one-{i}")
+        _seed_match(db_path, job_id, candidate_id)
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    with _counting_queries_touching(engine, "job_matches") as counts:
+        r = client.get("/api/dashboard/briefing")
+
+    assert r.status_code == 200
+    assert counts["n"] < job_count, (
+        f"expected a bounded number of job_matches queries regardless of job "
+        f"count ({job_count}), got {counts['n']} — looks like a reintroduced N+1 query"
+    )
+
+
+def test_new_since_last_visit_does_not_query_matches_or_applications_once_per_job(
+    tmp_path, monkeypatch, real_config
+):
+    """Dashboard-loading forensic audit: `new_since_last_visit()` used to
+    call `_latest_match()` AND `_application_for()` once per "new" job —
+    on a first visit (no previous_visit_at yet) that's every active job.
+    Both are now batched. Fails against either pre-fix per-job loop and
+    passes against the batched queries."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_count = 5
+    for i in range(job_count):
+        job_id = _seed_job(db_path, fingerprint=f"new-since-visit-n-plus-one-{i}")
+        _seed_match(db_path, job_id, candidate_id)
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    with _counting_queries_touching(engine, "job_matches", "applications") as counts:
+        r = client.get("/api/dashboard/new-since-last-visit")
+
+    assert r.status_code == 200
+    assert len(r.json()["jobs"]) == job_count
+    assert counts["n"] < job_count, (
+        f"expected a bounded number of job_matches/applications queries "
+        f"regardless of job count ({job_count}), got {counts['n']} — looks like "
+        f"a reintroduced N+1 query"
+    )
+
+
+def test_top10_does_not_query_matches_once_per_job(tmp_path, monkeypatch, real_config):
+    """Dashboard-loading forensic audit: `_ranked_jobs()` (backing
+    GET /api/jobs/top10) used to call `_latest_match()` once per row in
+    the WHOLE `jobs` table, independent of the `limit=10` on the output."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_count = 5
+    for i in range(job_count):
+        job_id = _seed_job(db_path, fingerprint=f"top10-n-plus-one-{i}")
+        _seed_match(db_path, job_id, candidate_id)
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    with _counting_queries_touching(engine, "job_matches") as counts:
+        r = client.get("/api/jobs/top10")
+
+    assert r.status_code == 200
+    assert counts["n"] < job_count, (
+        f"expected a bounded number of job_matches queries regardless of job "
+        f"count ({job_count}), got {counts['n']} — looks like a reintroduced N+1 query"
+    )
+
+
+def test_apply_now_batches_both_match_and_application_lookups(tmp_path, monkeypatch, real_config):
+    """Dashboard-loading forensic audit: `_ranked_jobs()` (backing
+    GET /api/jobs/apply-now, which passes limit=None) used to call BOTH
+    `_latest_match()` and `_application_for()` once per row in the WHOLE
+    `jobs` table — every job got an application lookup before the
+    APPLY-only filter even ran. Seeds jobs with a real saved application
+    (via the actual save endpoint, never fabricated) to prove the
+    application batching path is genuinely exercised, not just present."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_count = 5
+    for i in range(job_count):
+        job_id = _seed_job(db_path, fingerprint=f"apply-now-n-plus-one-{i}")
+        _seed_match(db_path, job_id, candidate_id, decision="APPLY")
+        client.post(f"/api/jobs/{job_id}/save")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    with _counting_queries_touching(engine, "job_matches", "applications") as counts:
+        r = client.get("/api/jobs/apply-now")
+
+    assert r.status_code == 200
+    assert len(r.json()) == job_count
+    assert counts["n"] < job_count, (
+        f"expected a bounded number of job_matches/applications queries "
+        f"regardless of job count ({job_count}), got {counts['n']} — looks like "
+        f"a reintroduced N+1 query"
     )
 
 
