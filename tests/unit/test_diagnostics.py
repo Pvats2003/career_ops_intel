@@ -14,8 +14,8 @@ from pathlib import Path
 import yaml
 from typer.testing import CliRunner
 
-from job_agent.cli.doctor import run_doctor
 from job_agent.cli.main import app
+from job_agent.diagnostics import run_doctor
 
 runner = CliRunner()
 

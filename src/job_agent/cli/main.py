@@ -80,7 +80,7 @@ from job_agent.applications.service import (
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError
 from job_agent.candidate.parser import CandidateParseError, parse_candidate_profile
-from job_agent.cli.doctor import run_doctor
+from job_agent.diagnostics import run_doctor
 from job_agent.config.loader import REPO_ROOT, AppConfig, load_config
 from job_agent.db.models import Application, ApplicationAllowlistEntry, JobMatch
 from job_agent.db.models import Job as JobRow
@@ -1943,6 +1943,16 @@ def serve(
     `dist/` bundle here."""
     import uvicorn
 
+    # A cloud deployment's start command is the ONLY thing that runs on
+    # every redeploy — there is no separate interactive step to run
+    # `job-agent init`/`db upgrade` first. Bringing the schema up to date
+    # here (idempotent, safe no-op when already current) is what makes
+    # "push new code with a new alembic/versions/ migration" work without
+    # a manual extra step on the deployment platform.
+    cfg = load_config()
+    console.print("Ensuring database schema is up to date...")
+    _run_alembic_upgrade(cfg.env.database_url)
+
     console.print(
         f"[green]Career OS dashboard starting at[/green] http://{host}:{port} "
         "(Ctrl+C to stop)"
@@ -1950,7 +1960,6 @@ def serve(
 
     background_scheduler = None
     if scheduler:
-        cfg = load_config()
         background_scheduler = build_scheduler(cfg)
         background_scheduler.start()
         console.print("[green]Autonomous scheduled search enabled.[/green]")

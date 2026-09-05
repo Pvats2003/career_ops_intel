@@ -65,6 +65,17 @@ class EnvSettings(BaseSettings):
     adzuna_app_id: str | None = None
     adzuna_app_key: str | None = None
 
+    # Cloud-deployment access gate (see docs/CLOUD_DEPLOYMENT.md). This is
+    # a personal single-candidate dashboard — real name, resume, salary
+    # expectations, application history — so it must never be reachable
+    # by an anonymous visitor once it has a public URL. Leaving BOTH unset
+    # (the local-dev default) applies no gate at all, matching today's
+    # localhost-only behavior exactly. Setting both requires every request
+    # (except the platform health check) to present matching HTTP Basic
+    # credentials.
+    app_username: str | None = None
+    app_password: str | None = None
+
 
 def _load_yaml(path: Path) -> dict:
     if not path.exists():

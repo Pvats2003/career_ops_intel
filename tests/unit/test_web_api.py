@@ -211,7 +211,26 @@ def test_health(tmp_path, monkeypatch, real_config):
     client, _ = _client(tmp_path, monkeypatch, real_config)
     r = client.get("/api/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["database"]["connected"] is True
+    # This test's DB comes from `_cached_engine`'s `init_db()` (a plain
+    # `create_all`, like every other test in this suite) rather than a
+    # real Alembic run -- so `alembic_version` is genuinely never
+    # stamped here, and reporting migrations_current=False is the
+    # correct, honest answer for this database, not a bug. A real
+    # deployment's database goes through `job-agent serve`'s automatic
+    # `_run_alembic_upgrade()` instead (see test_cli_db_commands.py).
+    assert body["database"]["migrations_current"] is False
+    assert body["scheduler"]["available"] is True
+    assert body["job_sources"]["remotive"] == "enabled"
+    assert body["llm"]["configured"] is False
+    # Never a raw connection string, credential, or API key anywhere in
+    # the response -- this endpoint is exempt from the access gate and
+    # must be safe to expose on a public URL with zero auth.
+    body_text = str(body)
+    assert "sqlite://" not in body_text
+    assert "postgresql://" not in body_text
 
 
 def test_candidate_profile_reflects_synthetic_files(tmp_path, monkeypatch, real_config):

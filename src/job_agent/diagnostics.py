@@ -1,11 +1,11 @@
-"""`job-agent doctor` — local-activation-package diagnostics.
-
-Answers one question before the candidate spends time on anything else:
-"can I actually run Career OS right now, and if not, exactly what do I need
-to fix?" Every check here inspects real config/env/DB/filesystem state —
-nothing is assumed to pass, and NETWORK is always reported UNKNOWN (never
-PASS) because this command makes no outbound HTTP calls itself; reachability
-to job sources can only be verified by actually running a search
+"""Shared system diagnostics — `job-agent doctor` (this process/filesystem)
+and `/api/health` (a deployed instance, polled by whatever's running it)
+both answer the same underlying question through this one module: "is
+Career OS actually configured and working right now, and if not, what
+exactly needs fixing?" Every check here inspects real config/env/DB
+state — nothing is assumed to pass, and NETWORK is always reported UNKNOWN
+(never PASS) because nothing here makes an outbound HTTP call to a job
+source; reachability can only be verified by actually running a search
 (`job-agent jobs search-run`) from wherever Career OS is deployed.
 """
 
@@ -135,23 +135,65 @@ def _check_preferences(cfg: AppConfig) -> DoctorCheck:
     return DoctorCheck("Candidate preferences", "PASS", "all fields in config/preferences.yaml set")
 
 
-def _check_database(cfg: AppConfig) -> DoctorCheck:
-    from alembic.runtime.migration import MigrationContext
+@dataclass(frozen=True)
+class SchemaRevisionInfo:
+    connected: bool
+    current_revision: str | None
+    head_revision: str | None
+    error: str | None = None
 
+    @property
+    def up_to_date(self) -> bool:
+        return self.connected and self.current_revision == self.head_revision
+
+
+def _schema_revision_info(database_url: str) -> SchemaRevisionInfo:
+    """Real DB connectivity plus a real Alembic revision comparison —
+    shared by `job-agent doctor`/`db current` and `/api/health` so both
+    answer "is the schema actually current" the same way, not just
+    "does a revision exist at all" (which can't distinguish an
+    up-to-date database from one that's behind head)."""
     try:
-        engine = get_engine(cfg.env.database_url)
+        from alembic.config import Config as AlembicConfig
+        from alembic.runtime.migration import MigrationContext
+        from alembic.script import ScriptDirectory
+
+        alembic_cfg = AlembicConfig(str(REPO_ROOT / "alembic.ini"))
+        alembic_cfg.set_main_option("script_location", str(REPO_ROOT / "alembic"))
+        alembic_cfg.set_main_option("sqlalchemy.url", database_url)
+        head_revision = ScriptDirectory.from_config(alembic_cfg).get_current_head()
+
+        engine = get_engine(database_url)
         with engine.connect() as connection:
             context = MigrationContext.configure(connection)
-            revision = context.get_current_revision()
+            current_revision = context.get_current_revision()
     except Exception as exc:  # noqa: BLE001
-        return DoctorCheck("Database", "ERROR", redact_text(str(exc)))
-    if revision is None:
+        return SchemaRevisionInfo(
+            connected=False, current_revision=None, head_revision=None,
+            error=redact_text(str(exc)),
+        )
+    return SchemaRevisionInfo(
+        connected=True, current_revision=current_revision, head_revision=head_revision
+    )
+
+
+def _check_database(cfg: AppConfig) -> DoctorCheck:
+    info = _schema_revision_info(cfg.env.database_url)
+    safe_url = redact_text(cfg.env.database_url)
+    if not info.connected:
+        return DoctorCheck("Database", "ERROR", info.error or "connection failed")
+    if info.current_revision is None:
+        return DoctorCheck(
+            "Database", "WARN", f"{safe_url} — not yet initialized, run `job-agent init`"
+        )
+    if not info.up_to_date:
         return DoctorCheck(
             "Database",
             "WARN",
-            f"{redact_text(cfg.env.database_url)} — not yet initialized, run `job-agent init`",
+            f"{safe_url} @ {info.current_revision} — behind head ({info.head_revision}); "
+            "run `job-agent db upgrade`",
         )
-    return DoctorCheck("Database", "PASS", f"{redact_text(cfg.env.database_url)} @ {revision}")
+    return DoctorCheck("Database", "PASS", f"{safe_url} @ {info.current_revision}")
 
 
 def _check_source(cfg: AppConfig, key: str, *, keyless: bool) -> DoctorCheck:
@@ -234,6 +276,52 @@ def _check_network() -> DoctorCheck:
         "not checked — doctor makes no outbound calls; verify with "
         "`job-agent jobs search-run` on the machine Career OS will actually run on",
     )
+
+
+def get_health_status(cfg: AppConfig) -> dict:
+    """Machine-readable status for `/api/health` — deliberately a SMALLER
+    set of checks than `run_doctor()` (no filesystem/Python-version/
+    dependency checks; those only matter to someone with a shell on the
+    box, never to whatever's polling a deployed instance's health
+    endpoint). Every value here is a plain bool/string derived from
+    config/DB state — never a raw `database_url`, API key, or credential,
+    so this is always safe to expose on a public health endpoint."""
+    schema = _schema_revision_info(cfg.env.database_url)
+
+    def _source_status(key: str, *, keyless: bool) -> str:
+        source = cfg.sources.sources.get(key)
+        if source is None:
+            return "missing_config"
+        if not source.enabled:
+            return "disabled"
+        if keyless:
+            return "enabled"
+        if key == "adzuna":
+            has_credentials = cfg.env.adzuna_app_id and cfg.env.adzuna_app_key
+            return "enabled" if has_credentials else "enabled_no_credentials"
+        placeholder = any(b.token.startswith(_PLACEHOLDER_PREFIX) for b in source.boards)
+        return "enabled_placeholder_token" if placeholder else "enabled"
+
+    return {
+        "status": "ok",
+        "database": {
+            "connected": schema.connected,
+            "migrations_current": schema.up_to_date,
+        },
+        "scheduler": {
+            "available": importlib.util.find_spec("apscheduler") is not None,
+        },
+        "job_sources": {
+            "remotive": _source_status("remotive", keyless=True),
+            "arbeitnow": _source_status("arbeitnow", keyless=True),
+            "adzuna": _source_status("adzuna", keyless=False),
+            "greenhouse": _source_status("greenhouse", keyless=False),
+            "lever": _source_status("lever", keyless=False),
+        },
+        "llm": {
+            "configured": bool(cfg.env.anthropic_api_key),
+        },
+    }
 
 
 def run_doctor(config_dir: Path | None = None) -> DoctorReport:

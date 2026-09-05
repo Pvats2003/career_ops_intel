@@ -70,6 +70,27 @@ def test_db_upgrade_is_a_safe_no_op_when_already_current(tmp_path, monkeypatch, 
     assert "up to date" in second.output
 
 
+def test_serve_runs_the_alembic_upgrade_automatically_at_startup(
+    tmp_path, monkeypatch, real_config
+):
+    """Cloud-deployment finding: a platform's start command is the ONLY
+    thing that runs on every redeploy -- there is no separate interactive
+    step to run `job-agent init`/`db upgrade` first. `serve()` must bring
+    the schema up to date itself before it starts accepting requests, or a
+    redeploy that adds a new alembic/versions/ migration would leave the
+    live database silently out of date."""
+    db_path = _configure_env(tmp_path, monkeypatch, real_config)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    result = runner.invoke(app, ["serve", "--no-scheduler"])
+    assert result.exit_code == 0, result.output
+
+    current = runner.invoke(app, ["db", "current"])
+    assert current.exit_code == 0, current.output
+    assert "none — never migrated" not in current.output
+    assert db_path.exists()
+
+
 def test_init_command_runs_the_alembic_upgrade_automatically(tmp_path, monkeypatch, real_config):
     # `init()` scaffolds against the literal `REPO_ROOT` (a real install has
     # exactly one `.env`), not `cfg.env.config_dir`/`candidate_dir` — and

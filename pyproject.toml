@@ -22,6 +22,12 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "python-multipart>=0.0.9",
     "apscheduler>=3.10",
+    # Postgres driver for cloud deployment (persistent managed database) --
+    # SQLite (the local-dev default) needs no driver here; get_engine()
+    # already branches on the database_url scheme, so switching
+    # DATABASE_URL to a postgresql+psycopg://... URL is the only change
+    # needed to run against Postgres instead of SQLite.
+    "psycopg[binary]>=3.1",
 ]
 
 [project.optional-dependencies]
