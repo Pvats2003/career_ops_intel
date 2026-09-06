@@ -108,3 +108,49 @@ def test_anthropic_provider_raises_on_schema_mismatch(monkeypatch):
         provider.complete_json(
             system="s", user_prompt="u", schema=DummySchema, tool_name="t", prompt_version="v1"
         )
+
+
+# --- Part 17 cost audit: every real Anthropic call logs its real usage -----
+
+
+def test_anthropic_provider_logs_real_token_usage(monkeypatch, caplog):
+    """Every real API call must log real usage from the API's own response
+    (never an estimate), so per-feature LLM cost is actually observable
+    instead of being computed and silently discarded (the exact gap this
+    test guards against regressing)."""
+    import logging
+
+    response = _FakeResponse(
+        content=[_FakeToolUseBlock(type="tool_use", input={"x": 42})],
+        usage=_FakeUsage(input_tokens=123, output_tokens=45),
+    )
+    provider = _make_provider(monkeypatch, response)
+    with caplog.at_level(logging.INFO, logger="job_agent.llm.cost"):
+        provider.complete_json(
+            system="s", user_prompt="u", schema=DummySchema, tool_name="t", prompt_version="v1"
+        )
+
+    records = [r for r in caplog.records if r.name == "job_agent.llm.cost"]
+    assert len(records) == 1
+    data = records[0].event_data
+    assert data["input_tokens"] == 123
+    assert data["output_tokens"] == 45
+    assert data["model"] == "fake-model"
+    assert data["prompt_version"] == "v1"
+    assert data["result"] == "success"
+
+
+def test_anthropic_provider_does_not_log_on_failure(monkeypatch, caplog):
+    """A failed call never produced real usage data, so it must not log a
+    (fabricated) usage line — only a genuinely completed call is logged."""
+    import logging
+
+    response = _FakeResponse(content=[], usage=_FakeUsage(input_tokens=1, output_tokens=1))
+    provider = _make_provider(monkeypatch, response)
+    with caplog.at_level(logging.INFO, logger="job_agent.llm.cost"):
+        with pytest.raises(LLMOutputValidationError):
+            provider.complete_json(
+                system="s", user_prompt="u", schema=DummySchema, tool_name="t", prompt_version="v1"
+            )
+
+    assert [r for r in caplog.records if r.name == "job_agent.llm.cost"] == []

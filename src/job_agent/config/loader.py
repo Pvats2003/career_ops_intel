@@ -58,6 +58,42 @@ class EnvSettings(BaseSettings):
     llm_provider: str | None = None
     llm_model: str | None = None
 
+    # Adzuna Jobs API (Phase 8's multi-country search_api source) — free
+    # credentials from https://developer.adzuna.com/. Left unset means the
+    # `adzuna` source, even if `enabled: true` in sources.yaml, is skipped
+    # with a logged reason rather than making an unauthenticated call.
+    adzuna_app_id: str | None = None
+    adzuna_app_key: str | None = None
+
+    # Cloud-deployment access gate (see docs/CLOUD_DEPLOYMENT.md). This is
+    # a personal single-candidate dashboard — real name, resume, salary
+    # expectations, application history — so it must never be reachable
+    # by an anonymous visitor once it has a public URL. Leaving BOTH unset
+    # (the local-dev default) applies no gate at all, matching today's
+    # localhost-only behavior exactly. Setting both requires every request
+    # (except the platform health check) to present matching HTTP Basic
+    # credentials.
+    app_username: str | None = None
+    app_password: str | None = None
+
+
+# Dashboard performance forensic fix: `web/deps.py:get_config()` calls
+# `load_config()` fresh on every single web request by design (so editing
+# config/*.yaml takes effect on the next request, and tests can
+# monkeypatch env vars per-test — see this module's docstring). That's
+# correct for the env-derived half of `AppConfig`, but it also meant
+# re-reading and re-validating all 5 YAML files from disk on every
+# request, every one of which is byte-for-byte identical to the last read
+# in the overwhelming common case. This cache is keyed on each file's
+# (mtime_ns, size) — not a TTL — so it is invalidated the instant a file
+# is actually edited on disk, with no staleness window at all; it never
+# caches a missing/invalid file (the exists()/type checks below always run
+# against a real read). Only the raw parsed YAML `dict` is cached, never a
+# validated pydantic model, so callers always get a fresh
+# `ProfileConfig`/etc. instance from `model_validate()` — nothing here
+# holds a mutable object shared across requests.
+_yaml_cache: dict[Path, tuple[tuple[int, int], dict]] = {}
+
 
 def _load_yaml(path: Path) -> dict:
     if not path.exists():
@@ -65,10 +101,17 @@ def _load_yaml(path: Path) -> dict:
             f"Required config file missing: {path}. "
             "Run `job-agent init` to scaffold default config."
         )
+    stat = path.stat()
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cached = _yaml_cache.get(path)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+
     with path.open("r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
     if not isinstance(data, dict):
         raise ValueError(f"Config file {path} must contain a YAML mapping at the top level")
+    _yaml_cache[path] = (signature, data)
     return data
 
 

@@ -24,15 +24,21 @@ def db_session():
         yield session
 
 
-def test_build_sources_disabled_by_default(real_config):
-    """Shipped config/sources.yaml has greenhouse/lever disabled -> no sources
-    should be built, and no network call should ever be attempted."""
+def test_build_sources_greenhouse_and_lever_disabled_by_default(real_config):
+    """Shipped config/sources.yaml has greenhouse/lever disabled (real board
+    tokens require the candidate to say which companies to track — never
+    fabricated) — no sources should be built for them, and no network call
+    should ever be attempted for either. Real-world activation (2026-09-04)
+    enabled the three keyless/free sources (remotive, arbeitnow, adzuna) by
+    default, so this no longer asserts an empty list outright — it asserts
+    specifically that greenhouse/lever contribute nothing, which is the
+    property this test actually exists to guard."""
     http = ResilientHttpClient()
     try:
         sources = build_sources(real_config, http)
     finally:
         http.close()
-    assert sources == []
+    assert not any(isinstance(s, (GreenhouseJobSource, LeverJobSource)) for s in sources)
 
 
 def test_build_sources_reads_enabled_boards(tmp_path, real_config):
@@ -47,6 +53,12 @@ def test_build_sources_reads_enabled_boards(tmp_path, real_config):
     data["sources"]["greenhouse"]["boards"] = [{"token": "acme", "company_name": "Acme Inc"}]
     data["sources"]["lever"]["enabled"] = True
     data["sources"]["lever"]["boards"] = [{"token": "acme2", "company_name": "Acme Analytics"}]
+    # Isolate this test to greenhouse/lever only — remotive/arbeitnow/adzuna
+    # are enabled by default in the shipped config (real-world activation,
+    # 2026-09-04) and would otherwise add unrelated sources to the result.
+    data["sources"]["remotive"]["enabled"] = False
+    data["sources"]["arbeitnow"]["enabled"] = False
+    data["sources"]["adzuna"]["enabled"] = False
     (cfg_dir / "sources.yaml").write_text(yaml.dump(data))
 
     cfg = load_config(config_dir=cfg_dir)

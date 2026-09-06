@@ -137,7 +137,10 @@ from job_agent.applications.schema import (
     SubmissionEvidence,
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError, can_transition
-from job_agent.applications.verification_contract import validate_submission_evidence
+from job_agent.applications.verification_contract import (
+    EvidenceValidation,
+    validate_submission_evidence,
+)
 from job_agent.candidate.schema import CandidateProfile
 from job_agent.config.loader import REPO_ROOT, AppConfig
 from job_agent.db.models import Application, ApplicationApproval, JobMatch
@@ -694,6 +697,16 @@ def verify_application(
     )
     session.commit()
     return application
+
+
+def validate_browser_submission_evidence(evidence: SubmissionEvidence) -> EvidenceValidation:
+    """The one sanctioned way for `job_agent.cli.main`'s `browser-submit`
+    command to run the same shape-validity check `verify_application`
+    applies to approval-requiring providers, without itself importing
+    `job_agent.applications.verification_contract` — a
+    `TestDormancy`-enforced boundary restricts that module to this file
+    alone. Pure pass-through; no state, no side effects."""
+    return validate_submission_evidence(evidence)
 
 
 def answers_from_db(session: Session, application_id: int) -> list[GeneratedAnswer]:

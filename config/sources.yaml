@@ -41,6 +41,63 @@ sources:
       - token: "REPLACE_WITH_REAL_LEVER_COMPANY_SLUG"
         company_name: "REPLACE_WITH_COMPANY_NAME"
 
+  remotive:
+    enabled: true
+    kind: "search_api"
+    poll_interval_minutes: 60
+    rate_limit_per_minute: 10
+    max_queries: 3
+    notes: >-
+      Public, keyless remote-jobs API (https://remotive.com/api/remote-jobs)
+      — no ToS concern, no credential needed. Searches the candidate's own
+      generated query portfolio (job_agent.jobs.query_generator), up to
+      max_queries terms per scan. Enabled 2026-09-04 (real-world activation
+      audit): the adapter is implemented and tested; this sandbox's network
+      policy blocks outbound calls to remotive.com so it could not be
+      live-verified from here — it will start returning real jobs the
+      moment `job-agent jobs search-run` runs somewhere with network access
+      to remotive.com. No further action needed from the candidate.
+
+  arbeitnow:
+    enabled: true
+    kind: "search_api"
+    poll_interval_minutes: 60
+    rate_limit_per_minute: 10
+    notes: >-
+      Public, keyless job-board API
+      (https://www.arbeitnow.com/api/job-board-api) — no ToS concern, no
+      credential needed, lists every current posting (no search term
+      supported by the API itself). Reports a real visa_sponsorship flag
+      per listing when the source states it. Enabled 2026-09-04 (real-world
+      activation audit): the adapter is implemented and tested; this
+      sandbox's network policy blocks outbound calls to arbeitnow.com so it
+      could not be live-verified from here — it will start returning real
+      jobs the moment a real run has network access to arbeitnow.com. No
+      further action needed from the candidate.
+
+  adzuna:
+    enabled: true
+    kind: "search_api"
+    poll_interval_minutes: 60
+    rate_limit_per_minute: 10
+    max_queries: 2
+    # ISO 3166-1 alpha-2 codes Adzuna supports, drawn from the candidate's
+    # requested country list: gb=UK, us=USA, ca=Canada, in=India,
+    # sg=Singapore, au=Australia, de=Germany, nl=Netherlands. Ireland and
+    # UAE are not Adzuna markets as of this writing — omitted rather than
+    # faked (Remotive/Arbeitnow above cover global/remote roles instead).
+    countries: ["gb", "us", "ca", "in", "sg", "au", "de", "nl"]
+    notes: >-
+      Official Adzuna Jobs API (https://developer.adzuna.com/) — requires
+      a free ADZUNA_APP_ID/ADZUNA_APP_KEY (see .env.example); skipped with
+      a logged reason if unset even when enabled here, never a crash and
+      never fake data. Enabled 2026-09-04 (real-world activation audit) so
+      it activates the instant credentials are set — but it is genuinely
+      NOT live yet: get free credentials at https://developer.adzuna.com/,
+      set ADZUNA_APP_ID/ADZUNA_APP_KEY in `.env`, and this sandbox's network
+      policy also blocks api.adzuna.com so connectivity could not be
+      live-verified from here either.
+
   workday:
     enabled: false
     kind: "ats_api"

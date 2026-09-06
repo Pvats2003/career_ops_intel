@@ -26,8 +26,11 @@ from pydantic import BaseModel, ValidationError
 
 from job_agent.config.loader import AppConfig
 from job_agent.llm.errors import LLMOutputValidationError, LLMUnavailableError
+from job_agent.logging.setup import get_logger, log_event
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+_logger = get_logger("job_agent.llm.cost")
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,24 @@ class AnthropicLLMProvider(LLMProvider):
             input_tokens=getattr(usage, "input_tokens", None),
             output_tokens=getattr(usage, "output_tokens", None),
             latency_ms=latency_ms,
+        )
+        # Part 17 cost audit: every real Anthropic call passes through this
+        # one method regardless of caller (semantic matching, resume
+        # tailoring, cover letters, answer generation, career chat), so
+        # this is the single place that can log real, complete usage —
+        # never an estimate — for every LLM dollar this system spends.
+        # Token counts come straight from the API's own `usage` block.
+        log_event(
+            _logger,
+            component="llm.cost",
+            action="complete_json",
+            result="success",
+            duration_ms=latency_ms,
+            provider=meta.provider,
+            model=meta.model,
+            prompt_version=meta.prompt_version,
+            input_tokens=meta.input_tokens,
+            output_tokens=meta.output_tokens,
         )
         return parsed, meta
 

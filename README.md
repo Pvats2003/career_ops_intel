@@ -5,17 +5,22 @@ a truthful candidate knowledge base, and (in later phases) prepares and
 submits applications — with humans in the loop by default and every
 generated fact traceable to a source.
 
-**This repository is at the end of Phase 6A (Provider Architecture &
-Contracts).** Phase 6A is architecture/contracts only — see "Architecture
-(Phase 6A" below. It widens the `ApplicationProvider` interface, adds a
-`SUBMISSION_UNCERTAIN` state, and wires `config/rules.yaml`'s safety rules
-into actual enforcement for the first time — but ships **no real provider,
-no browser automation, no credential handling, and no new way to reach
-SUBMITTED/VERIFIED**. `ManualReviewProvider` remains the only shipped
-`ApplicationProvider`, and its `submit()` still always refuses. Resume
-variant selection/tailoring, real ATS/browser-automation integrations, and
-live submission do not exist yet. **Nothing in this codebase can submit a
-real job application.**
+**Setting this up on your own machine?** Start with
+[`docs/LOCAL_SETUP.md`](docs/LOCAL_SETUP.md) (exact commands, in order) and
+[`docs/FIRST_RUN_CHECKLIST.md`](docs/FIRST_RUN_CHECKLIST.md) (the shortest
+possible path to your first real search). Run `job-agent doctor` at any
+point to see exactly what's configured, what's missing, and how to fix it.
+
+The system today includes a working FastAPI + React web dashboard, real
+(keyless) job-source adapters (Remotive, Arbeitnow), an Adzuna adapter ready
+for free API credentials, deterministic + LLM-assisted matching, resume
+tailoring, cover-letter generation, an application assistant, and an
+autonomous scheduler — all covered by the phase-by-phase architecture notes
+below, which are kept for historical/design context. Submitting an actual
+job application always requires an explicit human action; nothing in this
+codebase submits automatically. See `docs/LOCAL_ACTIVATION_REPORT.md` for a
+current, honest breakdown of what's verified vs. what still needs your
+machine/credentials/decisions.
 
 ## Core principle
 
@@ -92,6 +97,16 @@ src/job_agent/
                                                    orchestration + (Phase 6A) per-item batch
                                                    isolation and inspection-driven HUMAN_REQUIRED
   cli/                     Typer CLI (main.py)
+  web/                     Web dashboard backend (Phase 7) — FastAPI over the same services
+    deps.py                  Config/DB-session/candidate dependencies
+    schemas.py                API request/response models (never the ORM rows directly)
+    routers/                   dashboard.py, candidate.py, jobs.py, pipeline.py
+    app.py                       create_app(); serves web-ui/dist + an SPA fallback route
+
+web-ui/                  Web dashboard frontend (Phase 7) — Vite + React + TypeScript + Tailwind
+  src/pages/               Dashboard, Jobs, JobDetail, Pipeline, Resume, Analytics
+  src/components/          JobCard + shared UI primitives (Card, Badge, EmptyState, ...)
+  src/api.ts, src/types.ts  Typed fetch client + response types (hand-kept in sync with schemas.py)
 
 prompts/                 Versioned prompt text (job_matcher.md, answer_generator.md)
 
@@ -611,11 +626,20 @@ Copy `.env.example` to `.env` (or run `job-agent init`) and fill in secrets.
 
 ## Running it
 
+See `docs/LOCAL_SETUP.md` for the full, exact-commands walkthrough
+(Windows and Linux/Mac). Short version:
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-alembic upgrade head        # create the SQLite schema (data/job_agent.db)
+job-agent init               # scaffolds .env from .env.example, creates data/,
+                              # and runs the Alembic migration to head
+job-agent doctor              # one-command diagnostic: exactly what's
+                              # configured, what's missing, how to fix it
+job-agent db upgrade          # re-run after any `git pull` that adds a new
+                              # alembic/versions/ migration (safe no-op otherwise)
+job-agent db current          # show the database's current Alembic revision
 
 job-agent status            # show effective dry-run/live-mode/automation-level state
 job-agent health            # config loads + candidate profile parses + DB reachable
@@ -656,9 +680,44 @@ degrading.
 `applications run` never actually submits anything in this phase: the only
 shipped `ApplicationProvider` (`ManualReviewProvider`) always refuses at the
 `submit()` call, regardless of `DRY_RUN`/`LIVE_MODE`/automation level — real
-ATS/browser-automation integrations are a later phase. `job-agent dashboard`
-is still registered for interface stability but exits with a clear "not
-implemented yet" message — see `job_agent/cli/main.py`.
+ATS/browser-automation integrations are a later phase.
+
+## Web dashboard (Phase 7)
+
+`job-agent serve` starts a FastAPI server (`job_agent/web/`) exposing the
+exact same candidate/job/matching/pipeline services every CLI command
+above already uses — it is a second front end over the same code, never a
+second implementation of "what matching/scanning/saving a job means".
+
+```bash
+job-agent serve                 # http://127.0.0.1:8000 — API + built frontend
+job-agent serve --reload        # auto-reload during backend development
+```
+
+The dashboard shows your candidate profile, ranked/filterable job matches
+with a full score breakdown and "why this matches you" explanation, a
+Kanban-style application pipeline (Saved → Shortlisted → Apply → Applied →
+Assessment → Interview → Offer → Rejected, tracked via a new
+`Application.pipeline_stage` column that is completely separate from the
+safety-gated automation `status` field and never touches it), a resume
+upload/re-parse flow, and basic pipeline analytics. It never fabricates a
+job listing, match score, or company detail — with no source enabled in
+`config/sources.yaml` it honestly reports zero jobs; the dashboard's own
+"Scan for jobs"/"Re-run matching" buttons call the same `jobs scan`/
+`jobs match` logic described above.
+
+To develop the frontend itself (`web-ui/`, a Vite + React + TypeScript +
+Tailwind app):
+
+```bash
+cd web-ui
+npm install
+npm run dev       # http://localhost:5173, proxies /api to job-agent serve on :8000
+npm run build      # writes web-ui/dist, which `job-agent serve` then serves directly
+```
+
+`job-agent serve` alone (no `npm run dev` needed) is enough once
+`web-ui/dist` has been built.
 
 ## Testing
 
@@ -709,6 +768,18 @@ accumulate and are never overwritten), retry-from-FAILED idempotency
 (never creates a duplicate row), and the core invariant that an
 application can never reach `VERIFIED` without genuine, non-blank
 verification evidence.
+
+Phase 7's tests (`test_web_api.py`) use FastAPI's `TestClient` against
+`create_app()` with the same tmp_path/monkeypatch config isolation every
+other test file uses — nothing ever touches the real `data/job_agent.db`.
+Coverage includes: an honest zero-jobs scan when no source is enabled, job
+list filtering/sorting, save-is-idempotent-and-never-regresses-stage,
+pipeline-stage validation, the audit-trail-preserving delete guard (refuses
+past SHORTLISTED), analytics aggregation, matching with no LLM key
+configured, resume-upload content-type rejection, and the SPA fallback
+route (a direct GET/refresh on a client-side route like `/pipeline` must
+return the app shell, never a 404, while an unknown `/api/*` path still
+404s as a real API 404).
 
 Phase 6A's tests (`test_rules_enforcement.py`, plus additions to
 `test_applications_provider.py`, `test_applications_schema.py`,
@@ -959,11 +1030,20 @@ of which are implemented and none of which should be assumed from Phase
   6D" before that name was reassigned to the browser-provider foundation
   phase above — renumbered here to avoid the collision, no scope change.)
 
-Beyond that: the FastAPI dashboard, the scheduler, and notifications. Also
-not started within "job sources": Workday, company career pages, and the
-ToS-restricted sources (LinkedIn, Indeed, Wellfound) — see
-`config/sources.yaml` notes on each. Each phase stops for review before the
-next begins.
+- **Phase 7 — Web Dashboard.** **Shipped.** `job_agent/web/` (FastAPI) +
+  `web-ui/` (React/TypeScript/Tailwind) — see "Web dashboard (Phase 7)"
+  above. Career-path discovery (BUILD PROMPT section 4), resume tailoring
+  per job (section 14), the application assistant's answer generation
+  surfaced in the UI (section 15 — the underlying `answer_engine` already
+  exists and is used by `applications prepare`, just not yet exposed as a
+  dashboard action), and company intelligence (section 16, which needs an
+  external data source this repo doesn't have) remain unbuilt in the web
+  layer specifically.
+
+Beyond that: the scheduler and notifications. Also not started within "job
+sources": Workday, company career pages, and the ToS-restricted sources
+(LinkedIn, Indeed, Wellfound) — see `config/sources.yaml` notes on each.
+Each phase stops for review before the next begins.
 
 **Before Level 4 (auto-submit) automation is ever safe to enable:** fill in
 `config/preferences.yaml` (salary, visa/work authorization, relocation) —

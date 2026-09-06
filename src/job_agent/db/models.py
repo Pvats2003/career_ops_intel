@@ -52,6 +52,24 @@ class Candidate(Base, TimestampMixin):
     parsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     source_files: Mapped[list] = mapped_column(JSON, default=list)
 
+    # Dashboard performance forensic fix: `job_agent.resume.versioning.
+    # compute_profile_hash()`'s sha256 of the last-persisted profile's
+    # semantic content (excluding `parsed_at`, which changes on every
+    # parse regardless of real content). Lets `save_candidate_profile()`
+    # tell "nothing changed" across separate requests/processes and skip
+    # the delete/reinsert-everything cycle entirely. NULL means "unknown,
+    # must resync" (pre-migration rows, or a row never fingerprinted yet)
+    # — never treated as a match.
+    profile_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Career OS web dashboard (Phase 8+) — when the candidate last opened
+    # the dashboard, used purely to compute "new since last visit" on read
+    # (never gates or authorizes anything); set by the web layer, not by
+    # any CLI command.
+    last_dashboard_view_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     facts: Mapped[list[CandidateFact]] = relationship(
         back_populates="candidate", cascade="all, delete-orphan"
     )
@@ -208,6 +226,14 @@ class JobSource(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     last_health_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # FINAL GOD MODE Part 6.19's Source Health page needs "last successful
+    # run" to survive a subsequent failure — last_health_check_at above is
+    # overwritten on EVERY check regardless of outcome, so a source that's
+    # been failing for days would otherwise show its last (failed) check
+    # time as if it were a success. Set only when a check succeeds.
+    last_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class Job(Base, TimestampMixin):
@@ -217,6 +243,13 @@ class Job(Base, TimestampMixin):
         Index("ix_jobs_company_name", "company_name"),
         Index("ix_jobs_title", "title"),
         Index("ix_jobs_posted_at", "posted_at"),
+        # Both filters below were full `SCAN jobs` in EXPLAIN QUERY PLAN
+        # (Part 16 performance audit) — source_id backs every per-source
+        # scan/dedup lookup (jobs/service.py, jobs/repository.py) and
+        # lifecycle_status backs the staleness sweep and every "ACTIVE
+        # jobs only" query, both of which walk the whole table today.
+        Index("ix_jobs_source_id", "source_id"),
+        Index("ix_jobs_lifecycle_status", "lifecycle_status"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -246,12 +279,29 @@ class Job(Base, TimestampMixin):
     freshness_status: Mapped[str] = mapped_column(String(32), default="UNKNOWN_POST_DATE")
     raw_data: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    # Career OS Phase 8 — source-availability lifecycle (ACTIVE/CLOSED/
+    # EXPIRED), deliberately separate from `freshness_status` above:
+    # `freshness_status` says how recently the posting claims to have been
+    # posted; `lifecycle_status` says whether the posting is still
+    # actually live, set by `job_agent.jobs.service` when a full re-scan
+    # of a source no longer lists a previously-seen job (CLOSED), or by a
+    # separate staleness sweep for a job unconfirmed for too long
+    # (EXPIRED) — never guessed at import time, always ACTIVE by default.
+    lifecycle_status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
+
 
 class JobMatch(Base, TimestampMixin):
     __tablename__ = "job_matches"
     __table_args__ = (
         Index("ix_job_matches_score", "overall_score"),
         Index("ix_job_matches_decision", "decision"),
+        # `job_view.latest_match()` — the single most-called query in the
+        # web layer, once per job on every job list/detail/company/
+        # compare view — filters on (job_id, candidate_id) and orders by
+        # created_at DESC LIMIT 1. Without this, EXPLAIN QUERY PLAN showed
+        # it using only the single-column job_id index and then sorting
+        # via a temp B-tree (Part 16 performance audit).
+        Index("ix_job_matches_job_candidate_created", "job_id", "candidate_id", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -275,6 +325,21 @@ class JobMatch(Base, TimestampMixin):
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
     prompt_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     model_used: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Career OS Phase 16 cost control — job_agent.matching.cache.
+    # compute_match_cache_key(profile, config, job): when a fresh match's
+    # key equals the LATEST existing row's, the match is reused verbatim
+    # instead of paying for another deterministic+LLM pass. NULL for any
+    # row written before this column existed — never treated as a match.
+    cache_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Matching Engine V2 (forensic false-positive audit, item G) — the
+    # uncapped weighted-average score alongside the (possibly lower)
+    # `overall_score` actually used for the decision, so a hard-stop/
+    # risk-flagged job's raw evidence stays visible rather than hidden
+    # behind the capped number. NULL for any row written before this
+    # column existed (pre-V2 rows recompute automatically on the next
+    # matching run — see job_agent.matching.cache.MATCH_LOGIC_VERSION).
+    raw_fit_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_flags: Mapped[list | None] = mapped_column(JSON, nullable=True, default=list)
 
 
 # --------------------------------------------------------------------------
@@ -303,12 +368,28 @@ class Application(Base, TimestampMixin):
     row is required to also append an immutable `ApplicationEvent` row;
     this table holds current state, `application_events` holds history —
     the same split already used for `jobs`/`job_matches`.
+
+    `pipeline_stage` (Career OS web dashboard, section 13) is a SEPARATE
+    concern from `status` above and never read or written by anything in
+    `job_agent.applications.state_machine`/`service` — `status` tracks
+    what the SAFETY-GATED AUTOMATION has actually done (discovered,
+    prepared, submitted, verified...) and its transitions are guarded by
+    `state_machine.validate_transition`; `pipeline_stage` tracks where the
+    CANDIDATE'S OWN real-world recruiting process currently stands
+    (saved it, shortlisted it, applied by any means, in an assessment,
+    interviewing, an offer, rejected) and the human is free to move it in
+    any order from the dashboard — it is never used to gate or authorize
+    an automated action. Reusing this table (rather than a separate
+    SavedJob entity) means "save a job" and "track an application" are
+    the same row, so there is exactly one place a given job's pipeline
+    state lives.
     """
 
     __tablename__ = "applications"
     __table_args__ = (
         Index("ix_applications_status", "status"),
         Index("ix_applications_match_score", "match_score"),
+        Index("ix_applications_pipeline_stage", "pipeline_stage"),
         UniqueConstraint("job_id", "candidate_id", name="uq_applications_job_candidate"),
     )
 
@@ -329,6 +410,24 @@ class Application(Base, TimestampMixin):
     confirmation_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     screenshot_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- Career OS web dashboard (recruiting-pipeline tracking; see the
+    # class docstring's `pipeline_stage` note above) ---
+    pipeline_stage: Mapped[str] = mapped_column(String(32), default="SAVED")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recruiter_contact: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    interview_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    follow_up_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Application checklist (FINAL GOD MODE Part 4.12) — the two items with
+    # no automatically-derivable signal elsewhere (resume selection/
+    # tailoring already come from `resume_id`/`Resume.is_tailored`;
+    # submitted/confirmed already come from `status`/`submitted_at`/
+    # `confirmation_id`/`confirmation_url`). A candidate ticks these
+    # manually; never inferred.
+    cover_letter_ready: Mapped[bool] = mapped_column(default=False)
+    questions_prepared: Mapped[bool] = mapped_column(default=False)
 
 
 class ApplicationAnswer(Base, TimestampMixin):
@@ -427,6 +526,9 @@ class Notification(Base):
     __tablename__ = "notifications"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("candidate.id"), nullable=True, index=True
+    )
     event_type: Mapped[str] = mapped_column(String(64))
     channel: Mapped[str] = mapped_column(String(32))
     title: Mapped[str] = mapped_column(String(255))
@@ -436,7 +538,79 @@ class Notification(Base):
         ForeignKey("applications.id"), nullable=True
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Phase 8 (Career OS web dashboard): when the candidate dismissed/read
+    # this notification in the UI — None means still unread. Distinct from
+    # `sent_at`, which is about outbound delivery (email/push), not
+    # in-app read state.
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WatchlistEntry(Base, TimestampMixin):
+    """A company/role/location the candidate wants proactively flagged —
+    Career OS Phase 11 section 19. `kind` + `value` together define what
+    to match new jobs against; matching happens in `job_agent.jobs.
+    watchlist`, never here (this table is pure storage)."""
+
+    __tablename__ = "watchlist_entries"
+    __table_args__ = (Index("ix_watchlist_entries_candidate_kind", "candidate_id", "kind"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidate.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(16))  # COMPANY | ROLE | LOCATION
+    value: Mapped[str] = mapped_column(String(255))
+
+
+class SearchPreferences(Base, TimestampMixin):
+    """One row per candidate — Career OS Phase 15 settings page. Overlays
+    (never replaces) `config/preferences.yaml`/`config/profile.yaml`: those
+    YAML files stay the source of truth for who the candidate IS (facts),
+    this table holds how they want the SEARCH scoped, live-editable from
+    the dashboard without touching a YAML file on disk. A missing row for
+    the candidate means "no overrides set yet" — callers fall back to the
+    YAML-derived defaults, never to a guessed value.
+    """
+
+    __tablename__ = "search_preferences"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate.id"), unique=True, index=True
+    )
+    target_roles: Mapped[list] = mapped_column(JSON, default=list)
+    target_countries: Mapped[list] = mapped_column(JSON, default=list)
+    target_cities: Mapped[list] = mapped_column(JSON, default=list)
+    remote_preference: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    min_salary: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_experience_gap_years: Mapped[float | None] = mapped_column(Float, nullable=True)
+    industries: Mapped[list] = mapped_column(JSON, default=list)
+    companies_priority: Mapped[list] = mapped_column(JSON, default=list)
+    companies_excluded: Mapped[list] = mapped_column(JSON, default=list)
+    min_match_score: Mapped[int] = mapped_column(default=0)
+    search_frequency_hours: Mapped[int] = mapped_column(default=24)
+    notification_min_score: Mapped[int] = mapped_column(default=90)
+    notification_frequency: Mapped[str] = mapped_column(String(16), default="daily")
+
+
+class SearchRun(Base):
+    """One end-to-end discovery run (scan -> dedupe -> freshness -> match)
+    — Career OS Phase 8 section 3. Insert-only history, mirroring the
+    `application_events` audit-trail pattern: `status` is updated in place
+    as the run progresses, everything else is append-only observation."""
+
+    __tablename__ = "search_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sources: Mapped[list] = mapped_column(JSON, default=list)
+    queries: Mapped[list] = mapped_column(JSON, default=list)
+    jobs_found: Mapped[int] = mapped_column(default=0)
+    duplicates_removed: Mapped[int] = mapped_column(default=0)
+    expired_removed: Mapped[int] = mapped_column(default=0)
+    qualified: Mapped[int] = mapped_column(default=0)
+    errors: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(16), default="RUNNING")
 
 
 class SystemEvent(Base):

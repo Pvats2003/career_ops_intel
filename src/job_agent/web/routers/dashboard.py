@@ -1,0 +1,369 @@
+"""Section 10 — the one screen that should answer "what are the best jobs
+I should apply to right now" within seconds. Pure read aggregation over
+`jobs`/`job_matches`/`applications` and the current resume validation
+status; triggers no scan/match itself (the dashboard's "Scan for jobs" /
+"Re-run matching" actions call `job_agent.web.routers.jobs`'s endpoints).
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from fastapi import APIRouter
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, load_only
+
+from job_agent.applications.follow_up import compute_follow_up_recommendations
+from job_agent.candidate.briefing import compose_morning_briefing
+from job_agent.candidate.career_paths import discover_career_paths
+from job_agent.candidate.learning import compute_learned_preferences, discover_insights
+from job_agent.db.models import Application, Candidate, JobMatch
+from job_agent.db.models import Job as JobRow
+from job_agent.matching.ranking import rank_jobs
+from job_agent.resume.repository import get_latest_version
+from job_agent.web import job_view
+from job_agent.web.deps import CandidateDep, ConfigDep, SessionDep
+from job_agent.web.routers.jobs import _application_for, _job_out
+from job_agent.web.schemas import (
+    BriefingHighlightOut,
+    DashboardSummaryOut,
+    MorningBriefingOut,
+    NewSinceLastVisitOut,
+    RankedJobOut,
+)
+
+router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+_APPLY_PRIORITY_DECISIONS = {"APPLY"}
+# Matching Engine V2 (audit item J): a "qualified match" is a job that
+# cleared the save_threshold and isn't excluded/hard-stopped into
+# HUMAN_REQUIRED — NOT merely "a JobMatch row exists for it" (the old
+# `job_matches` metric's actual meaning, which counted every scored job
+# regardless of quality, including outright SKIPs).
+_QUALIFIED_DECISIONS = {"APPLY", "REVIEW", "SAVE"}
+_HIGH_CONFIDENCE_DECISIONS = {"APPLY", "REVIEW"}
+_APPLIED_STAGES = {"APPLIED", "ASSESSMENT", "INTERVIEW", "OFFER", "REJECTED"}
+
+# Dashboard performance forensic fix, round 3: `dashboard_summary()` is the
+# one endpoint that must still fetch the ENTIRE historical `jobs` table
+# (its jobs_scored/qualified_matches/total_jobs_discovered counters are
+# genuinely all-time, unlike its siblings' ACTIVE-only fetches) — but it
+# was fetching every column, including large TEXT/JSON fields
+# (description, requirements, preferred_qualifications, raw_data,
+# locations) that nothing in this endpoint's call chain ever reads. This
+# is the exact, traced set of columns actually touched, verified against
+# the real code (not assumed) across: the counters loop below,
+# `matching.ranking.rank_jobs`/`_component_breakdown`/`explain`,
+# `candidate.learning.behavioral_fit_signal` (its `_DIMENSIONS`), and —
+# for the ≤10 jobs that reach it — `job_view.job_out()` plus its own
+# `jobs.confidence.assess_data_confidence`/`jobs.viability.
+# assess_application_viability` helpers. `visa_information` looks like a
+# large field but IS required (`assess_application_viability` reads it);
+# it stays loaded. `raiseload=True` means any future code path that
+# starts reading an excluded column fails loudly and immediately —
+# never silently degrades into a per-row lazy SELECT.
+_SUMMARY_JOB_COLUMNS = load_only(
+    JobRow.id,
+    JobRow.title,
+    JobRow.company_name,
+    JobRow.location,
+    JobRow.remote_type,
+    JobRow.employment_type,
+    JobRow.salary_min,
+    JobRow.salary_max,
+    JobRow.currency,
+    JobRow.application_url,
+    JobRow.posted_at,
+    JobRow.discovered_at,
+    JobRow.freshness_status,
+    JobRow.lifecycle_status,
+    JobRow.company_url,
+    JobRow.company_id,
+    JobRow.visa_information,
+    raiseload=True,
+)
+
+
+def _decision_counts_all_time(session: Session, candidate_id: int) -> dict[str, int]:
+    """{decision: count of jobs (ANY status) whose LATEST match for this
+    candidate has that decision} — computed as one SQL aggregate instead
+    of fetching every historical `Job`/`JobMatch` row into Python.
+
+    Dashboard performance forensic fix, round 4: `dashboard_summary()`'s
+    counters are genuinely all-time (audit item J's `_QUALIFIED_DECISIONS`
+    etc. are evaluated over every job ever discovered, not just ACTIVE
+    ones), so an earlier round's ACTIVE-only SQL filter (used everywhere
+    else in this file) can't apply here — but computing them never
+    actually required materializing full `Job`/`JobMatch` ORM objects for
+    every historical row, only a count per decision. Query count was
+    already flat after an earlier round's N+1 fix (`latest_matches_by_job`
+    batched the match lookup into one query), yet wall-clock time still
+    scaled linearly with total historical job count — confirmed locally:
+    68ms at 600 jobs, 674ms at 6000, same query count throughout — because
+    every one of those rows was still being fetched, deserialized into an
+    ORM object, and iterated in a Python `for job in jobs:` loop just to
+    look up its decision and count it. Same "latest match per job_id"
+    definition `job_view.latest_matches_by_job()` uses (a
+    MAX(created_at) GROUP BY job_id subquery), joined back to `job_matches`
+    for its `decision`, joined to `jobs` so a `job_matches` row can never
+    be counted for a job that doesn't actually exist (never observed in
+    practice — `job_matches.job_id` has a FK to `jobs.id` — but this keeps
+    the SQL provably equivalent to the old "iterate real Job rows, look up
+    their match" loop without relying on that FK never being violated)."""
+    latest_match_per_job = (
+        select(JobMatch.job_id, func.max(JobMatch.created_at).label("max_created_at"))
+        .where(JobMatch.candidate_id == candidate_id)
+        .group_by(JobMatch.job_id)
+        .subquery()
+    )
+    rows = session.execute(
+        select(JobMatch.decision, func.count(JobMatch.id))
+        .join(
+            latest_match_per_job,
+            (JobMatch.job_id == latest_match_per_job.c.job_id)
+            & (JobMatch.created_at == latest_match_per_job.c.max_created_at),
+        )
+        .join(JobRow, JobRow.id == JobMatch.job_id)
+        .group_by(JobMatch.decision)
+    ).all()
+    return dict(rows)
+
+
+@router.get("/summary", response_model=DashboardSummaryOut)
+def dashboard_summary(
+    session: SessionDep, candidate: CandidateDep, config: ConfigDep
+) -> DashboardSummaryOut:
+    _, candidate_id = candidate
+
+    # `total_jobs_discovered` is a plain, unfiltered count — never needed
+    # the actual rows, only how many there are.
+    total_jobs_discovered = session.execute(select(func.count()).select_from(JobRow)).scalar_one()
+
+    decision_counts = _decision_counts_all_time(session, candidate_id)
+    # `jobs_scored` is exactly "how many jobs have a match at all" — since
+    # `_decision_counts_all_time` already reduces to one row per matched
+    # job (grouped by its LATEST match's decision), the counts sum to
+    # exactly that, regardless of which decisions actually occur.
+    jobs_scored = sum(decision_counts.values())
+    qualified_matches = sum(
+        count for decision, count in decision_counts.items() if decision in _QUALIFIED_DECISIONS
+    )
+    high_confidence_matches = sum(
+        count
+        for decision, count in decision_counts.items()
+        if decision in _HIGH_CONFIDENCE_DECISIONS
+    )
+    apply_priority_count = decision_counts.get("APPLY", 0)
+
+    applications = list(
+        session.execute(
+            select(Application).where(Application.candidate_id == candidate_id)
+        ).scalars()
+    )
+
+    version = get_latest_version(session, candidate_id)
+
+    # `top_opportunities` is the only part of this endpoint that genuinely
+    # needs real Job objects — and `rank_jobs()` has always discarded any
+    # non-ACTIVE row internally (see its own docstring), exactly like
+    # `jobs.py::_compute_ranking_decisions` already fetches ACTIVE-only
+    # for Top 10/Apply Now. Fetching only ACTIVE jobs here changes zero
+    # output: every non-ACTIVE job that used to enter the old, bigger
+    # `rankable_pairs` list was always silently dropped by `rank_jobs()`
+    # before it could ever appear in `top_opportunities`.
+    active_jobs = list(
+        session.execute(
+            select(JobRow)
+            .where(JobRow.lifecycle_status == "ACTIVE")
+            .options(_SUMMARY_JOB_COLUMNS)
+        ).scalars()
+    )
+    active_matches_by_job = job_view.latest_matches_by_job(
+        session, [job.id for job in active_jobs], candidate_id
+    )
+    # Matching Engine V2 (audit item I): only decisions worth a human's
+    # attention are even candidates for Top Opportunities — a SKIP must
+    # NEVER appear there, so it's excluded here rather than relying on
+    # ranking alone to bury it.
+    rankable_pairs: list[tuple[JobRow, JobMatch | None]] = [
+        (job, match_row)
+        for job in active_jobs
+        if (match_row := active_matches_by_job.get(job.id)) is not None
+        and match_row.decision != "SKIP"
+    ]
+
+    # Reuses the exact same composite ranking `new_since_last_visit`/
+    # `morning_briefing` already use (job_agent.matching.ranking.
+    # rank_jobs) instead of the old raw overall_score sort — rank_jobs'
+    # own decision-aware career_value weighting means a HUMAN_REQUIRED
+    # job is naturally deprioritized under APPLY/REVIEW/SAVE, never
+    # ranked above them just for having a higher raw number.
+    preferences = compute_learned_preferences(
+        job_view.matched_jobs_with_applications(session, candidate_id)
+    )
+    ranked = rank_jobs(
+        rankable_pairs, config.automation.priority_weights, preferences=preferences, limit=10
+    )
+    top_out = [
+        _job_out(r.job, r.match, _application_for(session, r.job.id, candidate_id)) for r in ranked
+    ]
+
+    shortlisted = sum(
+        1 for a in applications if a.pipeline_stage in ("SHORTLISTED", *_APPLIED_STAGES)
+    )
+    applied = sum(1 for a in applications if a.pipeline_stage in _APPLIED_STAGES)
+    interviewing = sum(1 for a in applications if a.pipeline_stage in ("INTERVIEW", "OFFER"))
+    offers = sum(1 for a in applications if a.pipeline_stage == "OFFER")
+
+    return DashboardSummaryOut(
+        resume_parsed=True,
+        resume_validation_status=version.validation_status if version else None,
+        # Redefined per audit item J — see _QUALIFIED_DECISIONS above.
+        # `jobs_scored` keeps the OLD meaning available under its own,
+        # honestly-named field for any consumer that actually wants it.
+        job_matches=qualified_matches,
+        jobs_scored=jobs_scored,
+        qualified_matches=qualified_matches,
+        high_confidence_matches=high_confidence_matches,
+        shortlisted=shortlisted,
+        applied=applied,
+        interviewing=interviewing,
+        offers=offers,
+        total_jobs_discovered=total_jobs_discovered,
+        apply_priority_count=apply_priority_count,
+        top_opportunities=top_out,
+    )
+
+
+@router.get("/new-since-last-visit", response_model=NewSinceLastVisitOut)
+def new_since_last_visit(
+    session: SessionDep, candidate: CandidateDep, config: ConfigDep
+) -> NewSinceLastVisitOut:
+    """FINAL GOD MODE Part 1.2 — jobs discovered strictly after the
+    candidate's PREVIOUS dashboard visit (`Candidate.last_dashboard_view_at`
+    as it stood before this call), ranked the same way as Top 10. This
+    endpoint then advances `last_dashboard_view_at` to now and commits —
+    a deliberate side effect on a GET, exactly like a "mark as read": the
+    point is "what's new since I last looked", so calling it again
+    immediately must NOT show the same jobs again (per spec: "avoid
+    repeatedly showing the same jobs as new"). A candidate with no prior
+    visit sees everything currently active as new, once."""
+    _, candidate_id = candidate
+    candidate_row = session.get(Candidate, candidate_id)
+    previous_visit_at = candidate_row.last_dashboard_view_at if candidate_row else None
+
+    # Filtered to ACTIVE at the SQL level (dashboard performance forensic
+    # fix, round 2): `new_jobs` only ever feeds `rank_jobs()` below, which
+    # has always discarded non-ACTIVE rows anyway (see its docstring) — no
+    # output change, just fewer CLOSED/EXPIRED rows fetched and thrown away.
+    query = select(JobRow).where(JobRow.lifecycle_status == "ACTIVE")
+    if previous_visit_at is not None:
+        query = query.where(JobRow.discovered_at > previous_visit_at)
+    new_jobs = list(session.execute(query).scalars())
+
+    # Production-audit finding (dashboard-loading forensic audit): this
+    # used to call `_latest_match()`/`_application_for()` once per job in
+    # `new_jobs` — on a first visit (no previous_visit_at) that's every
+    # active job, an unbounded N+1 on each. Both batched into one query
+    # each regardless of how many jobs are "new".
+    matches_by_job = job_view.latest_matches_by_job(
+        session, [job.id for job in new_jobs], candidate_id
+    )
+    pairs = [(job, matches_by_job.get(job.id)) for job in new_jobs]
+    preferences = compute_learned_preferences(
+        job_view.matched_jobs_with_applications(session, candidate_id)
+    )
+    ranked = rank_jobs(pairs, config.automation.priority_weights, preferences=preferences)
+
+    applications_by_job = job_view.applications_by_job(
+        session, [r.job.id for r in ranked], candidate_id
+    )
+    out = [
+        RankedJobOut(
+            job=_job_out(r.job, r.match, applications_by_job.get(r.job.id)),
+            rank_score=r.rank_score, why=list(r.why), gaps=list(r.gaps),
+            recommendation=r.recommendation,
+        )
+        for r in ranked
+    ]
+
+    if candidate_row is not None:
+        candidate_row.last_dashboard_view_at = datetime.now(UTC)
+        session.commit()
+
+    return NewSinceLastVisitOut(previous_visit_at=previous_visit_at, jobs=out)
+
+
+@router.get("/briefing", response_model=MorningBriefingOut)
+def morning_briefing(
+    session: SessionDep, candidate: CandidateDep, config: ConfigDep
+) -> MorningBriefingOut:
+    """FINAL GOD MODE Part 1.3 — a genuinely useful daily summary, built
+    entirely from data Top 10 / Follow-ups / Insights / Career Paths
+    already compute (`job_agent.candidate.briefing` only formats it, it
+    never re-derives anything), so this can never silently disagree with
+    what those other views show."""
+    profile, candidate_id = candidate
+
+    # Production-audit finding (dashboard-loading forensic audit): this
+    # used to call `_latest_match()` once per row in the WHOLE `jobs`
+    # table — an unbounded N+1, the single largest contributor (alongside
+    # `dashboard_summary`) to the multi-minute dashboard-load hang at
+    # production job counts. Batched into one query regardless of count.
+    # Filtered to ACTIVE at the SQL level (round 2 of this fix): nothing
+    # else in this function derives a count from `jobs` — it only ever
+    # feeds `rank_jobs()`, which has always discarded non-ACTIVE rows
+    # anyway (see its docstring), so this changes zero output, only how
+    # many CLOSED/EXPIRED rows get fetched and immediately thrown away.
+    jobs = list(
+        session.execute(select(JobRow).where(JobRow.lifecycle_status == "ACTIVE")).scalars()
+    )
+    matches_by_job = job_view.latest_matches_by_job(
+        session, [job.id for job in jobs], candidate_id
+    )
+    pairs = [(job, matches_by_job.get(job.id)) for job in jobs]
+    jobs_with_applications = job_view.matched_jobs_with_applications(session, candidate_id)
+    preferences = compute_learned_preferences(jobs_with_applications)
+    ranked = rank_jobs(pairs, config.automation.priority_weights, preferences=preferences)
+
+    applications = list(
+        session.execute(
+            select(Application).where(Application.candidate_id == candidate_id)
+        ).scalars()
+    )
+    applications_with_jobs = []
+    for application in applications:
+        job = session.get(JobRow, application.job_id)
+        if job is not None:
+            applications_with_jobs.append((application, job))
+    follow_ups = compute_follow_up_recommendations(applications_with_jobs)
+
+    _, insight_summary = discover_insights(jobs_with_applications)
+    career_paths = discover_career_paths(profile)
+    top_career_path_label = career_paths[0].label if career_paths else None
+
+    briefing = compose_morning_briefing(
+        ranked, follow_ups,
+        insight_sentences=insight_summary, top_career_path_label=top_career_path_label,
+    )
+
+    return MorningBriefingOut(
+        total_opportunities=briefing.total_opportunities,
+        exceptional_count=briefing.exceptional_count,
+        strong_count=briefing.strong_count,
+        possible_count=briefing.possible_count,
+        top_highlights=[
+            BriefingHighlightOut(
+                job_id=h.job_id, title=h.title, company=h.company, location=h.location,
+                rank_score=h.rank_score,
+                freshness_label=job_view.FRESHNESS_LABELS.get(
+                    h.freshness_status, h.freshness_status
+                ),
+                why=h.why,
+            )
+            for h in briefing.top_highlights
+        ],
+        follow_up_summaries=list(briefing.follow_up_summaries),
+        career_insight=briefing.career_insight,
+        recommendation=briefing.recommendation,
+    )

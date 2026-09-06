@@ -6,6 +6,20 @@ the current candidate/*.md + config state. This is intentional for a
 single-candidate V1 system — the candidate files are the source of truth,
 the database is a derived, queryable projection of them, not independent
 state. (Job/application history in other tables is never touched here.)
+
+Dashboard performance forensic fix: `save_candidate_profile()` is called on
+every web request via `job_agent.web.deps.get_candidate()` (nearly every
+API endpoint depends on it), so "replace-on-reparse" used to mean
+"delete-and-reinsert every child row on every single page view" — real
+write amplification against Postgres for a call that, on a normal read-only
+dashboard visit, changes nothing at all. `Candidate.profile_fingerprint`
+(sha256 of the profile's semantic content, via `job_agent.resume.
+versioning.compute_profile_hash`) lets this function tell "the parsed
+profile is byte-for-byte the same as what's already stored" across
+separate requests/processes and skip the whole delete/reinsert/commit
+cycle in that case — the CLI's `job-agent profile parse` still gets exactly
+the same replace-on-reparse behavior whenever the profile has genuinely
+changed.
 """
 
 from __future__ import annotations
@@ -15,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from job_agent.candidate.schema import CandidateProfile, Fact
 from job_agent.db.models import Candidate, CandidateFact, Experience, Project, Skill
+from job_agent.resume.versioning import compute_profile_hash
 
 
 def _fact_row(candidate_id: int, fact_type: str, key: str, fact: Fact) -> CandidateFact:
@@ -31,10 +46,21 @@ def _fact_row(candidate_id: int, fact_type: str, key: str, fact: Fact) -> Candid
 
 
 def save_candidate_profile(session: Session, profile: CandidateProfile) -> int:
-    """Upsert the candidate profile. Returns the candidate id."""
+    """Upsert the candidate profile. Returns the candidate id.
+
+    A true no-op (zero writes, zero commit) when `existing.profile_fingerprint`
+    already matches this profile's content — see module docstring. A NULL
+    fingerprint (pre-migration row, or a row never fingerprinted yet) is
+    never treated as a match, so existing candidates always resync exactly
+    once after upgrading to this behavior.
+    """
     existing = session.execute(
         select(Candidate).where(Candidate.email == profile.contact_email.value)
     ).scalar_one_or_none()
+
+    fingerprint = compute_profile_hash(profile)
+    if existing is not None and existing.profile_fingerprint == fingerprint:
+        return existing.id
 
     if existing is None:
         candidate = Candidate(
@@ -45,11 +71,13 @@ def save_candidate_profile(session: Session, profile: CandidateProfile) -> int:
             current_location=profile.identity_current_location.value,
             parsed_at=profile.parsed_at,
             source_files=list(profile.source_files),
+            profile_fingerprint=fingerprint,
         )
         session.add(candidate)
         session.flush()  # assign candidate.id
     else:
         candidate = existing
+        candidate.profile_fingerprint = fingerprint
         candidate.name = profile.identity_name.value
         candidate.phone = profile.contact_phone.value
         candidate.linkedin = profile.contact_linkedin.value

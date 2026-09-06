@@ -22,12 +22,17 @@ from __future__ import annotations
 import shutil
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
 from rich.table import Table
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+if TYPE_CHECKING:
+    from alembic.config import Config as AlembicConfig
+    from playwright.sync_api import Browser
 
 from job_agent.applications.allowlist import (
     create_allowlist_entry,
@@ -41,11 +46,14 @@ from job_agent.applications.approvals import (
     create_approval,
     get_valid_approval,
 )
+from job_agent.applications.browser.session import BrowserSession
 from job_agent.applications.browser.snapshot import (
     HumanReviewSnapshot,
     compute_snapshot_fingerprint,
 )
 from job_agent.applications.browser.snapshot_render import render_snapshot
+from job_agent.applications.browser.submission_evidence import collect_post_submit_evidence
+from job_agent.applications.browser.submit_control import find_submit_control
 from job_agent.applications.errors import ProviderError
 from job_agent.applications.human_input import (
     HUMAN_INPUT_SOURCE_PREFIX,
@@ -60,13 +68,14 @@ from job_agent.applications.repository import (
     record_event,
 )
 from job_agent.applications.rules_enforcement import evaluate_inspection
-from job_agent.applications.schema import ApplicationStatus, GeneratedAnswer
+from job_agent.applications.schema import ApplicationInspection, ApplicationStatus, GeneratedAnswer
 from job_agent.applications.service import (
     answers_from_db,
     build_application_provider,
     prepare_applications_batch,
     submit_application,
     submit_applications_batch,
+    validate_browser_submission_evidence,
     verify_application,
 )
 from job_agent.applications.state_machine import IllegalStateTransitionError
@@ -76,9 +85,12 @@ from job_agent.db.models import Application, ApplicationAllowlistEntry, JobMatch
 from job_agent.db.models import Job as JobRow
 from job_agent.db.repository import save_candidate_profile
 from job_agent.db.session import get_engine, get_session_factory, init_db
+from job_agent.diagnostics import run_doctor
 from job_agent.jobs.repository import get_or_create_job_source, upsert_job
+from job_agent.jobs.scheduler import build_scheduler
 from job_agent.jobs.schema import FreshnessStatus
 from job_agent.jobs.schema import Job as JobTargetSchema
+from job_agent.jobs.search_run import execute_search_run
 from job_agent.jobs.service import run_scan
 from job_agent.llm.provider import NullLLMProvider, build_llm_provider
 from job_agent.logging.setup import configure_logging, get_logger, log_event, redact_text
@@ -92,12 +104,14 @@ app = typer.Typer(help="Autonomous global job discovery and application agent.")
 profile_app = typer.Typer(help="Candidate profile commands.")
 jobs_app = typer.Typer(help="Job discovery commands (Phase 2+).")
 applications_app = typer.Typer(help="Application pipeline commands (Phase 5+).")
+db_app = typer.Typer(help="Database schema commands.")
 allowlist_app = typer.Typer(
     help="Exact-posting submission allowlist (Phase 6C — controlled real-world execution)."
 )
 app.add_typer(profile_app, name="profile")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(applications_app, name="applications")
+app.add_typer(db_app, name="db")
 applications_app.add_typer(allowlist_app, name="allowlist")
 
 console = Console()
@@ -146,6 +160,63 @@ def init() -> None:
         console.print(".env already exists or no .env.example found — leaving as-is.")
 
     console.print("[green]init complete.[/green] config/ and candidate/ are ready.")
+
+    cfg = load_config()
+    _run_alembic_upgrade(cfg.env.database_url)
+    console.print("[green]Database schema is up to date.[/green]")
+
+
+def _alembic_config(database_url: str) -> AlembicConfig:
+    from alembic.config import Config as AlembicConfig
+
+    cfg = AlembicConfig(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", database_url)
+    return cfg
+
+
+def _run_alembic_upgrade(database_url: str) -> None:
+    """Bring the database schema up to date via Alembic — the one real
+    schema-migration path this repo has, previously reachable only by
+    running the `alembic` CLI by hand from the repo root (undocumented,
+    and never run automatically by anything `job-agent` itself does).
+    `init_db()` (used everywhere else) creates tables that don't exist
+    yet via `Base.metadata.create_all()`, but never ALTERs an existing
+    table to add a column a later migration introduced — so upgrading
+    this codebase against a database that already has data would
+    otherwise leave the app hitting "no such column" errors at runtime.
+    Real-world production-deployment audit finding: `job-agent init` now
+    runs this automatically, and `job-agent db upgrade` runs it on
+    demand (e.g. after `git pull` brings in a new migration)."""
+    from alembic import command as alembic_command
+
+    alembic_command.upgrade(_alembic_config(database_url), "head")
+
+
+@db_app.command("upgrade")
+def db_upgrade() -> None:
+    """Apply any outstanding Alembic migrations to bring the database
+    schema up to date. Safe to run any time, including on a database
+    that's already current (no-op). Run this after every `git pull` that
+    adds a file under `alembic/versions/`."""
+    cfg = load_config()
+    console.print(f"Upgrading [cyan]{cfg.env.database_url}[/cyan] to the latest schema...")
+    _run_alembic_upgrade(cfg.env.database_url)
+    console.print("[green]Database schema is up to date.[/green]")
+
+
+@db_app.command("current")
+def db_current() -> None:
+    """Show the database's current Alembic revision."""
+    from alembic.runtime.migration import MigrationContext
+
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    with engine.connect() as connection:
+        context = MigrationContext.configure(connection)
+        revision = context.get_current_revision()
+    console.print(f"Database: [cyan]{cfg.env.database_url}[/cyan]")
+    console.print(f"Current revision: [green]{revision or '(none — never migrated)'}[/green]")
 
 
 @profile_app.command("parse")
@@ -353,6 +424,34 @@ def health() -> None:
         raise typer.Exit(code=1)
 
 
+@app.command()
+def doctor() -> None:
+    """Full local-activation diagnostic: Python, dependencies, config,
+    database, candidate profile, preferences, every job source, Anthropic,
+    frontend build, and scheduler readiness — one command that tells you
+    exactly what to fix before your first real search. Never reports
+    network reachability as PASS (this command makes no outbound calls);
+    verify that separately with `job-agent jobs search-run`."""
+    report = run_doctor()
+
+    style = {"PASS": "green", "WARN": "yellow", "ERROR": "red", "UNKNOWN": "cyan"}
+    console.print("[bold]CAREER OS DOCTOR[/bold]\n")
+    for check in report.checks:
+        color = style[check.status]
+        console.print(f"[{color}][{check.status}][/{color}] {check.name}: {check.detail}")
+
+    console.print()
+    if report.has_errors:
+        console.print("[red]One or more ERRORs must be fixed before Career OS can run.[/red]")
+        raise typer.Exit(code=1)
+    if report.worst_status == "WARN":
+        console.print(
+            "[yellow]No blocking errors. Review WARNs above before your first real search.[/yellow]"
+        )
+    else:
+        console.print("[green]All checks passed.[/green]")
+
+
 @app.command(name="dry-run")
 def dry_run() -> None:
     """Confirm the system is in dry-run mode (no submissions possible)."""
@@ -491,6 +590,51 @@ def jobs_match() -> None:
         jobs_matched=len(outcomes),
         semantic_calls=sum(1 for o in outcomes if o.semantic_call_made),
     )
+
+
+@jobs_app.command("search-run")
+def jobs_search_run() -> None:
+    """One end-to-end discovery run (Phase 8): generate a search-query
+    portfolio from the candidate profile, scan every enabled source
+    (query-based sources get the generated queries), mark stale jobs
+    EXPIRED, match everything against the candidate, and record a
+    `SearchRun` row. Equivalent to running `jobs scan` + `jobs match`
+    together, plus query generation and lifecycle sweeping neither of
+    those commands does on their own."""
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    try:
+        profile = parse_candidate_profile(cfg)
+    except CandidateParseError as exc:
+        console.print(f"[red]Failed to parse candidate profile:[/red] {redact_text(str(exc))}")
+        raise typer.Exit(code=1) from exc
+
+    llm = build_llm_provider(cfg)
+
+    with session_factory() as session:
+        candidate_id = save_candidate_profile(session, profile)
+        run = execute_search_run(session, cfg, profile, candidate_id, llm=llm)
+
+    console.print(f"[bold]Search run #{run.id}[/bold] — {run.status}")
+    console.print(f"  Sources scanned: {', '.join(run.sources) or '(none enabled)'}")
+    console.print(f"  Queries used: {len(run.queries)}")
+    console.print(f"  Jobs found: {run.jobs_found}")
+    console.print(f"  Duplicates detected: {run.duplicates_removed}")
+    console.print(f"  Expired jobs swept: {run.expired_removed}")
+    console.print(f"  Qualified (APPLY/REVIEW): {run.qualified}")
+    if run.errors:
+        console.print(f"  [yellow]{len(run.errors)} error(s):[/yellow]")
+        for err in run.errors:
+            console.print(f"    {err}")
+    if not run.sources:
+        console.print(
+            "[yellow]No job source is enabled.[/yellow] Edit config/sources.yaml "
+            "(set enabled: true for greenhouse/lever/remotive/arbeitnow/adzuna) to "
+            "actually discover jobs."
+        )
 
 
 @applications_app.command("prepare")
@@ -749,10 +893,28 @@ def _parse_answer_overrides(answer: list[str] | None) -> dict[str, str]:
 
 
 @dataclass(frozen=True)
+class _LiveBrowserHandle:
+    """Only populated when `_run_browser_preparation(..., keep_session_open
+    =True)` is used — hands the caller the STILL-OPEN session/provider/
+    target/browser so it can keep acting on the exact same live DOM state
+    the snapshot was built from (never re-navigating, never re-filling),
+    instead of the helper closing everything before returning. The caller
+    becomes responsible for calling `.browser.close()` when done — used
+    only by `applications browser-submit`, which needs the live page to
+    still be open in order to click the actual submit control afterward."""
+
+    session: BrowserSession
+    browser: Browser
+    pw_cm: object
+    inspection: ApplicationInspection
+
+
+@dataclass(frozen=True)
 class _BrowserPrepareResult:
     job: JobRow
     snapshot: HumanReviewSnapshot
     unresolved_questions: tuple[str, ...]
+    live: _LiveBrowserHandle | None = None
 
 
 def _run_browser_preparation(
@@ -761,6 +923,8 @@ def _run_browser_preparation(
     application: Application,
     url: str,
     human_input_overrides: dict[str, str],
+    *,
+    keep_session_open: bool = False,
 ) -> _BrowserPrepareResult:
     """The ONE shared discover -> inspect -> evaluate_inspection ->
     get_questions -> generate_answer -> apply_human_input_overrides ->
@@ -768,12 +932,17 @@ def _run_browser_preparation(
     browser-*` command uses — so "prepare" means exactly the same thing
     everywhere it's invoked, never a second, slightly-different
     implementation. Opens exactly ONE fresh browser session, navigates to
-    `url` exactly once, and always closes the browser before returning
-    (or raising). A CAPTCHA/MFA/consent/unrecognized-structure verdict or
+    `url` exactly once. By default (`keep_session_open=False`, every
+    caller except `browser-submit`) always closes the browser before
+    returning; with `keep_session_open=True` the browser is left open and
+    handed back via the result's `live` field — the caller then owns
+    closing it. A CAPTCHA/MFA/consent/unrecognized-structure verdict or
     any other stop condition raises `typer.Exit` directly (code 0 for
     "human review needed, nothing is wrong", code 1 for a real failure)
     rather than returning a sentinel, matching the exact codes this
-    pipeline has always used.
+    pipeline has always used, and always closes the browser first even in
+    the `keep_session_open=True` case (there is nothing left to keep open
+    once the pipeline itself has decided to stop).
 
     NEVER passes `resume_path` to `BrowserApplicationProvider` — a resume
     is never automatically attached by any caller of this helper; see
@@ -811,63 +980,77 @@ def _run_browser_preparation(
 
     snapshot = None
     answers: list[GeneratedAnswer] = []
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        try:
-            # Real-target-readiness checkpoint: resume_path is
-            # DELIBERATELY never passed here. Passing it would make
-            # BrowserApplicationProvider.fill_application() attach the
-            # resume automatically the instant a file field is visible --
-            # with no check for whether that field is even required.
-            # `resume_text` above is still extracted and used for LLM
-            # answer validation (checking a claim against the resume's
-            # actual content), which is unrelated to file upload.
-            # Attaching a resume is a separate, explicit action a human
-            # takes later, not an automatic side effect of this pipeline.
-            provider = BrowserApplicationProvider({job.id: url}, browser=browser)
-            target = provider.discover_application(job)
-            if not target.reachable:
-                console.print(f"[red]Could not reach target:[/red] {target.detail}")
-                raise typer.Exit(code=1)
+    pw_cm = sync_playwright()
+    pw = pw_cm.__enter__()
+    browser = pw.chromium.launch(headless=True)
+    should_close = True
+    try:
+        # Real-target-readiness checkpoint: resume_path is DELIBERATELY
+        # never passed here. Passing it would make BrowserApplicationProvider.
+        # fill_application() attach the resume automatically the instant a
+        # file field is visible -- with no check for whether that field is
+        # even required. `resume_text` above is still extracted and used
+        # for LLM answer validation (checking a claim against the resume's
+        # actual content), which is unrelated to file upload. Attaching a
+        # resume is a separate, explicit action a human takes later, not
+        # an automatic side effect of this pipeline.
+        provider = BrowserApplicationProvider({job.id: url}, browser=browser)
+        target = provider.discover_application(job)
+        if not target.reachable:
+            console.print(f"[red]Could not reach target:[/red] {target.detail}")
+            raise typer.Exit(code=1)
 
-            inspection = provider.inspect_application(job, target)
-            verdict = evaluate_inspection(cfg.rules, inspection)
-            if verdict.human_required:
-                console.print(
-                    f"[yellow]Human review required before filling:[/yellow] "
-                    f"{verdict.reason} — nothing was filled."
-                )
-                raise typer.Exit(code=0)
+        inspection = provider.inspect_application(job, target)
+        verdict = evaluate_inspection(cfg.rules, inspection)
+        if verdict.human_required:
+            console.print(
+                f"[yellow]Human review required before filling:[/yellow] "
+                f"{verdict.reason} — nothing was filled."
+            )
+            raise typer.Exit(code=0)
 
-            questions = provider.get_questions(job)
-            answers = [
-                generate_answer(q, profile, resume_text, answer_bank, llm)
-                for q in questions
-            ]
-            answers = apply_human_input_overrides(answers, human_input_overrides)
-            applied_labels = {
-                a.question for a in answers if a.source.startswith(HUMAN_INPUT_SOURCE_PREFIX)
-            }
-            for label in set(human_input_overrides) - applied_labels:
-                console.print(
-                    f"[yellow]--answer {label!r} was not applied[/yellow] — either no "
-                    "question on this form has that exact text, or it was already "
-                    "resolved (a trusted fact/answer-bank/LLM answer is never overridden)."
-                )
+        questions = provider.get_questions(job)
+        answers = [
+            generate_answer(q, profile, resume_text, answer_bank, llm)
+            for q in questions
+        ]
+        answers = apply_human_input_overrides(answers, human_input_overrides)
+        applied_labels = {
+            a.question for a in answers if a.source.startswith(HUMAN_INPUT_SOURCE_PREFIX)
+        }
+        for label in set(human_input_overrides) - applied_labels:
+            console.print(
+                f"[yellow]--answer {label!r} was not applied[/yellow] — either no "
+                "question on this form has that exact text, or it was already "
+                "resolved (a trusted fact/answer-bank/LLM answer is never overridden)."
+            )
+        live: _LiveBrowserHandle | None = None
+        if keep_session_open:
+            _, browser_session = provider.fill_application_keep_session_open(
+                job, target, answers
+            )
+            snapshot = provider.get_snapshot(job.id)
+            live = _LiveBrowserHandle(
+                session=browser_session, browser=browser, pw_cm=pw_cm, inspection=inspection,
+            )
+            should_close = False
+        else:
             provider.fill_application(job, target, answers)
             snapshot = provider.get_snapshot(job.id)
-        except ProviderError as exc:
-            console.print(f"[red]Provider error:[/red] {redact_text(str(exc))}")
-            raise typer.Exit(code=1) from exc
-        finally:
+    except ProviderError as exc:
+        console.print(f"[red]Provider error:[/red] {redact_text(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if should_close:
             browser.close()
+            pw_cm.__exit__(None, None, None)
 
     if snapshot is None:
         console.print("[red]No snapshot was produced.[/red]")
         raise typer.Exit(code=1)
     unresolved_questions = tuple(a.question for a in answers if a.requires_human)
     return _BrowserPrepareResult(
-        job=job, snapshot=snapshot, unresolved_questions=unresolved_questions
+        job=job, snapshot=snapshot, unresolved_questions=unresolved_questions, live=live
     )
 
 
@@ -1137,10 +1320,251 @@ def applications_browser_fill(
     render_snapshot(result.snapshot, console)
     console.print(
         "\n[bold yellow]STOPPED BEFORE SUBMISSION.[/bold yellow] Nothing above was ever "
-        "transmitted anywhere. Automated submission is structurally unavailable — "
-        "BrowserApplicationProvider.submit() always refuses. Review the fields above "
-        "manually on the real site before doing anything further."
+        "transmitted anywhere. BrowserApplicationProvider.submit() itself always refuses; "
+        "the only path to a real submission is a SEPARATE, explicitly-approved "
+        "`applications browser-submit` run — see that command's own safety boundary. "
+        "Review the fields above manually before deciding what to do next."
     )
+
+
+@applications_app.command("browser-submit")
+def applications_browser_submit(
+    application_id: int = typer.Argument(..., help="Application id to submit."),
+    url: str = typer.Option(
+        ..., "--url", help="Exact application-form URL — must match this application's "
+        "job's own application_url exactly.",
+    ),
+    answer: list[str] | None = typer.Option(  # noqa: B008
+        None, "--answer",
+        help="The SAME --answer value(s) used at the (SEPARATE, later) `browser-approve` "
+        "run made specifically for this submission — must reproduce the identical prepared "
+        "state, or the freshly-computed snapshot fingerprint won't match and this command "
+        "will refuse.",
+    ),
+    confirm: bool = typer.Option(
+        False, "--confirm",
+        help="Launch a browser, re-inspect and re-fill the form, and show exactly what "
+        "would be submitted; without this, makes no network call at all. This alone does "
+        "NOT authorize a click — see --confirm-submit.",
+    ),
+    confirm_submit: bool = typer.Option(
+        False, "--confirm-submit",
+        help="The ONLY flag that authorizes the actual submit click. Requires --confirm "
+        "too. Without this flag, the command stops after showing the final confirmation "
+        "and clicks nothing.",
+    ),
+) -> None:
+    """The ONLY command in this codebase that can click a real application
+    submit control. Requires its OWN, SEPARATE `applications browser-approve`
+    run (never the same approval `browser-fill` already consumed — approvals
+    are single-use) bound to this application's exact job content and exact
+    freshly-prepared snapshot fingerprint, computed by a FRESH re-inspection
+    and re-fill this command performs itself, in one continuous browser
+    session, immediately before looking for the submit control — so the
+    exact DOM state that was fingerprint-checked is the exact DOM state
+    the click happens against, never a stale or separately-observed one.
+
+    Before ever considering a click: refuses if this application already
+    has a recorded successful submission (`Application.submitted_at`,
+    checked before any network call at all — no duplicate submission,
+    ever); refuses if any question is still unresolved; refuses if the
+    fresh re-inspection shows CAPTCHA/MFA/a password field/an unrecognized
+    structure (exactly like every other browser-* command); refuses if no
+    valid, unexpired, unconsumed approval matches the fresh fingerprint;
+    refuses if the intended submit control cannot be identified with high
+    confidence — zero candidates, more than one plausible candidate, or a
+    disabled candidate are all refusals, never a guess (see
+    `job_agent.applications.browser.submit_control`).
+
+    Passing --confirm alone runs every check above and prints the full
+    "APPLICATION SUBMISSION" confirmation (fields with provenance,
+    resume state, approval status, security posture) WITHOUT clicking
+    anything — the click itself requires the separate --confirm-submit
+    flag, which this command never infers from --confirm.
+
+    Once clicked, the approval is immediately consumed (single-use, no
+    retry — a second `browser-submit` run requires a brand new
+    `browser-approve`), then this command collects only what is ACTUALLY
+    observable afterward (a confirmation phrase, a navigated URL, the
+    form's own fields disappearing — see `job_agent.applications.browser.
+    submission_evidence`) — "the click did not raise an exception" is
+    never treated as "the application was submitted". Inconclusive
+    evidence is recorded as BROWSER_SUBMIT_UNCERTAIN and reported as
+    such, never silently upgraded to success and never automatically
+    retried.
+    """
+    human_input_overrides = _parse_answer_overrides(answer)
+    if not confirm:
+        console.print(
+            "[yellow]No action taken.[/yellow] Pass --confirm to actually contact "
+            f"{url} and review application {application_id} for submission "
+            "(--confirm-submit is required separately to actually click)."
+        )
+        raise typer.Exit(code=0)
+
+    cfg = load_config()
+    engine = get_engine(cfg.env.database_url)
+    init_db(engine)
+    session_factory = get_session_factory(engine)
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        if application is None:
+            console.print(f"[red]No application with id {application_id}.[/red]")
+            raise typer.Exit(code=1)
+
+        # Step 10: duplicate-submission protection, checked before any
+        # network call at all — the cheapest, earliest possible refusal.
+        if application.submitted_at is not None:
+            console.print(
+                f"[red]Application {application_id} already has a recorded submission "
+                f"({application.submitted_at.isoformat()}).[/red] Refusing to submit again."
+            )
+            raise typer.Exit(code=1)
+
+        result = _run_browser_preparation(
+            cfg, session, application, url, human_input_overrides, keep_session_open=True,
+        )
+        assert result.live is not None  # keep_session_open=True always populates this
+        live = result.live
+
+        try:
+            if result.unresolved_questions:
+                console.print(
+                    f"[red]Application {application_id} still has question(s) requiring "
+                    "human input:[/red]"
+                )
+                for question in result.unresolved_questions:
+                    console.print(f"    ? {question}")
+                console.print("Refusing to submit an incomplete application.")
+                raise typer.Exit(code=1)
+
+            posting_fingerprint = result.job.job_fingerprint
+            answer_fingerprint = compute_snapshot_fingerprint(result.snapshot)
+            approval = get_valid_approval(
+                session, application.id, posting_fingerprint, answer_fingerprint
+            )
+            if approval is None:
+                console.print(
+                    "[red]No valid approval matches the current prepared state.[/red]\n"
+                    "This means at least one of: no approval exists yet for THIS "
+                    "submission, it expired, it was already consumed by an earlier "
+                    "browser-fill or browser-submit run, it was revoked, or the "
+                    "form/answers changed since approval. Approvals are single-use and "
+                    "never shared between browser-fill and browser-submit — run "
+                    "`applications browser-approve` again (with the same --answer values) "
+                    "specifically before submitting, then re-run this command."
+                )
+                raise typer.Exit(code=1)
+
+            control_result = find_submit_control(live.session)
+            if control_result.control is None:
+                console.print(
+                    f"[red]Cannot identify the submit control with confidence:[/red] "
+                    f"{control_result.reason} HUMAN_REQUIRED — nothing was clicked."
+                )
+                raise typer.Exit(code=1)
+
+            render_snapshot(result.snapshot, console)
+            console.print("\n[bold]APPLICATION SUBMISSION[/bold]")
+            console.print(f"  Company: {result.job.company_name}")
+            console.print(f"  Role: {result.job.title}")
+            console.print(f"  URL: {url}")
+            console.print("\n  Resume:")
+            if result.snapshot.uploaded_files:
+                for uploaded in result.snapshot.uploaded_files:
+                    console.print(f"    {uploaded.filename} (attached)")
+            else:
+                console.print("    Not attached")
+            console.print("\n  Approval:")
+            console.print(f"    Application ID: {application.id}")
+            console.print(f"    Job fingerprint: {posting_fingerprint}")
+            console.print(f"    Snapshot fingerprint: {answer_fingerprint}")
+            console.print(f"    Approval: VALID (id {approval.id}, single-use)")
+            console.print("\n  Security (this fresh re-inspection):")
+            console.print(
+                f"    CAPTCHA: {'DETECTED' if live.inspection.captcha_detected else 'NOT DETECTED'}"
+            )
+            console.print(
+                f"    MFA: {'DETECTED' if live.inspection.mfa_detected else 'NOT DETECTED'}"
+            )
+            console.print(
+                "    Form structure (incl. password fields/unexpected controls): "
+                + ("RECOGNIZED" if live.inspection.structure_recognized else "NOT RECOGNIZED")
+            )
+            console.print(f"\n  Submit control identified: {control_result.control.label!r}")
+
+            if not confirm_submit:
+                console.print(
+                    "\n[yellow]Pass --confirm-submit to actually click and submit.[/yellow] "
+                    "Nothing was submitted."
+                )
+                raise typer.Exit(code=0)
+
+            pre_submit_url = live.session.current_url
+            live.session.click_submit_control(control_result.control.selector)
+
+            # Fail closed the instant the actual, irreversible submission
+            # action is performed — the approval is consumed HERE,
+            # regardless of what evidence collection below finds, so a
+            # crash/timeout during evidence collection can never leave a
+            # still-valid, replayable approval sitting around (Step 7/10).
+            consume_approval(session, approval)
+            session.commit()
+
+            evidence = collect_post_submit_evidence(
+                live.session, pre_submit_url=pre_submit_url, filled_snapshot=result.snapshot,
+            )
+            if evidence is not None:
+                shape = validate_browser_submission_evidence(evidence)
+                application.submitted_at = evidence.submitted_at
+                application.confirmation_id = evidence.confirmation_id
+                application.confirmation_url = evidence.confirmation_url
+                application.confirmation_text = evidence.confirmation_text
+                record_event(
+                    session, application.id, "BROWSER_SUBMIT_COMPLETED",
+                    {
+                        "approval_id": approval.id,
+                        "posting_fingerprint": posting_fingerprint,
+                        "snapshot_fingerprint": answer_fingerprint,
+                        "confirmation_url": evidence.confirmation_url,
+                        "confirmation_text": evidence.confirmation_text,
+                        "evidence_shape_valid": shape.valid,
+                    },
+                )
+                session.commit()
+                console.print("\n[bold green]COMPLETED[/bold green] — submission evidence:")
+                if evidence.confirmation_url:
+                    console.print(f"  Confirmation URL: {evidence.confirmation_url}")
+                if evidence.confirmation_text:
+                    console.print(f"  Confirmation text: {evidence.confirmation_text!r}")
+                if not shape.valid:
+                    console.print(
+                        f"[yellow]Note: evidence shape check flagged: "
+                        f"{'; '.join(shape.reasons)}[/yellow]"
+                    )
+            else:
+                record_event(
+                    session, application.id, "BROWSER_SUBMIT_UNCERTAIN",
+                    {
+                        "approval_id": approval.id,
+                        "posting_fingerprint": posting_fingerprint,
+                        "snapshot_fingerprint": answer_fingerprint,
+                        "reason": "insufficient post-click evidence to confirm success",
+                    },
+                )
+                session.commit()
+                console.print(
+                    "\n[bold yellow]UNKNOWN / HUMAN_REQUIRED[/bold yellow] — the submit "
+                    "control was clicked, but there is not enough evidence in the "
+                    "resulting page to confirm the application was actually received. "
+                    "The approval has been consumed (no retry) — verify manually on the "
+                    "real site before doing anything further."
+                )
+                raise typer.Exit(code=1)
+        finally:
+            live.browser.close()
+            live.pw_cm.__exit__(None, None, None)  # type: ignore[attr-defined]
 
 
 @applications_app.command("run")
@@ -1496,8 +1920,55 @@ def allowlist_list() -> None:
 
 
 @app.command()
-def dashboard() -> None:
-    _not_implemented("Phase 7 (Dashboard)")
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address for the web dashboard."),
+    port: int = typer.Option(8000, "--port", help="Port for the web dashboard."),
+    reload: bool = typer.Option(
+        False, "--reload", help="Auto-reload on source changes (development only)."
+    ),
+    scheduler: bool = typer.Option(
+        True,
+        "--scheduler/--no-scheduler",
+        help="Run the autonomous scheduled search (Phase 11) alongside the dashboard. "
+        "Frequency comes from each candidate's Settings page (search_frequency_hours, "
+        "default 24h) — never fires more often than that, whatever this poll interval is.",
+    ),
+) -> None:
+    """Launch the Career OS web dashboard (Phase 7) — a FastAPI server
+    exposing the exact same candidate/job/matching/pipeline services every
+    other command here already uses (`job_agent.web.app`), plus the built
+    frontend if `web-ui/dist` exists (`cd web-ui && npm run build`).
+    During frontend development, run `npm run dev` in `web-ui/` separately
+    (it proxies API calls to this server) instead of relying on the built
+    `dist/` bundle here."""
+    import uvicorn
+
+    # A cloud deployment's start command is the ONLY thing that runs on
+    # every redeploy — there is no separate interactive step to run
+    # `job-agent init`/`db upgrade` first. Bringing the schema up to date
+    # here (idempotent, safe no-op when already current) is what makes
+    # "push new code with a new alembic/versions/ migration" work without
+    # a manual extra step on the deployment platform.
+    cfg = load_config()
+    console.print("Ensuring database schema is up to date...")
+    _run_alembic_upgrade(cfg.env.database_url)
+
+    console.print(
+        f"[green]Career OS dashboard starting at[/green] http://{host}:{port} "
+        "(Ctrl+C to stop)"
+    )
+
+    background_scheduler = None
+    if scheduler:
+        background_scheduler = build_scheduler(cfg)
+        background_scheduler.start()
+        console.print("[green]Autonomous scheduled search enabled.[/green]")
+
+    try:
+        uvicorn.run("job_agent.web.app:app", host=host, port=port, reload=reload)
+    finally:
+        if background_scheduler is not None:
+            background_scheduler.shutdown(wait=False)
 
 
 if __name__ == "__main__":

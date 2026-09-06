@@ -16,3 +16,5 @@ htmlcov/
 dist/
 build/
 *.log
+node_modules/
+web-ui/dist/

@@ -97,11 +97,20 @@ class BoardIdentifier(StrictModel):
 
 class SourceConfig(StrictModel):
     enabled: bool = False
-    kind: Literal["ats_api", "scrape", "restricted"] = "restricted"
+    kind: Literal["ats_api", "search_api", "scrape", "restricted"] = "restricted"
     poll_interval_minutes: int | None = None
     rate_limit_per_minute: int | None = None
     notes: str = ""
     boards: list[BoardIdentifier] = Field(default_factory=list)
+    # search_api sources only (Phase 8's Remotive/Arbeitnow/Adzuna
+    # adapters) — ISO 3166-1 alpha-2 country codes to query, e.g. ["gb",
+    # "in", "sg"]. Ignored by ats_api/scrape/restricted sources.
+    countries: list[str] = Field(default_factory=list)
+    # Maximum queries from the candidate's generated search-query
+    # portfolio (job_agent.jobs.query_generator) to actually issue per
+    # scan for this source — bounds request volume/cost regardless of
+    # how large the portfolio grows.
+    max_queries: int = 3
 
 
 class GlobalLimits(StrictModel):
@@ -126,9 +135,12 @@ class AutomationSettings(StrictModel):
 
 
 class MatchingThresholds(StrictModel):
-    auto_apply_threshold: int = Field(ge=0, le=100, default=90)
-    review_threshold: int = Field(ge=0, le=100, default=80)
-    save_threshold: int = Field(ge=0, le=100, default=70)
+    # Matching Engine V2 recalibration — see config/automation.yaml's
+    # `matching` block for the full rationale. These are fallback
+    # defaults only; production is always driven by automation.yaml.
+    auto_apply_threshold: int = Field(ge=0, le=100, default=85)
+    review_threshold: int = Field(ge=0, le=100, default=65)
+    save_threshold: int = Field(ge=0, le=100, default=50)
     semantic_blend_weight: float = Field(ge=0.0, le=1.0, default=0.4)
 
 
@@ -139,11 +151,16 @@ class FreshnessSettings(StrictModel):
 
 
 class PriorityWeights(StrictModel):
-    match: float = 0.50
-    freshness: float = 0.20
+    match: float = 0.45
+    freshness: float = 0.15
     career_value: float = 0.15
     company_fit: float = 0.10
     application_ease: float = 0.05
+    # CAREER OS FINAL GOD MODE Part 1.1 — a bounded nudge from repeated
+    # save/apply behavior (job_agent.candidate.learning), never large
+    # enough on its own to turn a weak match into a strong one or
+    # override a hard-stop exclusion the matcher already applied.
+    behavioral_fit: float = 0.10
 
 
 class ScoringWeights(StrictModel):

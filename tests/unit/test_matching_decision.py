@@ -26,8 +26,19 @@ def test_apply_above_auto_threshold_with_semantic():
     assert decide(scored, THRESHOLDS) == Decision.APPLY
 
 
-def test_capped_to_review_without_semantic_even_above_auto_threshold():
-    scored = _scored(overall_score=95, semantic_available=False)
+def test_capped_to_review_without_high_confidence_evidence_even_above_auto_threshold():
+    """Matching Engine V2 (audit item H) rewrote WHY this caps to REVIEW.
+    The old rule was "no semantic call was made -> always REVIEW,
+    regardless of evidence" — which would have made APPLY permanently
+    unreachable for a deterministic-only deployment (production has no
+    LLM configured at all). The new rule instead looks at the actual
+    deterministic evidence: role_match=50/specific_matched_count=0 here
+    is genuinely ambiguous (no clear primary-tier role-family match, no
+    confirmed domain-specific skill), so it stays capped to REVIEW on
+    the merits — not because semantic didn't run. See
+    tests/unit/test_matching_v2.py's test_23/23b/23c for the
+    deterministic-only-CAN-reach-APPLY side of this same change."""
+    scored = _scored(overall_score=95, semantic_available=False, specific_matched_count=0)
     assert decide(scored, THRESHOLDS) == Decision.REVIEW
 
 

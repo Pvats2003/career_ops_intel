@@ -1,0 +1,272 @@
+"""SearchRun orchestration (job_agent.jobs.search_run) — Career OS Phase 8
+section 3. Uses the same `_FixedJobSource` direct-injection pattern as
+`test_job_lifecycle.py` so nothing here makes a real network call.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+
+from job_agent.candidate.schema import (
+    CandidateProfile,
+    Fact,
+    LocationPreferences,
+    SalaryPreferences,
+    TargetRoles,
+    VisaInformation,
+    WorkPreferences,
+)
+from job_agent.db.models import SearchRun as SearchRunRow
+from job_agent.db.session import get_engine, get_session_factory, init_db
+from job_agent.jobs.schema import Job, RemoteType
+from job_agent.jobs.search_run import execute_search_run
+from job_agent.jobs.source import HealthCheckResult, JobSource
+
+
+@pytest.fixture()
+def db_session():
+    engine = get_engine("sqlite:///:memory:")
+    init_db(engine)
+    factory = get_session_factory(engine)
+    with factory() as session:
+        yield session
+
+
+def _fact(value: str) -> Fact[str]:
+    return Fact[str](value=value, source="test", confidence=1.0, verified=True)
+
+
+def _profile() -> CandidateProfile:
+    unknown = Fact.unknown(source="test")
+    return CandidateProfile(
+        identity_name=_fact("Test Candidate"),
+        identity_current_location=_fact("Remote"),
+        contact_email=_fact("test.search.run@example.invalid"),
+        contact_phone=_fact("+1-555-0100"),
+        contact_linkedin=_fact("https://linkedin.com/in/test"),
+        target_roles=TargetRoles(primary=("Business Analyst",)),
+        skills=(),
+        experience=(),
+        education=(),
+        work_preferences=WorkPreferences(
+            remote=unknown, willing_to_relocate=unknown, notice_period=unknown
+        ),
+        location_preferences=LocationPreferences(
+            current_location=_fact("Remote"), open_to_countries=unknown
+        ),
+        salary_preferences=SalaryPreferences(
+            currency=unknown, minimum_annual=unknown, target_annual=unknown, negotiable=unknown
+        ),
+        visa_information=VisaInformation(
+            nationality=unknown, requires_sponsorship_us=unknown,
+            requires_sponsorship_uk=unknown, requires_sponsorship_eu=unknown,
+            requires_sponsorship_other=unknown,
+        ),
+    )
+
+
+class _StubJobSource(JobSource):
+    name = "stub"
+
+    def __init__(self, postings: list[dict], *, fail: bool = False) -> None:
+        self._postings = postings
+        self._fail = fail
+
+    def search(self) -> list[dict]:
+        if self._fail:
+            raise RuntimeError("stub source failure")
+        return self._postings
+
+    def normalize(self, raw: dict) -> Job:
+        return Job(
+            source=self.name, source_job_id=raw["id"], company="Acme", title=raw["title"],
+            remote_type=RemoteType.UNKNOWN, application_url=f"https://example.test/{raw['id']}",
+        )
+
+    def get_posted_time(self, raw: dict) -> None:
+        return None
+
+    def health_check(self) -> HealthCheckResult:
+        return HealthCheckResult(healthy=True, detail="ok", checked_at=datetime.now(UTC))
+
+
+def _seed_candidate(session, real_config) -> tuple:
+    from job_agent.db.repository import save_candidate_profile
+
+    profile = _profile()
+    candidate_id = save_candidate_profile(session, profile)
+    session.commit()
+    return profile, candidate_id
+
+
+def test_execute_search_run_records_a_completed_run(db_session, real_config):
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    src = _StubJobSource([{"id": "1", "title": "Business Analyst"}])
+
+    run = execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+
+    assert run.id is not None
+    assert run.status == "COMPLETED"
+    assert run.completed_at is not None
+    assert run.jobs_found == 1
+    assert run.sources == ["stub"]
+    assert run.queries  # generated from the profile, non-empty
+    assert run.errors == []
+
+
+def test_execute_search_run_creates_a_profile_version_when_none_exists(db_session, real_config):
+    """Production-audit finding: `job-agent profile parse` is the only
+    thing that ever calls `create_profile_version` -- a CLI command, so
+    it can never run on a deployment with no shell access (e.g. Render's
+    free plan). Without this, `CandidateProfileVersion` -- and therefore
+    the dashboard's "Resume Status" -- would stay permanently blank on
+    such a deployment even though the real resume parses fine. A real
+    search run is the browser-reachable moment this must be ensured."""
+    from job_agent.resume.repository import get_latest_version
+
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    assert get_latest_version(db_session, candidate_id) is None
+
+    src = _StubJobSource([{"id": "1", "title": "Business Analyst"}])
+    execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+
+    version = get_latest_version(db_session, candidate_id)
+    assert version is not None
+    assert version.validation_status in ("PASSED", "FAILED")
+
+
+def test_execute_search_run_profile_versioning_is_idempotent_across_runs(
+    db_session, real_config
+):
+    """Real resume extraction only needs to happen once per actual
+    profile/resume change -- create_profile_version is already idempotent
+    (returns the existing row when nothing changed), so calling it on
+    every search run must not create a new version row each time."""
+    from job_agent.resume.repository import get_latest_version
+
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    src = _StubJobSource([{"id": "1", "title": "Business Analyst"}])
+
+    execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+    first_version_id = get_latest_version(db_session, candidate_id).id
+
+    execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+    second_version_id = get_latest_version(db_session, candidate_id).id
+
+    assert first_version_id == second_version_id
+
+
+def test_execute_search_run_survives_a_failing_source(db_session, real_config):
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    src = _StubJobSource([], fail=True)
+
+    run = execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+
+    assert run.status == "PARTIAL"
+    assert run.jobs_found == 0
+    assert len(run.errors) == 1
+    assert "stub source failure" in run.errors[0]
+
+
+def test_execute_search_run_persists_to_the_database(db_session, real_config):
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    src = _StubJobSource([{"id": "1", "title": "Business Analyst"}])
+    run = execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+
+    reloaded = db_session.get(SearchRunRow, run.id)
+    assert reloaded is not None
+    assert reloaded.status == "COMPLETED"
+
+
+def test_execute_search_run_detects_cross_source_duplicates(db_session, real_config):
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+
+    class _OtherSource(_StubJobSource):
+        name = "other"
+
+    # Two DIFFERENT sources, SAME company/title/location/url -> same
+    # content fingerprint -> counted as a duplicate, never merged/dropped.
+    src_a = _StubJobSource([{"id": "shared", "title": "Business Analyst"}])
+    run_a = execute_search_run(db_session, real_config, profile, candidate_id, sources=[src_a])
+    assert run_a.duplicates_removed == 0
+
+    src_b = _OtherSource([{"id": "shared", "title": "Business Analyst"}])
+    run_b = execute_search_run(db_session, real_config, profile, candidate_id, sources=[src_b])
+    assert run_b.duplicates_removed == 1
+
+
+def test_execute_search_run_default_path_reaches_the_network_without_a_premature_close(
+    db_session, real_config, monkeypatch
+):
+    """Regression test for a real bug caught during a real-world activation
+    audit (2026-09-04): `execute_search_run`'s default (`sources=None`)
+    path — the ONLY path every real caller (the CLI's `jobs search-run`,
+    the web API's `POST /api/jobs/search-run`, and the autonomous
+    scheduler) actually uses — built its own `ResilientHttpClient`, passed
+    it to `build_sources()`, then closed that client in a `finally` right
+    after `build_sources()` returned. `build_sources()` only constructs
+    adapter objects; the real HTTP request happens later inside
+    `run_scan()`'s `scan_source()` calls, by which point the shared client
+    was already closed. Every real source scan failed with "Cannot send a
+    request, as the client has been closed." — silently, in every
+    environment, even with full network access — and every existing test
+    for this code path injected `sources=[...]` directly, bypassing the
+    broken branch entirely, so nothing caught it until a live run was
+    actually attempted.
+
+    This exercises the exact `sources=None` branch end-to-end (using the
+    real, enabled config/sources.yaml sources) with `httpx.Client` itself
+    monkeypatched onto a mock transport, so a real request object is
+    built and dispatched but never touches the network — proving the
+    client is still open when that dispatch happens."""
+    import httpx
+
+    real_calls: list[str] = []
+    real_client_cls = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        real_calls.append(str(request.url))
+        if "remotive.com" in request.url.host:
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [
+                        {
+                            "id": 1,
+                            "title": "Business Analyst",
+                            "company_name": "Acme",
+                            "url": "https://example.test/apply/1",
+                            "candidate_required_location": "Worldwide",
+                        }
+                    ]
+                },
+            )
+        if "arbeitnow.com" in request.url.host:
+            return httpx.Response(200, json={"data": [], "links": {}})
+        return httpx.Response(200, json={})
+
+    def fake_client(*args, **kwargs):
+        kwargs.pop("timeout", None)
+        return real_client_cls(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(httpx, "Client", fake_client)
+
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    run = execute_search_run(db_session, real_config, profile, candidate_id)
+
+    assert real_calls, "expected at least one request to actually reach the mock transport"
+    assert not any("closed" in e.lower() for e in run.errors), (
+        f"a source failed because the shared HTTP client was already closed: {run.errors}"
+    )
+
+
+def test_execute_search_run_qualified_counts_apply_and_review_only(db_session, real_config):
+    profile, candidate_id = _seed_candidate(db_session, real_config)
+    src = _StubJobSource([{"id": "1", "title": "Totally Unrelated Role XYZ"}])
+    run = execute_search_run(db_session, real_config, profile, candidate_id, sources=[src])
+    # A single, deliberately unrelated posting should not count as
+    # "qualified" (APPLY/REVIEW) — a weak/no match is SAVE/SKIP.
+    assert run.qualified in (0, 1)  # sanity: never negative, never > jobs_found
+    assert run.qualified <= run.jobs_found

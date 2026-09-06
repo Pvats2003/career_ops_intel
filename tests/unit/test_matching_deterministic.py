@@ -88,6 +88,97 @@ def test_seniority_boost_for_junior_keywords(real_profile, real_config):
     assert result.seniority_match == 90
 
 
+# --- Matching Engine V3 calibration fix C: bare "Manager" no longer
+# auto-hard-stops; explicit seniority markers and named compound
+# "<Function> Manager" titles still do. -----------------------------------
+
+
+def test_seniority_bare_product_manager_is_not_hard_stopped(real_profile, real_config):
+    """The core fix: "Product Manager" is this candidate's own, literal
+    primary target-role title (config/profile.yaml) with no seniority
+    qualifier — it must never hard-stop into HUMAN_REQUIRED merely
+    because "manager" is a substring of it."""
+    job = _job(
+        title="Product Manager",
+        description="Own the product roadmap for our early-stage product team.",
+        requirements="1-2 years product experience preferred.",
+    )
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" not in result.hard_stop_reasons
+    assert result.seniority_match >= 50  # neutral, not penalized to 15
+
+
+def test_seniority_bare_business_analyst_is_not_hard_stopped(real_profile, real_config):
+    job = _job(title="Business Analyst", description="Requirements gathering and SQL analysis.")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" not in result.hard_stop_reasons
+
+
+def test_seniority_senior_product_manager_still_hard_stops(real_profile, real_config):
+    job = _job(title="Senior Product Manager", description="Lead our flagship product line.")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_lead_product_manager_still_hard_stops(real_profile, real_config):
+    job = _job(title="Lead Product Manager")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_director_of_product_still_hard_stops(real_profile, real_config):
+    job = _job(title="Director of Product")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_head_of_product_still_hard_stops(real_profile, real_config):
+    job = _job(title="Head of Product")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_vp_product_still_hard_stops(real_profile, real_config):
+    job = _job(title="VP of Product")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_chief_product_officer_still_hard_stops(real_profile, real_config):
+    job = _job(title="Chief Product Officer")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_engineering_manager_still_hard_stops(real_profile, real_config):
+    """A compound functional-manager title the candidate never targets —
+    fix C preserves this exactly as the audit required."""
+    job = _job(title="Engineering Manager", description="Manage a team of backend engineers.")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_marketing_manager_still_hard_stops(real_profile, real_config):
+    job = _job(title="Marketing Manager")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_finance_manager_still_hard_stops(real_profile, real_config):
+    job = _job(title="Finance Manager")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert "seniority_mismatch" in result.hard_stop_reasons
+
+
+def test_seniority_associate_product_manager_unaffected_by_fix_c(real_profile, real_config):
+    """Already correctly recognized as junior via "associate" before this
+    fix — must remain unaffected."""
+    job = _job(title="Associate Product Manager")
+    result = compute_deterministic_match(real_profile, real_config.profile, job)
+    assert result.seniority_match == 90
+    assert "seniority_mismatch" not in result.hard_stop_reasons
+
+
 def test_eligibility_hard_stop_when_visa_unknown(real_profile, real_config):
     job = _job(description="Must be authorized to work in the United States without sponsorship.")
     result = compute_deterministic_match(real_profile, real_config.profile, job)
