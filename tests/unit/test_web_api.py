@@ -773,8 +773,10 @@ def test_dashboard_summary_column_projection_introduces_no_new_queries(
     # > 10 so the pre-existing, already-accepted `_application_for()` loop
     # over `top_out` (bounded to `limit=10` ranked jobs) is pinned at 10
     # regardless of job_count -- the genuinely job-count-independent
-    # bound this test is actually checking.
-    job_count = 20
+    # bound this test is actually checking. Comfortably above the flat
+    # SQL-aggregate query count (a handful of COUNT/GROUP BY statements
+    # plus the bounded top_out lookups) so the margin isn't coincidental.
+    job_count = 50
     for i in range(job_count):
         job_id = _seed_job(db_path, fingerprint=f"col-proj-{i}")
         _seed_match(db_path, job_id, candidate_id, overall_score=90, decision="APPLY")
@@ -788,6 +790,182 @@ def test_dashboard_summary_column_projection_introduces_no_new_queries(
         f"expected a bounded total SELECT count regardless of job count "
         f"({job_count}), got {counts['n']} -- looks like the column "
         f"projection introduced a hidden per-row lazy load"
+    )
+
+
+def test_dashboard_summary_counts_unmatched_jobs_correctly(tmp_path, monkeypatch, real_config):
+    """Dashboard performance forensic fix, round 4 (SQL-aggregate counters):
+    a job with no `JobMatch` row at all must still contribute to the
+    all-time `total_jobs_discovered` count, but must never contribute to
+    `jobs_scored`/`qualified_matches`/`high_confidence_matches`/
+    `apply_priority_count` -- exactly the old "iterate every job, look up
+    its match, skip counting if the match is None" behavior, now computed
+    via `_decision_counts_all_time`'s GROUP BY instead of a Python loop."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    _seed_job(db_path, fingerprint="unmatched-1")
+    _seed_job(db_path, fingerprint="unmatched-2")
+    matched_id = _seed_job(db_path, fingerprint="matched-1")
+    _seed_match(db_path, matched_id, candidate_id, overall_score=90, decision="APPLY")
+
+    r = client.get("/api/dashboard/summary")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_jobs_discovered"] == 3
+    assert body["jobs_scored"] == 1
+    assert body["qualified_matches"] == 1
+    assert body["job_matches"] == 1
+    assert body["high_confidence_matches"] == 1
+    assert body["apply_priority_count"] == 1
+
+
+def test_dashboard_summary_counters_never_fetch_historical_job_rows(
+    tmp_path, monkeypatch, real_config
+):
+    """Row-materialization proof (the exact bottleneck this fix removes):
+    the all-time counters must be computable via SQL aggregation alone --
+    never by an unfiltered `SELECT ... FROM jobs` that would materialize
+    every historical `Job` row (CLOSED ones included) just to count them.
+    Scoped precisely to that pattern -- a bare COUNT(*)/aggregate is fine
+    (no row materialization), and a `WHERE jobs.id IN (...)` fetch bounded
+    by an explicit id list (e.g. the pre-existing, out-of-scope
+    `matched_jobs_with_applications` lookup behind learned-preferences)
+    is fine too, since it scales with matched/applied jobs, not with
+    total historical job count -- only a WHERE-less scan of the whole
+    table is the thing this fix must have eliminated."""
+    import re
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    closed_id = _seed_job(db_path, fingerprint="hist-closed", lifecycle_status="CLOSED")
+    _seed_match(db_path, closed_id, candidate_id, overall_score=95, decision="APPLY")
+    active_id = _seed_job(db_path, fingerprint="hist-active", lifecycle_status="ACTIVE")
+    _seed_match(db_path, active_id, candidate_id, overall_score=90, decision="APPLY")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    unfiltered_full_table_fetches: list[str] = []
+
+    def _capture(conn, cursor, statement, *args):
+        upper = statement.upper()
+        if (
+            re.search(r"FROM\s+jobs\b", statement, re.IGNORECASE)
+            and "WHERE" not in upper
+            and "COUNT(" not in upper
+        ):
+            unfiltered_full_table_fetches.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        r = client.get("/api/dashboard/summary")
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_jobs_discovered"] == 2
+    assert body["qualified_matches"] == 2
+
+    assert not unfiltered_full_table_fetches, (
+        f"expected zero unfiltered, whole-table `jobs` SELECTs -- a CLOSED "
+        f"job's row must never be materialized just to count it; got:\n"
+        f"{unfiltered_full_table_fetches}"
+    )
+
+
+def test_dashboard_summary_query_count_independent_of_historical_job_count(
+    tmp_path, monkeypatch, real_config
+):
+    """Row-scaling regression (the exact forensic finding this fix
+    addresses): dashboard_summary()'s SQL statement count must be
+    identical at 100, 600, and 1200 total historical jobs -- proving the
+    counters are computed via SQL aggregation, never by fetching and
+    iterating every historical Job row into Python. Before this fix, the
+    query count was already flat (an earlier N+1 fix batched match
+    lookups), yet wall-clock time still scaled linearly with row count
+    (68ms at 600 jobs, 674ms at 6000, locally) because the full jobs
+    table was still being fetched and deserialized into ORM objects on
+    every request. This test only proves the query-count side of that;
+    the wall-clock side is covered by the separate LOCAL-ONLY benchmark."""
+
+    def _seed_bulk(db_path: Path, candidate_id: int, count: int) -> None:
+        engine = get_engine(f"sqlite:///{db_path}")
+        factory = get_session_factory(engine)
+        with factory() as session:
+            source = JobSourceRow(name=f"bulk-{count}", kind="ats_api", enabled=True)
+            session.add(source)
+            session.flush()
+            job_ids = []
+            for i in range(count):
+                # The first 15 jobs are always ACTIVE, guaranteeing at least
+                # 15 rankable (ACTIVE + matched + non-SKIP) candidates
+                # regardless of `count` -- so the bounded top-10 loop in
+                # `dashboard_summary()` is pinned at exactly 10 entries at
+                # every scale, and the per-request query count is genuinely
+                # comparable across 100/600/1200 rather than an artifact of
+                # how many jobs happened to qualify for ranking at each size.
+                status = "ACTIVE" if i < 15 or i % 3 == 0 else "CLOSED"
+                job = JobRow(
+                    source_id=source.id,
+                    company_name="Acme",
+                    title=f"Role {i}",
+                    location="Remote",
+                    remote_type="remote",
+                    employment_type="full_time",
+                    application_url=f"https://example.test/{count}/{i}",
+                    job_fingerprint=f"bulk-{count}-{i}",
+                    lifecycle_status=status,
+                )
+                session.add(job)
+                session.flush()
+                job_ids.append(job.id)
+            session.commit()
+            for i, job_id in enumerate(job_ids):
+                if i < 15:
+                    decision = "APPLY"
+                elif i % 4 == 0:  # a mix of never-scored jobs, like real history
+                    continue
+                else:
+                    decision = "APPLY" if i % 2 == 0 else "SKIP"
+                session.add(
+                    JobMatch(
+                        job_id=job_id,
+                        candidate_id=candidate_id,
+                        overall_score=70,
+                        decision=decision,
+                        skills_match=80,
+                        experience_match=70,
+                        role_match=90,
+                        project_match=60,
+                        education_match=100,
+                        location_match=100,
+                        seniority_match=80,
+                        eligibility_match=100,
+                        reasoning="bulk",
+                        semantic_available=False,
+                    )
+                )
+            session.commit()
+
+    query_counts: dict[int, int] = {}
+    for job_count in (100, 600, 1200):
+        scale_dir = tmp_path / f"scale-{job_count}"
+        scale_dir.mkdir()
+        client, db_path = _client(scale_dir, monkeypatch, real_config)
+        candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+        _seed_bulk(db_path, candidate_id, job_count)
+
+        engine = _cached_engine(f"sqlite:///{db_path}")
+        with _counting_queries_touching(engine, "SELECT") as counts:
+            r = client.get("/api/dashboard/summary")
+
+        assert r.status_code == 200
+        assert r.json()["total_jobs_discovered"] == job_count
+        query_counts[job_count] = counts["n"]
+
+    assert len(set(query_counts.values())) == 1, (
+        f"expected an identical, job-count-independent SQL statement count "
+        f"at 100/600/1200 total historical jobs, got {query_counts} -- "
+        f"looks like a reintroduced per-row (N+1) query pattern"
     )
 
 

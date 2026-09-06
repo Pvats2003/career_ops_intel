@@ -10,8 +10,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import APIRouter
-from sqlalchemy import select
-from sqlalchemy.orm import load_only
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, load_only
 
 from job_agent.applications.follow_up import compute_follow_up_recommendations
 from job_agent.candidate.briefing import compose_morning_briefing
@@ -84,12 +84,77 @@ _SUMMARY_JOB_COLUMNS = load_only(
 )
 
 
+def _decision_counts_all_time(session: Session, candidate_id: int) -> dict[str, int]:
+    """{decision: count of jobs (ANY status) whose LATEST match for this
+    candidate has that decision} — computed as one SQL aggregate instead
+    of fetching every historical `Job`/`JobMatch` row into Python.
+
+    Dashboard performance forensic fix, round 4: `dashboard_summary()`'s
+    counters are genuinely all-time (audit item J's `_QUALIFIED_DECISIONS`
+    etc. are evaluated over every job ever discovered, not just ACTIVE
+    ones), so an earlier round's ACTIVE-only SQL filter (used everywhere
+    else in this file) can't apply here — but computing them never
+    actually required materializing full `Job`/`JobMatch` ORM objects for
+    every historical row, only a count per decision. Query count was
+    already flat after an earlier round's N+1 fix (`latest_matches_by_job`
+    batched the match lookup into one query), yet wall-clock time still
+    scaled linearly with total historical job count — confirmed locally:
+    68ms at 600 jobs, 674ms at 6000, same query count throughout — because
+    every one of those rows was still being fetched, deserialized into an
+    ORM object, and iterated in a Python `for job in jobs:` loop just to
+    look up its decision and count it. Same "latest match per job_id"
+    definition `job_view.latest_matches_by_job()` uses (a
+    MAX(created_at) GROUP BY job_id subquery), joined back to `job_matches`
+    for its `decision`, joined to `jobs` so a `job_matches` row can never
+    be counted for a job that doesn't actually exist (never observed in
+    practice — `job_matches.job_id` has a FK to `jobs.id` — but this keeps
+    the SQL provably equivalent to the old "iterate real Job rows, look up
+    their match" loop without relying on that FK never being violated)."""
+    latest_match_per_job = (
+        select(JobMatch.job_id, func.max(JobMatch.created_at).label("max_created_at"))
+        .where(JobMatch.candidate_id == candidate_id)
+        .group_by(JobMatch.job_id)
+        .subquery()
+    )
+    rows = session.execute(
+        select(JobMatch.decision, func.count(JobMatch.id))
+        .join(
+            latest_match_per_job,
+            (JobMatch.job_id == latest_match_per_job.c.job_id)
+            & (JobMatch.created_at == latest_match_per_job.c.max_created_at),
+        )
+        .join(JobRow, JobRow.id == JobMatch.job_id)
+        .group_by(JobMatch.decision)
+    ).all()
+    return dict(rows)
+
+
 @router.get("/summary", response_model=DashboardSummaryOut)
 def dashboard_summary(
     session: SessionDep, candidate: CandidateDep, config: ConfigDep
 ) -> DashboardSummaryOut:
     _, candidate_id = candidate
-    jobs = list(session.execute(select(JobRow).options(_SUMMARY_JOB_COLUMNS)).scalars())
+
+    # `total_jobs_discovered` is a plain, unfiltered count — never needed
+    # the actual rows, only how many there are.
+    total_jobs_discovered = session.execute(select(func.count()).select_from(JobRow)).scalar_one()
+
+    decision_counts = _decision_counts_all_time(session, candidate_id)
+    # `jobs_scored` is exactly "how many jobs have a match at all" — since
+    # `_decision_counts_all_time` already reduces to one row per matched
+    # job (grouped by its LATEST match's decision), the counts sum to
+    # exactly that, regardless of which decisions actually occur.
+    jobs_scored = sum(decision_counts.values())
+    qualified_matches = sum(
+        count for decision, count in decision_counts.items() if decision in _QUALIFIED_DECISIONS
+    )
+    high_confidence_matches = sum(
+        count
+        for decision, count in decision_counts.items()
+        if decision in _HIGH_CONFIDENCE_DECISIONS
+    )
+    apply_priority_count = decision_counts.get("APPLY", 0)
+
     applications = list(
         session.execute(
             select(Application).where(Application.candidate_id == candidate_id)
@@ -98,35 +163,34 @@ def dashboard_summary(
 
     version = get_latest_version(session, candidate_id)
 
-    # Production-audit finding: this used to call `_latest_match()` once
-    # per job (one query per row in `jobs`, unbounded N+1) — on Neon each
-    # extra round-trip is real network latency, not just SQLite's local
-    # disk-cache overhead the test suite runs against. One batched query
-    # via `latest_matches_by_job()` regardless of how many jobs exist.
-    matches_by_job = job_view.latest_matches_by_job(
-        session, [job.id for job in jobs], candidate_id
+    # `top_opportunities` is the only part of this endpoint that genuinely
+    # needs real Job objects — and `rank_jobs()` has always discarded any
+    # non-ACTIVE row internally (see its own docstring), exactly like
+    # `jobs.py::_compute_ranking_decisions` already fetches ACTIVE-only
+    # for Top 10/Apply Now. Fetching only ACTIVE jobs here changes zero
+    # output: every non-ACTIVE job that used to enter the old, bigger
+    # `rankable_pairs` list was always silently dropped by `rank_jobs()`
+    # before it could ever appear in `top_opportunities`.
+    active_jobs = list(
+        session.execute(
+            select(JobRow)
+            .where(JobRow.lifecycle_status == "ACTIVE")
+            .options(_SUMMARY_JOB_COLUMNS)
+        ).scalars()
     )
-    jobs_scored = 0
-    qualified_matches = 0
-    high_confidence_matches = 0
-    apply_priority_count = 0
+    active_matches_by_job = job_view.latest_matches_by_job(
+        session, [job.id for job in active_jobs], candidate_id
+    )
     # Matching Engine V2 (audit item I): only decisions worth a human's
     # attention are even candidates for Top Opportunities — a SKIP must
     # NEVER appear there, so it's excluded here rather than relying on
     # ranking alone to bury it.
-    rankable_pairs: list[tuple[JobRow, JobMatch | None]] = []
-    for job in jobs:
-        match_row = matches_by_job.get(job.id)
-        if match_row is not None:
-            jobs_scored += 1
-            if match_row.decision in _QUALIFIED_DECISIONS:
-                qualified_matches += 1
-            if match_row.decision in _HIGH_CONFIDENCE_DECISIONS:
-                high_confidence_matches += 1
-            if match_row.decision in _APPLY_PRIORITY_DECISIONS:
-                apply_priority_count += 1
-            if match_row.decision != "SKIP":
-                rankable_pairs.append((job, match_row))
+    rankable_pairs: list[tuple[JobRow, JobMatch | None]] = [
+        (job, match_row)
+        for job in active_jobs
+        if (match_row := active_matches_by_job.get(job.id)) is not None
+        and match_row.decision != "SKIP"
+    ]
 
     # Reuses the exact same composite ranking `new_since_last_visit`/
     # `morning_briefing` already use (job_agent.matching.ranking.
@@ -165,7 +229,7 @@ def dashboard_summary(
         applied=applied,
         interviewing=interviewing,
         offers=offers,
-        total_jobs_discovered=len(jobs),
+        total_jobs_discovered=total_jobs_discovered,
         apply_priority_count=apply_priority_count,
         top_opportunities=top_out,
     )
