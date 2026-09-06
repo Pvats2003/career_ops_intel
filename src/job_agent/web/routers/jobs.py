@@ -18,7 +18,7 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from job_agent.applications.answer_bank import load_answer_bank
 from job_agent.applications.answer_engine import classify_question, generate_answer
@@ -76,6 +76,42 @@ _application_for = job_view.application_for
 _match_out = job_view.match_out
 _job_out = job_view.job_out
 
+# Whole-application performance forensic audit finding: `list_jobs()`
+# needs everything `job_view.JOB_SERIALIZATION_COLUMNS` already covers,
+# PLUS `job_fingerprint`/`source_id` (read directly by
+# `_canonicalize_duplicates()`/`_source_name_map()` below) and
+# `description` (the optional `q` free-text filter searches it — unlike
+# Companies/Watchlist, Jobs cannot exclude this column). Still excludes
+# `requirements`, `preferred_qualifications`, `raw_data`, and `locations`,
+# none of which `list_jobs()`, `_job_out()`, `_rank_maps()`, or
+# `rank_jobs()` read (traced field-by-field; `rank_jobs()` only reads
+# `application_url`/`freshness_status`/`lifecycle_status`,
+# `compute_learned_preferences()` only reads `employment_type`/
+# `remote_type` — all already included below).
+_JOBS_LIST_COLUMNS = load_only(
+    JobRow.id,
+    JobRow.title,
+    JobRow.company_name,
+    JobRow.location,
+    JobRow.remote_type,
+    JobRow.employment_type,
+    JobRow.salary_min,
+    JobRow.salary_max,
+    JobRow.currency,
+    JobRow.application_url,
+    JobRow.posted_at,
+    JobRow.discovered_at,
+    JobRow.freshness_status,
+    JobRow.lifecycle_status,
+    JobRow.company_url,
+    JobRow.company_id,
+    JobRow.visa_information,
+    JobRow.job_fingerprint,
+    JobRow.source_id,
+    JobRow.description,
+    raiseload=True,
+)
+
 
 def _source_name_map(session: Session) -> dict[int, str]:
     return {row.id: row.name for row in session.execute(select(JobSourceRow)).scalars()}
@@ -109,12 +145,30 @@ def _canonicalize_duplicates(
 
 
 def _rank_maps(
-    session: Session, config: AppConfig, candidate_id: int, jobs: list[JobRow]
+    session: Session,
+    config: AppConfig,
+    candidate_id: int,
+    jobs: list[JobRow],
+    matches_by_job: dict[int, JobMatchRow] | None = None,
 ) -> tuple[dict[int, float], dict[int, float]]:
     """(rank_score, career_value) per job id — one shared `rank_jobs` call
     so "recommended" and "highest career value" sort never disagree with
-    Top 10's own ranking."""
-    pairs = [(job, _latest_match(session, job.id, candidate_id)) for job in jobs]
+    Top 10's own ranking.
+
+    Production-audit finding (whole-application forensic audit): this used
+    to call `_latest_match()` once per job in `jobs` — a second, INDEPENDENT
+    unbatched N+1 on top of `list_jobs()`'s own (already-fixed) per-job
+    lookups, since `list_jobs()` calls this a second time for
+    `sort=recommended`/`career_value`. `matches_by_job` lets the caller
+    pass the SAME batched map it already computed for the rest of the
+    response, so this never re-queries `job_matches` a second time for the
+    same job set; if omitted, this batches it itself (one query, not one
+    per job) so `_rank_maps` stays correct as a standalone call."""
+    if matches_by_job is None:
+        matches_by_job = job_view.latest_matches_by_job(
+            session, [job.id for job in jobs], candidate_id
+        )
+    pairs = [(job, matches_by_job.get(job.id)) for job in jobs]
     preferences = compute_learned_preferences(
         job_view.matched_jobs_with_applications(session, candidate_id)
     )
@@ -154,8 +208,37 @@ def list_jobs(
     offset: int = Query(default=0, ge=0),
 ) -> JobListOut:
     profile, candidate_id = candidate
-    jobs = list(session.execute(select(JobRow)).scalars())
+
+    # Whole-application performance forensic audit finding: this used to
+    # be `select(JobRow)` with every large TEXT/JSON column loaded, followed
+    # by 2 UNBATCHED queries per canonical job (`_latest_match`/
+    # `_application_for`) inside the loop below. Deliberately NOT adding a
+    # SQL-level `lifecycle_status == "ACTIVE"` filter here even though
+    # `include_inactive=False` is the default: `_canonicalize_duplicates()`
+    # picks whichever row in a `job_fingerprint` group has the freshest
+    # `posted_at`/`discovered_at` as canonical, REGARDLESS of status — a
+    # fingerprint group with one still-ACTIVE row and one newer CLOSED row
+    # (the same underlying posting, re-scraped from two sources) must still
+    # canonicalize across BOTH rows exactly as before, or the ACTIVE
+    # duplicate could start appearing under a different canonical row than
+    # it used to. Column projection alone (see `_JOBS_LIST_COLUMNS`'s
+    # docstring) already removes the large TEXT/JSON columns nothing here
+    # reads; the two per-job DB round-trips are eliminated by batching
+    # below instead, with `include_inactive`'s own filter left exactly
+    # where it always was — a per-row check after canonicalization.
+    jobs = list(session.execute(select(JobRow).options(_JOBS_LIST_COLUMNS)).scalars())
     source_names = _source_name_map(session)
+
+    # One batched query each for every job just fetched, instead of one
+    # `_latest_match`/`_application_for` call per canonical job below.
+    # Batching over every raw row (not just canonical ones) is what keeps
+    # this trivially equivalent to the old per-row calls: whichever job id
+    # a canonical row happens to have, its entry in these maps is exactly
+    # what `_latest_match`/`_application_for` would have returned for that
+    # same id.
+    job_ids = [job.id for job in jobs]
+    matches_by_job = job_view.latest_matches_by_job(session, job_ids, candidate_id)
+    applications_by_job = job_view.applications_by_job(session, job_ids, candidate_id)
 
     career_path_titles: set[str] | None = None
     if career_path is not None:
@@ -166,8 +249,8 @@ def list_jobs(
     now = datetime.now(UTC)
     items: list[JobOut] = []
     for job, also_seen_on, duplicate_count in _canonicalize_duplicates(jobs, source_names):
-        match_row = _latest_match(session, job.id, candidate_id)
-        application = _application_for(session, job.id, candidate_id)
+        match_row = matches_by_job.get(job.id)
+        application = applications_by_job.get(job.id)
         job_source_name = source_names.get(job.source_id, None) if job.source_id else None
 
         if not include_inactive and job.lifecycle_status != "ACTIVE":
@@ -217,7 +300,13 @@ def list_jobs(
         )
 
     if sort in ("recommended", "career_value"):
-        rank_scores, career_values = _rank_maps(session, config, candidate_id, jobs)
+        # Reuses the SAME `matches_by_job` map already batched above
+        # instead of `_rank_maps` calling `_latest_match()` per job again
+        # — the second, independent per-job N+1 this endpoint used to pay
+        # for `sort=recommended`/`career_value` on top of its first.
+        rank_scores, career_values = _rank_maps(
+            session, config, candidate_id, jobs, matches_by_job
+        )
         score_map = rank_scores if sort == "recommended" else career_values
         items.sort(key=lambda j: score_map.get(j.id, -1.0), reverse=True)
     elif sort == "match":

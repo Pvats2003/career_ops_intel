@@ -9,7 +9,7 @@ action.
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from job_agent.applications.checklist import compute_checklist
@@ -286,7 +286,13 @@ def pipeline_analytics(session: SessionDep, candidate: CandidateDep) -> Analytic
             select(Application).where(Application.candidate_id == candidate_id)
         ).scalars()
     )
-    total_jobs_discovered = session.execute(select(JobRow)).scalars().all()
+    # Whole-application performance forensic audit finding: this used to
+    # fetch every column of every job ever discovered just to call `len()`
+    # on the result — a full unfiltered table transfer for a number the
+    # database can compute itself.
+    total_jobs_discovered = session.execute(
+        select(func.count()).select_from(JobRow)
+    ).scalar_one()
 
     stage_counts: dict[str, int] = {stage: 0 for stage in PIPELINE_STAGES}
     for application in applications:
@@ -337,7 +343,7 @@ def pipeline_analytics(session: SessionDep, candidate: CandidateDep) -> Analytic
             StageBreakdownOut(stage=stage, count=stage_counts.get(stage, 0))
             for stage in PIPELINE_STAGES
         ],
-        total_jobs_discovered=len(total_jobs_discovered),
+        total_jobs_discovered=total_jobs_discovered,
         total_matched=len(applications),
         total_shortlisted=total_shortlisted,
         total_applied=total_applied,

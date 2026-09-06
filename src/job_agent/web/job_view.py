@@ -6,7 +6,7 @@ two never grow two separate, drifting serializations of the same job row.
 from __future__ import annotations
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from job_agent.db.models import Application, JobMatch
 from job_agent.db.models import Job as JobRow
@@ -14,6 +14,42 @@ from job_agent.jobs.confidence import assess_data_confidence
 from job_agent.jobs.schema import FreshnessStatus
 from job_agent.jobs.viability import assess_application_viability
 from job_agent.web.schemas import ApplicationViabilityOut, DataConfidenceOut, JobOut, MatchOut
+
+# Whole-application performance forensic audit finding: every field
+# `job_out()`, `assess_data_confidence()`, and `assess_application_
+# viability()` actually read off a `Job` row, traced field-by-field —
+# excludes only `description`, `requirements`, `preferred_qualifications`,
+# `raw_data`, and `locations`, none of which any of those three functions
+# touch. `raiseload=True` makes any accidental read of an excluded column
+# raise `InvalidRequestError` immediately instead of silently issuing a
+# per-row lazy-load query, so a future field addition to `job_out()` that
+# needs one of the excluded columns fails loudly in tests rather than
+# quietly reintroducing an N+1. Shared by every read-side endpoint that
+# calls `job_out()` over more than a single job row (`companies.py`,
+# `watchlist.py`) without needing the large TEXT/JSON columns; endpoints
+# that also do free-text search over `description` (`jobs.py`'s
+# `list_jobs`) extend this set with the extra columns they genuinely need
+# rather than reusing it as-is.
+JOB_SERIALIZATION_COLUMNS = load_only(
+    JobRow.id,
+    JobRow.title,
+    JobRow.company_name,
+    JobRow.location,
+    JobRow.remote_type,
+    JobRow.employment_type,
+    JobRow.salary_min,
+    JobRow.salary_max,
+    JobRow.currency,
+    JobRow.application_url,
+    JobRow.posted_at,
+    JobRow.discovered_at,
+    JobRow.freshness_status,
+    JobRow.lifecycle_status,
+    JobRow.company_url,
+    JobRow.company_id,
+    JobRow.visa_information,
+    raiseload=True,
+)
 
 FRESHNESS_LABELS: dict[str, str] = {
     FreshnessStatus.JUST_POSTED.value: "Posted within hours",

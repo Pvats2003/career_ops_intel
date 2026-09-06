@@ -31,6 +31,7 @@ from job_agent.db.models import JobMatch
 from job_agent.db.models import JobSource as JobSourceRow
 from job_agent.db.session import get_engine, get_session_factory, init_db
 from job_agent.jobs.notifications import generate_notifications
+from job_agent.web import job_view
 from job_agent.web.app import create_app
 from job_agent.web.deps import _cached_engine
 
@@ -2184,3 +2185,668 @@ def test_scheduler_status_reflects_configured_frequency(tmp_path, monkeypatch, r
     assert body["frequency_hours"] == 6
     assert body["last_run_completed_at"] is None
     assert body["next_run_due_at"] is not None
+
+
+# ===========================================================================
+# Whole-application performance forensic audit -- coordinated Fixes A-C.
+#
+# The audit found the exact per-job N+1 pattern already eliminated on
+# Dashboard (`66e42ad`/`dbbc469`) still unfixed on Companies (~3 unbatched
+# queries/job, no column projection), Jobs (2+ unbatched queries/job,
+# fetched/matched BEFORE filtering/pagination), and Watchlist (1 unbatched
+# query/job) -- plus Pipeline Analytics fetching every job row just to
+# `len()` it. These tests prove: (1) query count for Companies/Jobs/
+# Watchlist no longer scales with job count, (2) the batched results are
+# byte-for-byte identical to what the old per-job calls would have
+# produced, (3) every filter/sort/include_inactive/pagination semantic is
+# unchanged, and (4) the column projections exclude only genuinely-unused
+# large TEXT/JSON columns, proven via `raiseload=True`.
+# ===========================================================================
+
+
+def _seed_many_jobs_with_matches(
+    db_path: Path,
+    candidate_id: int,
+    count: int,
+    *,
+    prefix: str,
+    companies: int = 5,
+    match_every: int = 2,
+) -> list[int]:
+    """Seeds `count` jobs (spread across `companies` distinct company
+    names) plus a `JobMatch` for every `match_every`-th job, all in ONE
+    session/commit -- unlike `_seed_job`/`_seed_match` (each opening their
+    own engine+session+commit), this is fast enough to use at the 100-600
+    job scale these query-count tests need."""
+    engine = get_engine(f"sqlite:///{db_path}")
+    factory = get_session_factory(engine)
+    job_ids: list[int] = []
+    with factory() as session:
+        source = JobSourceRow(name=f"{prefix}-source", kind="ats_api", enabled=True)
+        session.add(source)
+        session.flush()
+        for i in range(count):
+            job = JobRow(
+                source_id=source.id,
+                company_name=f"{prefix} Co {i % companies}",
+                title=f"{prefix} Role {i}",
+                location="Remote",
+                remote_type="remote",
+                employment_type="full_time",
+                salary_min=80000,
+                salary_max=110000,
+                currency="USD",
+                application_url=f"https://example.test/{prefix}/{i}",
+                job_fingerprint=f"{prefix}-{i}",
+                description="Analyze business processes.",
+                requirements="SQL, Excel",
+                lifecycle_status="ACTIVE",
+            )
+            session.add(job)
+            session.flush()
+            job_ids.append(job.id)
+            if i % match_every == 0:
+                session.add(
+                    JobMatch(
+                        job_id=job.id,
+                        candidate_id=candidate_id,
+                        overall_score=50 + (i % 50),
+                        decision="APPLY" if i % 3 == 0 else "REVIEW",
+                        skills_match=80,
+                        experience_match=70,
+                        role_match=90,
+                        project_match=60,
+                        education_match=100,
+                        location_match=100,
+                        seniority_match=80,
+                        eligibility_match=100,
+                        reasoning="synthetic",
+                        semantic_available=False,
+                    )
+                )
+        session.commit()
+    return job_ids
+
+
+# --- Companies (Fix A1) ----------------------------------------------------
+
+
+def test_list_companies_query_count_bounded_across_job_counts(tmp_path, monkeypatch, real_config):
+    """Whole-application performance forensic audit finding: `list_companies()`
+    used to run ~3 unbatched queries per job (a `latest_match()` for the
+    company-fit computation, then `latest_match()` AGAIN plus
+    `application_for()` per job while building `matching_jobs`). Fails
+    against the pre-fix per-job loop (query count grows 1:1 with job
+    count) and passes against the batched queries (a small constant
+    regardless of job count)."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    counts_by_job_count: dict[int, int] = {}
+    for job_count in (10, 100, 600):
+        _seed_many_jobs_with_matches(
+            db_path, candidate_id, job_count, prefix=f"co-scale-{job_count}"
+        )
+        with _counting_queries_touching(engine, "jobs", "job_matches", "applications") as counts:
+            r = client.get("/api/companies")
+        assert r.status_code == 200
+        counts_by_job_count[job_count] = counts["n"]
+
+    for job_count, n in counts_by_job_count.items():
+        assert n < 15, (
+            f"expected a bounded query count regardless of job count, got {n} "
+            f"queries at {job_count} jobs -- looks like a reintroduced N+1"
+        )
+    # The discriminating signature of an eliminated N+1: query count must
+    # not grow materially between the smallest and largest dataset.
+    assert counts_by_job_count[600] - counts_by_job_count[10] <= 3, (
+        f"query count grew with job count ({counts_by_job_count}) -- looks "
+        f"like a reintroduced N+1"
+    )
+
+
+def test_list_companies_result_matches_per_job_oracle(tmp_path, monkeypatch, real_config):
+    """The batched `matches_by_job`/`applications_by_job` maps
+    `list_companies()` now uses must return, for every job, exactly what
+    `job_view.latest_match()`/`application_for()` (the original,
+    still-present per-job functions) would compute for that same job --
+    proving the batching is not just faster but identical."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    job_ids = []
+    for i in range(6):
+        job_id = _seed_job(db_path, fingerprint=f"oracle-co-{i}", company_name=f"OracleCo {i % 2}")
+        job_ids.append(job_id)
+        if i % 2 == 0:
+            _seed_match(db_path, job_id, candidate_id, overall_score=60 + i, decision="APPLY")
+    client.post(f"/api/jobs/{job_ids[0]}/save")
+    client.post(f"/api/jobs/{job_ids[2]}/save")
+
+    r = client.get("/api/companies")
+    assert r.status_code == 200
+    body = r.json()
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    with get_session_factory(engine)() as session:
+        for company in body:
+            for job in company["matching_jobs"]:
+                expected_match = job_view.latest_match(session, job["id"], candidate_id)
+                expected_app = job_view.application_for(session, job["id"], candidate_id)
+                if expected_match is None:
+                    assert job["match"] is None
+                else:
+                    assert job["match"] is not None
+                    assert job["match"]["overall_score"] == int(expected_match.overall_score)
+                    assert job["match"]["decision"] == expected_match.decision
+                if expected_app is None:
+                    assert job["application_id"] is None
+                else:
+                    assert job["application_id"] == expected_app.id
+
+
+def test_get_company_matches_list_companies_entry(tmp_path, monkeypatch, real_config):
+    """`get_company()` and `list_companies()` share `_company_out()` but
+    batch independently (one company-scoped, one whole-table) -- they must
+    still produce byte-for-byte identical output for the same company."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_a = _seed_job(db_path, fingerprint="gc-a", company_name="Consistency Co")
+    job_b = _seed_job(db_path, fingerprint="gc-b", company_name="Consistency Co")
+    _seed_match(db_path, job_a, candidate_id, overall_score=88, decision="APPLY")
+    client.post(f"/api/jobs/{job_b}/save")
+
+    list_body = client.get("/api/companies").json()
+    entry = next(c for c in list_body if c["name"] == "Consistency Co")
+
+    detail = client.get(f"/api/companies/{entry['id']}").json()
+    assert detail == entry
+
+
+def test_companies_jobs_queries_omit_large_columns(tmp_path, monkeypatch, real_config):
+    """`list_companies()`/`get_company()`'s jobs SELECTs must not mention
+    the large TEXT/JSON columns nothing in `_company_out()`'s call chain
+    reads (see `job_view.JOB_SERIALIZATION_COLUMNS`'s docstring) --
+    captured directly from the SQL text, not inferred from behavior."""
+    import re
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="co-column-shape")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    captured: list[str] = []
+
+    def _capture(conn, cursor, statement, *args):
+        if re.search(r"FROM\s+jobs\b", statement, re.IGNORECASE) and "SELECT" in statement.upper():
+            captured.append(statement)
+
+    excluded_columns = {
+        "description", "requirements", "preferred_qualifications", "raw_data", "locations",
+    }
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        r1 = client.get("/api/companies")
+        captured.clear()
+        r2 = client.get(f"/api/companies/{job_id}")
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert captured, "expected at least one SELECT against jobs for get_company"
+    for statement in captured:
+        for column in excluded_columns:
+            assert column not in statement, (
+                f"companies jobs SELECT unexpectedly includes excluded column "
+                f"{column!r}:\n{statement}"
+            )
+
+
+def test_job_serialization_columns_raiseload_blocks_excluded_fields(
+    tmp_path, monkeypatch, real_config
+):
+    """`job_view.JOB_SERIALIZATION_COLUMNS`'s `raiseload=True` must make
+    accessing an excluded column fail loudly and immediately rather than
+    silently issuing a per-row lazy-load query -- so a future field added
+    to `job_out()`/company output that needs an excluded column fails this
+    test instead of quietly reintroducing an N+1. Every field this
+    projection DOES load must NOT raise."""
+    import pytest
+    from sqlalchemy import select as sa_select
+    from sqlalchemy.exc import InvalidRequestError
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="raiseload-check")
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    with get_session_factory(engine)() as session:
+        job = session.execute(
+            sa_select(JobRow)
+            .where(JobRow.id == job_id)
+            .options(job_view.JOB_SERIALIZATION_COLUMNS)
+        ).scalar_one()
+        for column in (
+            "requirements", "preferred_qualifications", "raw_data", "locations", "description",
+        ):
+            with pytest.raises(InvalidRequestError):
+                getattr(job, column)
+        for column in (
+            "id", "title", "company_name", "location", "remote_type", "employment_type",
+            "salary_min", "salary_max", "currency", "application_url", "posted_at",
+            "discovered_at", "freshness_status", "lifecycle_status", "company_url",
+            "company_id", "visa_information",
+        ):
+            getattr(job, column)  # must not raise
+
+
+# --- Jobs (Fix A2/B) ---------------------------------------------------
+
+
+def test_list_jobs_query_count_bounded_match_sort(tmp_path, monkeypatch, real_config):
+    """Whole-application performance forensic audit finding: `list_jobs()`
+    used to run 2 unbatched queries per job (`_latest_match()` +
+    `_application_for()`) BEFORE any filter/pagination ran. Fails against
+    the pre-fix per-job loop and passes against the batched queries."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    counts_by_job_count: dict[int, int] = {}
+    for job_count in (10, 100, 600):
+        _seed_many_jobs_with_matches(
+            db_path, candidate_id, job_count, prefix=f"jobs-scale-{job_count}"
+        )
+        with _counting_queries_touching(engine, "jobs", "job_matches", "applications") as counts:
+            r = client.get("/api/jobs", params={"limit": 50})
+        assert r.status_code == 200
+        counts_by_job_count[job_count] = counts["n"]
+
+    for job_count, n in counts_by_job_count.items():
+        assert n < 15, (
+            f"expected a bounded query count regardless of job count, got {n} "
+            f"queries at {job_count} jobs -- looks like a reintroduced N+1"
+        )
+    assert counts_by_job_count[600] - counts_by_job_count[10] <= 3, (
+        f"query count grew with job count ({counts_by_job_count}) -- looks "
+        f"like a reintroduced N+1"
+    )
+
+
+def test_list_jobs_query_count_bounded_recommended_sort(tmp_path, monkeypatch, real_config):
+    """Same as above for `sort=recommended`, which used to ALSO trigger a
+    second, independent per-job N+1 via `_rank_maps()`'s own
+    `_latest_match()` loop on top of `list_jobs()`'s own."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    counts_by_job_count: dict[int, int] = {}
+    for job_count in (10, 100, 600):
+        _seed_many_jobs_with_matches(
+            db_path, candidate_id, job_count, prefix=f"jobs-rec-scale-{job_count}"
+        )
+        with _counting_queries_touching(engine, "jobs", "job_matches", "applications") as counts:
+            r = client.get("/api/jobs", params={"sort": "recommended", "limit": 50})
+        assert r.status_code == 200
+        counts_by_job_count[job_count] = counts["n"]
+
+    for job_count, n in counts_by_job_count.items():
+        assert n < 15, (
+            f"expected a bounded query count regardless of job count, got {n} "
+            f"queries at {job_count} jobs -- looks like a reintroduced N+1"
+        )
+    assert counts_by_job_count[600] - counts_by_job_count[10] <= 3, (
+        f"query count grew with job count ({counts_by_job_count}) -- looks "
+        f"like a reintroduced N+1"
+    )
+
+
+def test_list_jobs_result_matches_per_job_oracle_with_filters(tmp_path, monkeypatch, real_config):
+    """The batched maps must return exactly what per-job
+    `_latest_match()`/`_application_for()` calls would have, INCLUDING
+    when several filters that read match/application data (`decision`,
+    `min_score`, `pipeline_stage`) are combined."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    job_ids = []
+    for i in range(10):
+        job_id = _seed_job(db_path, fingerprint=f"filter-oracle-{i}", company_name=f"FilterCo {i}")
+        job_ids.append(job_id)
+        _seed_match(
+            db_path, job_id, candidate_id,
+            overall_score=30 + i * 7,
+            decision="APPLY" if i % 2 == 0 else "REVIEW",
+        )
+    client.post(f"/api/jobs/{job_ids[1]}/save")
+    client.post(f"/api/jobs/{job_ids[3]}/save")
+
+    r = client.get("/api/jobs", params={"decision": "APPLY", "min_score": 40, "limit": 50})
+    assert r.status_code == 200
+    items = r.json()["items"]
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    with get_session_factory(engine)() as session:
+        # Independently recompute the expected id set straight from the
+        # per-job oracle functions -- must match the batched endpoint
+        # exactly.
+        expected_ids = set()
+        for job_id in job_ids:
+            match = job_view.latest_match(session, job_id, candidate_id)
+            if match is not None and match.decision == "APPLY" and match.overall_score >= 40:
+                expected_ids.add(job_id)
+        assert {item["id"] for item in items} == expected_ids
+
+        for item in items:
+            expected_app = job_view.application_for(session, item["id"], candidate_id)
+            if expected_app is None:
+                assert item["application_id"] is None
+            else:
+                assert item["application_id"] == expected_app.id
+
+
+def test_list_jobs_include_inactive_true_still_returns_all_statuses(
+    tmp_path, monkeypatch, real_config
+):
+    """CRITICAL semantic to preserve: `include_inactive=True` must still
+    fetch/match every job regardless of `lifecycle_status`, at scale, not
+    just for the 3-job smoke test already covering the basic case."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    for i in range(8):
+        status = "ACTIVE" if i % 2 == 0 else "CLOSED"
+        job_id = _seed_job(db_path, fingerprint=f"incl-inactive-{i}", lifecycle_status=status)
+        _seed_match(db_path, job_id, candidate_id, overall_score=70, decision="REVIEW")
+
+    default_r = client.get("/api/jobs", params={"limit": 50})
+    assert default_r.json()["total"] == 4  # only the ACTIVE half
+
+    all_r = client.get("/api/jobs", params={"include_inactive": "true", "limit": 50})
+    assert all_r.json()["total"] == 8  # every status
+
+
+def test_list_jobs_duplicate_canonicalization_unchanged_with_mixed_status_duplicates(
+    tmp_path, monkeypatch, real_config
+):
+    """Regression guard for the one genuinely subtle interaction in this
+    fix: `_canonicalize_duplicates()` picks whichever row in a
+    `job_fingerprint` group is freshest (`posted_at`/`discovered_at`)
+    REGARDLESS of status, so a group with an older ACTIVE row and a newer
+    CLOSED row (the same posting re-scraped from two sources, one of which
+    now shows it closed) canonicalizes to the CLOSED row -- and is then
+    entirely excluded by `include_inactive=False`'s default filter, exactly
+    as before this fix. This test pins that pre-existing behavior so a
+    future change to WHERE the ACTIVE filter is applied can't silently
+    change it without failing here."""
+    from datetime import UTC, datetime, timedelta
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    older_active = datetime.now(UTC) - timedelta(days=2)
+    newer_closed = datetime.now(UTC) - timedelta(hours=1)
+    _seed_job(
+        db_path, fingerprint="mixed-status-dup", source_name="greenhouse",
+        lifecycle_status="ACTIVE", posted_at=older_active,
+    )
+    _seed_job(
+        db_path, fingerprint="mixed-status-dup", source_name="lever",
+        lifecycle_status="CLOSED", posted_at=newer_closed,
+    )
+
+    default_r = client.get("/api/jobs")
+    assert default_r.json()["total"] == 0
+
+    all_r = client.get("/api/jobs", params={"include_inactive": "true"})
+    assert all_r.json()["total"] == 1
+    item = all_r.json()["items"][0]
+    assert item["lifecycle_status"] == "CLOSED"  # the freshest of the two
+    assert item["also_seen_on"] == ["greenhouse"]
+
+
+def test_jobs_list_query_omits_large_columns_but_keeps_description(
+    tmp_path, monkeypatch, real_config
+):
+    """`list_jobs()`'s jobs SELECT must exclude `requirements`/
+    `preferred_qualifications`/`raw_data`/`locations` (nothing here reads
+    them) but MUST still fetch `description` -- the `q` free-text filter
+    reads it, unlike Companies/Watchlist."""
+    import re
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="jobs-column-shape", description="Searchable analyst content.")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    captured: list[str] = []
+
+    def _capture(conn, cursor, statement, *args):
+        if re.search(r"FROM\s+jobs\b", statement, re.IGNORECASE) and "SELECT" in statement.upper():
+            captured.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        r = client.get("/api/jobs", params={"q": "analyst"})
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert r.status_code == 200
+    assert r.json()["total"] == 1
+    assert captured
+    excluded_columns = {"requirements", "preferred_qualifications", "raw_data", "locations"}
+    for statement in captured:
+        for column in excluded_columns:
+            assert column not in statement, (
+                f"jobs SELECT unexpectedly includes excluded column {column!r}:\n{statement}"
+            )
+        assert "description" in statement, "q filter needs description -- must still be fetched"
+
+
+def test_jobs_list_columns_raiseload_blocks_excluded_fields(tmp_path, monkeypatch, real_config):
+    """Same raiseload safety net as `job_view.JOB_SERIALIZATION_COLUMNS`,
+    for `jobs.py`'s own (slightly larger) projection."""
+    import pytest
+    from sqlalchemy import select as sa_select
+    from sqlalchemy.exc import InvalidRequestError
+
+    from job_agent.web.routers.jobs import _JOBS_LIST_COLUMNS
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    job_id = _seed_job(db_path, fingerprint="jobs-raiseload-check")
+
+    engine = get_engine(f"sqlite:///{db_path}")
+    with get_session_factory(engine)() as session:
+        job = session.execute(
+            sa_select(JobRow).where(JobRow.id == job_id).options(_JOBS_LIST_COLUMNS)
+        ).scalar_one()
+        for column in ("requirements", "preferred_qualifications", "raw_data", "locations"):
+            with pytest.raises(InvalidRequestError):
+                getattr(job, column)
+        for column in ("description", "job_fingerprint", "source_id", "id", "title"):
+            getattr(job, column)  # must not raise
+
+
+def test_list_jobs_recommended_sort_scores_match_top10_rank_scores(
+    tmp_path, monkeypatch, real_config
+):
+    """`sort=recommended` and `/api/jobs/top10` both now read from the SAME
+    batched `matches_by_job` map and the same `rank_jobs()` call path --
+    their relative ordering by rank_score must be identical, proving
+    reusing the batched map (instead of `_rank_maps()`'s own second
+    per-job `_latest_match()` loop) did not change any ranking score."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    for i in range(6):
+        job_id = _seed_job(db_path, fingerprint=f"rank-score-{i}")
+        _seed_match(db_path, job_id, candidate_id, overall_score=50 + i * 7, decision="APPLY")
+
+    top10 = client.get("/api/jobs/top10").json()
+    top10_scores = {item["job"]["id"]: item["rank_score"] for item in top10}
+    assert top10_scores  # sanity: the seeded jobs actually rank
+
+    recommended_body = client.get("/api/jobs", params={"sort": "recommended"}).json()
+    recommended_ids = [item["id"] for item in recommended_body["items"]]
+    top10_ids_in_score_order = [
+        job_id for job_id, _ in sorted(top10_scores.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    filtered_recommended = [jid for jid in recommended_ids if jid in top10_scores]
+    assert filtered_recommended == top10_ids_in_score_order
+
+
+# --- Watchlist (Fix A3/B) -----------------------------------------------
+
+
+def test_watchlist_summary_query_count_bounded_across_job_counts(
+    tmp_path, monkeypatch, real_config
+):
+    """Whole-application performance forensic audit finding:
+    `watchlist_summary()` used to run one unbatched `latest_match()` query
+    per job in the WHOLE table, every time the Settings page loaded."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    client.post("/api/watchlist", json={"kind": "COMPANY", "value": "wl-scale-0 Co 0"})
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    counts_by_job_count: dict[int, int] = {}
+    for job_count in (10, 100, 600):
+        _seed_many_jobs_with_matches(
+            db_path, candidate_id, job_count, prefix=f"wl-scale-{job_count}"
+        )
+        touched = ("jobs", "job_matches", "watchlist_entries")
+        with _counting_queries_touching(engine, *touched) as counts:
+            r = client.get("/api/watchlist/summary")
+        assert r.status_code == 200
+        counts_by_job_count[job_count] = counts["n"]
+
+    for job_count, n in counts_by_job_count.items():
+        assert n < 10, (
+            f"expected a bounded query count regardless of job count, got {n} "
+            f"queries at {job_count} jobs -- looks like a reintroduced N+1"
+        )
+    assert counts_by_job_count[600] - counts_by_job_count[10] <= 3, (
+        f"query count grew with job count ({counts_by_job_count}) -- looks "
+        f"like a reintroduced N+1"
+    )
+
+
+def test_watchlist_summary_excludes_inactive_jobs_same_as_before(
+    tmp_path, monkeypatch, real_config
+):
+    """The new SQL-level `lifecycle_status == "ACTIVE"` filter must produce
+    EXACTLY what `summarize_watchlist()`'s own internal Python-level
+    ACTIVE filter already did: a CLOSED job matching a watchlist entry must
+    never count towards `matching_count`/`highest_match_score`/
+    `latest_posted_at`."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    client.post("/api/watchlist", json={"kind": "COMPANY", "value": "Acme Corp"})
+
+    active_id = _seed_job(db_path, fingerprint="wl-active", lifecycle_status="ACTIVE")
+    closed_id = _seed_job(db_path, fingerprint="wl-closed", lifecycle_status="CLOSED")
+    _seed_match(db_path, active_id, candidate_id, overall_score=70, decision="REVIEW")
+    _seed_match(db_path, closed_id, candidate_id, overall_score=99, decision="APPLY")
+
+    r = client.get("/api/watchlist/summary")
+    assert r.status_code == 200
+    entry = next(s for s in r.json() if s["entry"]["value"] == "Acme Corp")
+    assert entry["matching_count"] == 1  # the ACTIVE one only
+    assert entry["highest_match_score"] == 70  # never the CLOSED job's 99
+
+
+def test_watchlist_jobs_query_omits_large_columns(tmp_path, monkeypatch, real_config):
+    """`watchlist_summary()`'s jobs SELECT must not mention the large TEXT/
+    JSON columns nothing in `summarize_watchlist()`/`matches_entry()`
+    reads."""
+    import re
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    client.post("/api/watchlist", json={"kind": "COMPANY", "value": "Acme Corp"})
+    _seed_job(db_path, fingerprint="wl-column-shape")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    captured: list[str] = []
+
+    def _capture(conn, cursor, statement, *args):
+        if re.search(r"FROM\s+jobs\b", statement, re.IGNORECASE) and "SELECT" in statement.upper():
+            captured.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        r = client.get("/api/watchlist/summary")
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert r.status_code == 200
+    assert captured
+    excluded_columns = {
+        "description", "requirements", "preferred_qualifications", "raw_data", "locations",
+    }
+    for statement in captured:
+        for column in excluded_columns:
+            assert column not in statement, (
+                f"watchlist jobs SELECT unexpectedly includes excluded column "
+                f"{column!r}:\n{statement}"
+            )
+
+
+# --- Pipeline analytics (Fix C) -----------------------------------------
+
+
+def test_pipeline_analytics_total_jobs_discovered_uses_count_not_full_fetch(
+    tmp_path, monkeypatch, real_config
+):
+    """Whole-application performance forensic audit finding:
+    `pipeline_analytics()` used to fetch every column of every job just to
+    call `len()` on the result. The SQL actually issued must be a COUNT,
+    never a full-row SELECT against `jobs`."""
+    import re
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    for i in range(5):
+        _seed_job(db_path, fingerprint=f"analytics-count-{i}", description="x" * 20_000)
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    jobs_statements: list[str] = []
+
+    def _capture(conn, cursor, statement, *args):
+        if re.search(r"\bjobs\b", statement, re.IGNORECASE) and "SELECT" in statement.upper():
+            jobs_statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        r = client.get("/api/pipeline/analytics")
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert r.status_code == 200
+    assert r.json()["total_jobs_discovered"] == 5
+    assert jobs_statements, "expected at least one SELECT touching jobs"
+    for statement in jobs_statements:
+        upper = statement.upper()
+        if "COUNT(" in upper:
+            continue
+        # Any non-COUNT statement touching jobs must not be a full-row
+        # fetch of the large text columns this endpoint never reads.
+        assert "description" not in statement and "requirements" not in statement, (
+            f"pipeline analytics issued a full-row jobs SELECT instead of "
+            f"COUNT(*):\n{statement}"
+        )
+    assert any("COUNT(" in s.upper() for s in jobs_statements), (
+        "expected a COUNT(*)-shaped statement against jobs for total_jobs_discovered"
+    )
+
+
+def test_pipeline_analytics_total_jobs_discovered_matches_actual_count(
+    tmp_path, monkeypatch, real_config
+):
+    """Correctness: `total_jobs_discovered` must count every job regardless
+    of status -- the original `len(select(JobRow).all())` had no status
+    filter, and neither does the new `COUNT(*)`."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="analytics-active", lifecycle_status="ACTIVE")
+    _seed_job(db_path, fingerprint="analytics-closed", lifecycle_status="CLOSED")
+    _seed_job(db_path, fingerprint="analytics-expired", lifecycle_status="EXPIRED")
+
+    r = client.get("/api/pipeline/analytics")
+    assert r.status_code == 200
+    assert r.json()["total_jobs_discovered"] == 3

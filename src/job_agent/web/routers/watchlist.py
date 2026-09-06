@@ -46,7 +46,20 @@ def watchlist_summary(
 ) -> list[WatchlistEntrySummaryOut]:
     """Part 5.16's Company Watchlist view — per entry, how many ACTIVE
     postings match it, how many are new in the last 7 days, the highest
-    match score among them, and the latest posting date."""
+    match score among them, and the latest posting date.
+
+    Whole-application performance forensic audit finding: this used to be
+    an unfiltered `select(JobRow)` (every job ever discovered, every
+    column) followed by one unbatched `latest_match()` query per job.
+    `summarize_watchlist()` immediately discards every non-ACTIVE job
+    itself (`active_pairs = [... if j.lifecycle_status == "ACTIVE"]`), so
+    a SQL-level `lifecycle_status == "ACTIVE"` filter here changes nothing
+    about the result — it just stops fetching rows that were always
+    thrown away. Column projection (see `job_view.JOB_SERIALIZATION_
+    COLUMNS`'s docstring) removes the large TEXT/JSON columns neither this
+    function nor `summarize_watchlist()`/`matches_entry()` read. The match
+    lookup is batched into one query for every ACTIVE job instead of one
+    per job."""
     _, candidate_id = candidate
     entries = list(
         session.execute(
@@ -55,8 +68,15 @@ def watchlist_summary(
             .order_by(WatchlistEntryRow.created_at.desc())
         ).scalars()
     )
-    jobs = list(session.execute(select(JobRow)).scalars())
-    jobs_with_matches = [(j, job_view.latest_match(session, j.id, candidate_id)) for j in jobs]
+    jobs = list(
+        session.execute(
+            select(JobRow)
+            .where(JobRow.lifecycle_status == "ACTIVE")
+            .options(job_view.JOB_SERIALIZATION_COLUMNS)
+        ).scalars()
+    )
+    matches_by_job = job_view.latest_matches_by_job(session, [j.id for j in jobs], candidate_id)
+    jobs_with_matches = [(j, matches_by_job.get(j.id)) for j in jobs]
 
     summaries = summarize_watchlist(entries, jobs_with_matches)
     return [
