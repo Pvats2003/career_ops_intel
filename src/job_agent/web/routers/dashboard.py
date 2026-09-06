@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from job_agent.applications.follow_up import compute_follow_up_recommendations
 from job_agent.candidate.briefing import compose_morning_briefing
@@ -43,13 +44,52 @@ _QUALIFIED_DECISIONS = {"APPLY", "REVIEW", "SAVE"}
 _HIGH_CONFIDENCE_DECISIONS = {"APPLY", "REVIEW"}
 _APPLIED_STAGES = {"APPLIED", "ASSESSMENT", "INTERVIEW", "OFFER", "REJECTED"}
 
+# Dashboard performance forensic fix, round 3: `dashboard_summary()` is the
+# one endpoint that must still fetch the ENTIRE historical `jobs` table
+# (its jobs_scored/qualified_matches/total_jobs_discovered counters are
+# genuinely all-time, unlike its siblings' ACTIVE-only fetches) — but it
+# was fetching every column, including large TEXT/JSON fields
+# (description, requirements, preferred_qualifications, raw_data,
+# locations) that nothing in this endpoint's call chain ever reads. This
+# is the exact, traced set of columns actually touched, verified against
+# the real code (not assumed) across: the counters loop below,
+# `matching.ranking.rank_jobs`/`_component_breakdown`/`explain`,
+# `candidate.learning.behavioral_fit_signal` (its `_DIMENSIONS`), and —
+# for the ≤10 jobs that reach it — `job_view.job_out()` plus its own
+# `jobs.confidence.assess_data_confidence`/`jobs.viability.
+# assess_application_viability` helpers. `visa_information` looks like a
+# large field but IS required (`assess_application_viability` reads it);
+# it stays loaded. `raiseload=True` means any future code path that
+# starts reading an excluded column fails loudly and immediately —
+# never silently degrades into a per-row lazy SELECT.
+_SUMMARY_JOB_COLUMNS = load_only(
+    JobRow.id,
+    JobRow.title,
+    JobRow.company_name,
+    JobRow.location,
+    JobRow.remote_type,
+    JobRow.employment_type,
+    JobRow.salary_min,
+    JobRow.salary_max,
+    JobRow.currency,
+    JobRow.application_url,
+    JobRow.posted_at,
+    JobRow.discovered_at,
+    JobRow.freshness_status,
+    JobRow.lifecycle_status,
+    JobRow.company_url,
+    JobRow.company_id,
+    JobRow.visa_information,
+    raiseload=True,
+)
+
 
 @router.get("/summary", response_model=DashboardSummaryOut)
 def dashboard_summary(
     session: SessionDep, candidate: CandidateDep, config: ConfigDep
 ) -> DashboardSummaryOut:
     _, candidate_id = candidate
-    jobs = list(session.execute(select(JobRow)).scalars())
+    jobs = list(session.execute(select(JobRow).options(_SUMMARY_JOB_COLUMNS)).scalars())
     applications = list(
         session.execute(
             select(Application).where(Application.candidate_id == candidate_id)

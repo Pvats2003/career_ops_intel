@@ -648,6 +648,148 @@ def test_ranking_cache_does_not_hide_a_fresh_save(tmp_path, monkeypatch, real_co
     assert second.json()[0]["job"]["pipeline_stage"] == "SAVED"
 
 
+def test_dashboard_summary_jobs_query_omits_large_columns(tmp_path, monkeypatch, real_config):
+    """Dashboard performance forensic fix, round 3: `dashboard_summary()`'s
+    jobs SELECT used to fetch every column, including large TEXT/JSON
+    fields (description, requirements, preferred_qualifications, raw_data,
+    locations) that nothing in its call chain reads. `load_only(...,
+    raiseload=True)` means the actual SQL statement's column list must not
+    mention those fields at all — captured directly from the SQL text, not
+    inferred from behavior."""
+    import re
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    _seed_job(db_path, fingerprint="column-shape")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    captured_statements: list[str] = []
+
+    def _capture(conn, cursor, statement, *args):
+        if re.search(r"FROM\s+jobs\b", statement, re.IGNORECASE) and "SELECT" in statement.upper():
+            captured_statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        r = client.get("/api/dashboard/summary")
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert r.status_code == 200
+    assert captured_statements, "expected at least one SELECT against jobs"
+    excluded_columns = {
+        "description", "requirements", "preferred_qualifications", "raw_data", "locations",
+    }
+    for statement in captured_statements:
+        # SQLite quotes identifiers as "jobs"."column_name" -- a plain
+        # substring check on the column name is sufficient and avoids
+        # depending on exact quoting/formatting.
+        for column in excluded_columns:
+            assert column not in statement, (
+                f"jobs SELECT unexpectedly includes excluded large column {column!r}:\n{statement}"
+            )
+
+
+def test_dashboard_summary_works_with_large_job_text_fields(tmp_path, monkeypatch, real_config):
+    """Regression coverage: a job with large description/requirements/
+    raw_data content must not break dashboard_summary(), and its top-10
+    output must still include this job correctly (title, company, etc.)
+    without ever needing to load those large fields."""
+    from job_agent.db.models import Job as JobRow
+
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    job_id = _seed_job(db_path, fingerprint="large-fields", title="Large Fields Analyst")
+    _seed_match(db_path, job_id, candidate_id, overall_score=95, decision="APPLY")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    factory = get_session_factory(engine)
+    with factory() as session:
+        job = session.get(JobRow, job_id)
+        job.description = "x" * 50_000
+        job.requirements = "y" * 20_000
+        job.preferred_qualifications = "z" * 20_000
+        job.visa_information = "No sponsorship available for this role."
+        job.raw_data = {"raw_html": "w" * 50_000}
+        job.locations = ["Remote", "New York", "London"]
+        session.commit()
+
+    r = client.get("/api/dashboard/summary")
+    assert r.status_code == 200
+    body = r.json()
+    titles = [job["title"] for job in body["top_opportunities"]]
+    assert "Large Fields Analyst" in titles
+    top_job = next(j for j in body["top_opportunities"] if j["title"] == "Large Fields Analyst")
+    assert top_job["viability"]["visa_info_available"] is True
+
+
+def test_dashboard_summary_counters_and_ranking_unchanged_by_column_projection(
+    tmp_path, monkeypatch, real_config
+):
+    """The column projection must not change any observable behavior:
+    counters stay exactly as they were, ACTIVE filtering stays exactly as
+    it was, and historical (including CLOSED) jobs are still counted."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+
+    active_id = _seed_job(db_path, fingerprint="proj-active", title="Active Role")
+    _seed_match(db_path, active_id, candidate_id, overall_score=90, decision="APPLY")
+    closed_id = _seed_job(
+        db_path, fingerprint="proj-closed", title="Closed Role", lifecycle_status="CLOSED"
+    )
+    _seed_match(db_path, closed_id, candidate_id, overall_score=99, decision="APPLY")
+    skip_id = _seed_job(db_path, fingerprint="proj-skip", title="Skip Role")
+    _seed_match(db_path, skip_id, candidate_id, overall_score=40, decision="SKIP")
+
+    r = client.get("/api/dashboard/summary")
+    assert r.status_code == 200
+    body = r.json()
+
+    # total_jobs_discovered / jobs_scored are all-time counters -- the
+    # CLOSED job must still be counted, exactly as before this change.
+    assert body["total_jobs_discovered"] == 3
+    assert body["jobs_scored"] == 3
+    assert body["qualified_matches"] == 2  # the two APPLY jobs, not the SKIP
+
+    # ACTIVE-only ranking semantics unchanged: the CLOSED job must never
+    # appear in top_opportunities despite its higher raw score.
+    top_ids = [job["id"] for job in body["top_opportunities"]]
+    assert active_id in top_ids
+    assert closed_id not in top_ids
+    assert skip_id not in top_ids
+
+
+def test_dashboard_summary_column_projection_introduces_no_new_queries(
+    tmp_path, monkeypatch, real_config
+):
+    """Dashboard performance forensic fix, round 3: `load_only(...,
+    raiseload=True)` must reduce BYTES transferred without changing the
+    QUERY COUNT -- proving there is no hidden per-row lazy SELECT for any
+    of the loaded (or excluded-but-never-touched) columns. Total SELECT
+    count must stay bounded (independent of job count), matching the
+    existing job_matches-specific bound this endpoint already had."""
+    client, db_path = _client(tmp_path, monkeypatch, real_config)
+    candidate_id = client.get("/api/candidate/profile").json()["candidate_id"]
+    # > 10 so the pre-existing, already-accepted `_application_for()` loop
+    # over `top_out` (bounded to `limit=10` ranked jobs) is pinned at 10
+    # regardless of job_count -- the genuinely job-count-independent
+    # bound this test is actually checking.
+    job_count = 20
+    for i in range(job_count):
+        job_id = _seed_job(db_path, fingerprint=f"col-proj-{i}")
+        _seed_match(db_path, job_id, candidate_id, overall_score=90, decision="APPLY")
+
+    engine = _cached_engine(f"sqlite:///{db_path}")
+    with _counting_queries_touching(engine, "SELECT") as counts:
+        r = client.get("/api/dashboard/summary")
+
+    assert r.status_code == 200
+    assert counts["n"] < job_count, (
+        f"expected a bounded total SELECT count regardless of job count "
+        f"({job_count}), got {counts['n']} -- looks like the column "
+        f"projection introduced a hidden per-row lazy load"
+    )
+
+
 def test_jobs_scan_with_no_sources_enabled_is_honest_zero(tmp_path, monkeypatch, real_config):
     """With every source explicitly disabled, scanning must report zero
     results, never fabricate a job listing, and must not attempt any
