@@ -30,7 +30,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from job_agent.candidate.schema import CandidateProfile, EvidenceLevel
-from job_agent.matching.text import any_keyword_present, contains_keyword, fuzzy_overlap
+from job_agent.matching.text import (
+    any_keyword_or_synonym_present,
+    contains_keyword_or_synonym,
+    fuzzy_overlap_with_synonyms,
+)
 from job_agent.matching.vocabulary import GENERIC_SKILL_KEYWORDS, SPECIFIC_SKILL_KEYWORDS
 
 _EVIDENCE_WEIGHT = {
@@ -56,12 +60,14 @@ _NO_SPECIFIC_EVIDENCE_PROJECT_SCORE = 40
 
 
 def _find_evidence(profile: CandidateProfile, keyword: str) -> EvidenceLevel:
-    """Fuzzy (substring) match a vocabulary keyword against stored skill
-    names — see the identical rationale this was originally written for
-    in `job_agent.matching.deterministic`."""
+    """Fuzzy (substring) match a vocabulary keyword — or one of its known
+    synonym forms, e.g. "product roadmap" against a skill literally named
+    "Roadmapping" (Matching Engine V3 calibration fix D) — against stored
+    skill names. See the identical rationale `fuzzy_overlap` was
+    originally written for in `job_agent.matching.deterministic`."""
     best = EvidenceLevel.MISSING
     for skill in profile.skills:
-        if fuzzy_overlap(keyword, skill.name):
+        if fuzzy_overlap_with_synonyms(keyword, skill.name):
             if _EVIDENCE_PRIORITY[skill.evidence_level] > _EVIDENCE_PRIORITY[best]:
                 best = skill.evidence_level
     return best
@@ -99,9 +105,13 @@ def detect_requirements(text: str) -> RequirementSet:
     scores against. Deliberately flat/cross-domain (not scoped to the
     job's classified role family): a Product Analyst posting can quite
     legitimately require Tableau, and scoping detection to one family's
-    vocabulary would only produce false "not required" negatives."""
-    generic = tuple(any_keyword_present(text, GENERIC_SKILL_KEYWORDS))
-    specific = tuple(any_keyword_present(text, SPECIFIC_SKILL_KEYWORDS))
+    vocabulary would only produce false "not required" negatives. Also
+    recognizes a vocabulary term's known synonym forms (Matching Engine V3
+    calibration fix D) — e.g. a posting phrased "gather requirements"
+    still registers the vocabulary term "requirements gathering" as
+    mentioned, rather than missing it purely on word order."""
+    generic = tuple(any_keyword_or_synonym_present(text, GENERIC_SKILL_KEYWORDS))
+    specific = tuple(any_keyword_or_synonym_present(text, SPECIFIC_SKILL_KEYWORDS))
     return RequirementSet(generic=generic, specific=specific)
 
 
@@ -187,7 +197,9 @@ def score_project_relevance(
     project_text = " \n".join(
         f"{p.name} {p.stack or ''} {' '.join(p.highlights)}" for p in profile.projects
     )
-    matched = tuple(kw for kw in requirements.specific if contains_keyword(project_text, kw))
+    matched = tuple(
+        kw for kw in requirements.specific if contains_keyword_or_synonym(project_text, kw)
+    )
 
     specific_only = RequirementSet(generic=(), specific=requirements.specific)
     matched_weight = len(matched) * _SPECIFIC_WEIGHT

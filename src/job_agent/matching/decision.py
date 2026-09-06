@@ -27,10 +27,32 @@ from job_agent.matching.scoring import ScoredMatch
 _DETERMINISTIC_APPLY_MIN_ROLE_MATCH = 85
 _DETERMINISTIC_APPLY_MIN_SPECIFIC_MATCHES = 2
 
+# Matching Engine V3 calibration fix B: named explicitly, rather than
+# gating on "any risk flag at all" — see this function's docstring for why
+# `eligibility_uncertain` is the only one this check actually needs to
+# reason about.
+_ELIGIBILITY_UNCERTAIN_RISK_FLAG = "eligibility_uncertain"
+
 
 def _deterministic_confidence_is_high(scored: ScoredMatch) -> bool:
+    """The candidate's work-authorization/visa status is UNKNOWN (see
+    `job_agent.matching.deterministic._eligibility`) — silence in a job
+    posting about sponsorship is therefore never allowed to become a green
+    light for automatically APPLYing, even when everything else about the
+    match is excellent. `eligibility_uncertain` is the ONLY risk flag this
+    needs to check for explicitly (not a blanket "no risk flags of any
+    kind"): the other one that exists, `role_family_mismatch`, already
+    caps `overall_score` at 45 in `job_agent.matching.scoring.
+    _apply_score_caps` — strictly below `auto_apply_threshold` in every
+    configured deployment — so a role-mismatched job can structurally
+    never reach this gate at all. This is deliberately an APPLY-only
+    blocker: a job whose only issue is unconfirmed eligibility can and
+    should still reach REVIEW (the caller falls back to REVIEW, never
+    SKIP/SAVE, when this returns False at overall_score >=
+    auto_apply_threshold) — a human should look at it, the system should
+    just never auto-commit to it."""
     return (
-        not scored.risk_flags
+        _ELIGIBILITY_UNCERTAIN_RISK_FLAG not in scored.risk_flags
         and scored.role_match >= _DETERMINISTIC_APPLY_MIN_ROLE_MATCH
         and scored.specific_matched_count >= _DETERMINISTIC_APPLY_MIN_SPECIFIC_MATCHES
     )

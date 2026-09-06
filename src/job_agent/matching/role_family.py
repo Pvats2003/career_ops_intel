@@ -237,11 +237,49 @@ _TIER0_PATTERNS: tuple[tuple[RoleFamily, str], ...] = (
     (RoleFamily.SKILLED_TRADES_HOSPITALITY, "Server"),
 )
 
+# TIER 1 — intern/working-student variants, added by Matching Engine V3
+# calibration fix E. Production-audit finding: an intern/working-student
+# title (e.g. "Product Management Intern") fell all the way through to
+# OTHER_UNKNOWN even when it obviously names one of the SAME substantive
+# role families TIER 0 already recognizes — "intern"/"working student" was
+# never itself a role family, but TIER 0's patterns were all written for
+# the un-qualified, full-time form of a title and none of them happen to
+# be literal substrings of their own intern-qualified forms ("Product
+# Manager" is not a substring of "Product Management Intern"). Checked
+# AFTER TIER 0 (so any title that already matches an existing, more
+# specific pattern — "Business Analyst Intern" contains "Business
+# Analyst"; "APM Intern" contains "APM" — keeps resolving via TIER 0
+# exactly as before; nothing here ever overrides that). Ordered most-
+# specific-first WITHIN this tier for the same reason TIER 0 is: "Product
+# Operations Intern"/"Working Student Product Operations" must resolve to
+# PRODUCT_OPERATIONS before the shorter, less specific "Working Student
+# Product" (PRODUCT_MANAGEMENT) pattern ever gets a look, since the latter
+# is a literal prefix of the former. Deliberately narrow and role-
+# specific, per the audit's explicit instruction: "do not classify every
+# internship as Product" — a Finance/Software-Engineering/etc. internship
+# resolves to ITS OWN family, never defaulted to this candidate's own
+# target roles.
+_INTERN_TIER1_PATTERNS: tuple[tuple[RoleFamily, str], ...] = (
+    (RoleFamily.PRODUCT_OPERATIONS, "Product Operations Intern"),
+    (RoleFamily.PRODUCT_OPERATIONS, "Working Student Product Operations"),
+    (RoleFamily.PRODUCT_OPERATIONS, "Product Operations"),
+    (RoleFamily.PRODUCT_MANAGEMENT, "Product Management Intern"),
+    (RoleFamily.PRODUCT_MANAGEMENT, "PM Intern"),
+    (RoleFamily.PRODUCT_MANAGEMENT, "Product Intern"),
+    (RoleFamily.PRODUCT_MANAGEMENT, "Working Student Product"),
+    (RoleFamily.PRODUCT_MANAGEMENT, "Product Management"),
+    (RoleFamily.BUSINESS_ANALYSIS, "Business Analysis Intern"),
+    (RoleFamily.BUSINESS_ANALYSIS, "Working Student Business Analysis"),
+    (RoleFamily.BUSINESS_ANALYSIS, "Business Analysis"),
+    (RoleFamily.FINANCE_ACCOUNTING, "Finance Intern"),
+    (RoleFamily.SOFTWARE_ENGINEERING, "Software Engineering Intern"),
+)
+
 # TIER 2 — body-text fallback cues, used only when the title itself gave
-# no TIER 0 match. Deliberately small: enough to resolve the clearest
-# cases (a "Senior Engineer" posting that's obviously aerospace, or an
-# "Analyst" posting that's obviously accounting) without pretending to be
-# an exhaustive domain classifier.
+# no TIER 0/TIER 1 match. Deliberately small: enough to resolve the
+# clearest cases (a "Senior Engineer" posting that's obviously aerospace,
+# or an "Analyst" posting that's obviously accounting) without pretending
+# to be an exhaustive domain classifier.
 _TIER2_BODY_PATTERNS: tuple[tuple[RoleFamily, str], ...] = (
     (RoleFamily.AEROSPACE_CONTROLS_ROBOTICS_ENGINEERING, "orbital mechanics"),
     (RoleFamily.AEROSPACE_CONTROLS_ROBOTICS_ENGINEERING, "Kalman filter"),
@@ -284,6 +322,20 @@ _CAREER_PATH_LABEL_TO_FAMILY: dict[str, RoleFamily] = {
     "Marketing Operations": RoleFamily.MARKETING_OPERATIONS,
     "Customer Success Operations": RoleFamily.CUSTOMER_SUCCESS_OPERATIONS,
     "AI Operations": RoleFamily.ML_AI_ENGINEERING,
+    # Matching Engine V3 calibration, Phase 9: `job_agent.candidate.
+    # career_paths._TAXONOMY` has two labels this dict used to have no
+    # entry for at all, silently dropping either one from ever promoting
+    # a role family here even on a HIGH-priority discovered result. Both
+    # map onto families this taxonomy already documents as their home:
+    # role_family.py's own BUSINESS_OPERATIONS TIER0 comment ("also the
+    # home for Program/Project roles — no separate family exists for
+    # those in this taxonomy") and vocabulary.py's own SPECIFIC_SKILL_
+    # KEYWORDS comment ("Product Management (incl. UX, folded in here —
+    # no separate UX family in this taxonomy...")) — not a new judgment
+    # call, just closing a gap between two pieces of this module's own,
+    # already-stated design.
+    "Program / Project Management": RoleFamily.BUSINESS_OPERATIONS,
+    "UX / Product Design": RoleFamily.PRODUCT_MANAGEMENT,
 }
 
 
@@ -302,6 +354,10 @@ def classify_role_family(title: str, text: str = "") -> RoleFamilyMatch:
     same `JobText.combined_text` the rest of the matcher already uses) is
     only consulted (TIER 2) when the title itself resolved nothing."""
     for family, pattern in _TIER0_PATTERNS:
+        if contains_keyword(title, pattern):
+            return RoleFamilyMatch(family=family, confidence="high", matched_signal=pattern)
+
+    for family, pattern in _INTERN_TIER1_PATTERNS:
         if contains_keyword(title, pattern):
             return RoleFamilyMatch(family=family, confidence="high", matched_signal=pattern)
 

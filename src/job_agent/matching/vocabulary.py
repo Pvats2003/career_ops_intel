@@ -60,7 +60,18 @@ COMMON_REQUIREMENT_KEYWORDS: tuple[str, ...] = (
     "business analysis",
 )
 
-SENIOR_KEYWORDS: tuple[str, ...] = (
+# Matching Engine V3 calibration fix C: production-audit finding — a bare
+# "manager" used to be in this list, making "Product Manager" (this
+# candidate's own, literal, primary target-role title, per
+# config/profile.yaml) hard-stop into HUMAN_REQUIRED purely because
+# "manager" happens to be a substring of it, even with no seniority
+# qualifier at all. Every word below is an explicit, unambiguous seniority
+# marker that never doubles as a standard entry-point title for any of
+# this candidate's target role families. Compound "<Function> Manager"
+# titles that DO still legitimately signal real seniority (Engineering
+# Manager, Marketing Manager, ...) are handled separately by
+# `FUNCTIONAL_MANAGER_SENIOR_TITLES` below, not by a bare-word match here.
+EXPLICIT_SENIORITY_MARKERS: tuple[str, ...] = (
     "senior",
     "sr.",
     "staff",
@@ -70,7 +81,26 @@ SENIOR_KEYWORDS: tuple[str, ...] = (
     "head of",
     "vp",
     "vice president",
-    "manager",
+    "chief",
+)
+
+# A small, explicit list of COMPOUND "<Function> Manager" titles that DO
+# still legitimately signal real managerial seniority even with no
+# separate Senior/Lead/Director qualifier — unlike bare "Manager" or
+# "Product Manager", these describe someone managing a team/function, not
+# an individual-contributor entry point. Deliberately excludes every title
+# form that is this candidate's own primary/secondary/exploratory target
+# (Product Manager, Business Analyst, Operations Analyst, ...) — this list
+# exists to keep flagging titles that were NEVER the candidate's target in
+# the first place, never to reintroduce the "manager" false-stop fix C
+# closes for the candidate's own target roles.
+FUNCTIONAL_MANAGER_SENIOR_TITLES: tuple[str, ...] = (
+    "Marketing Manager",
+    "Finance Manager",
+    "Engineering Manager",
+    "Sales Manager",
+    "HR Manager",
+    "Accounting Manager",
 )
 
 JUNIOR_KEYWORDS: tuple[str, ...] = (
@@ -266,6 +296,37 @@ SPECIFIC_SKILL_KEYWORDS: tuple[str, ...] = (
     "kitchen operations",
     "housekeeping",
     "shift scheduling",
+)
+
+# --------------------------------------------------------------------------
+# Matching Engine V3 calibration fix D: a SMALL, hand-curated, closed set
+# of surface-form variants for a handful of high-value SPECIFIC_SKILL_
+# KEYWORDS terms — production-audit finding: `job_agent.matching.text.
+# contains_keyword`/`fuzzy_overlap` are exact-substring checks, so a
+# candidate skill genuinely evidenced under one phrasing ("Roadmapping")
+# was read as MISSING against a job/vocabulary phrasing that means the
+# same thing but orders or inflects the words differently ("product
+# roadmap"). This is deliberately NOT a stemmer or a general fuzzy-
+# similarity relaxation — each group below is a fixed, explicit list of
+# forms of the SAME concept, safe because every member is unambiguous on
+# its own (no member is a generic word that could plausibly mean something
+# else): a plural ("stakeholder communications"), a reordered verb phrase
+# for the same activity ("document processes" / "gather requirements" /
+# "groom backlog" for the SAME documentation/requirements-gathering/
+# backlog-grooming work already in SPECIFIC_SKILL_KEYWORDS), or the noun
+# root shared between a candidate's self-authored skill name and the
+# vocabulary phrase for it ("roadmapping" / "roadmap" / "product
+# roadmap"). Adding a new group here must meet the same bar: every member
+# must be a genuine restatement of the identical activity, never a
+# related-but-distinct one — this must never become a backdoor to the
+# generic-keyword-overlap problem the SPECIFIC/GENERIC tiering in this
+# module already exists to close.
+SKILL_SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"roadmapping", "roadmap", "product roadmap"}),
+    frozenset({"process documentation", "document processes", "documenting processes"}),
+    frozenset({"requirements gathering", "gather requirements", "gathering requirements"}),
+    frozenset({"stakeholder communication", "stakeholder communications"}),
+    frozenset({"backlog grooming", "groom backlog", "grooming backlog", "grooming the backlog"}),
 )
 
 NO_SPONSORSHIP_PATTERNS: tuple[str, ...] = (

@@ -41,9 +41,10 @@ from job_agent.matching.role_family import (
 from job_agent.matching.text import any_keyword_present, contains_keyword, extract_year_requirement
 from job_agent.matching.vocabulary import (
     DEGREE_REQUIRED_PATTERNS,
+    EXPLICIT_SENIORITY_MARKERS,
+    FUNCTIONAL_MANAGER_SENIOR_TITLES,
     JUNIOR_KEYWORDS,
     NO_SPONSORSHIP_PATTERNS,
-    SENIOR_KEYWORDS,
 )
 
 _ROLE_TIER_SCORE = {"primary": 90, "secondary": 72, "exploratory": 55}
@@ -229,10 +230,21 @@ def _location(profile: CandidateProfile, job: JobText) -> tuple[int, list[str]]:
 
 
 def _seniority(job: JobText) -> tuple[int, list[str], list[str]]:
+    """Matching Engine V3 calibration fix C: a bare "Manager" in the title
+    (e.g. "Product Manager", this candidate's own primary target-role
+    title) no longer triggers a seniority hard stop on its own —
+    `EXPLICIT_SENIORITY_MARKERS` requires an unambiguous qualifier
+    (Senior/Sr./Lead/Principal/Staff/Director/Head of/VP/Chief) instead.
+    `FUNCTIONAL_MANAGER_SENIOR_TITLES` separately still catches compound
+    "<Function> Manager" titles (Engineering Manager, Marketing Manager,
+    ...) that genuinely do signal managerial seniority even with no such
+    qualifier — none of which is a title this candidate targets."""
     text = job.combined_text
     if any_keyword_present(text, JUNIOR_KEYWORDS):
         return 90, [], []
-    senior_hits = any_keyword_present(job.title, SENIOR_KEYWORDS)
+    senior_hits = any_keyword_present(job.title, EXPLICIT_SENIORITY_MARKERS) + any_keyword_present(
+        job.title, FUNCTIONAL_MANAGER_SENIOR_TITLES
+    )
     if senior_hits:
         concern = f"title suggests senior-level ({', '.join(senior_hits)})"
         return 15, [concern], ["seniority_mismatch"]

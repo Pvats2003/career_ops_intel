@@ -10,10 +10,16 @@ actual data the false-positive bug was found against, and are what proves
 
 from __future__ import annotations
 
+from job_agent.candidate.career_paths import discover_career_paths
 from job_agent.config.models import MatchingThresholds, ScoringWeights
 from job_agent.matching.decision import decide, finalize
 from job_agent.matching.deterministic import JobText, compute_deterministic_match
-from job_agent.matching.role_family import RoleFamily, classify_role_family
+from job_agent.matching.role_family import (
+    _CAREER_PATH_LABEL_TO_FAMILY,
+    RoleFamily,
+    candidate_role_families,
+    classify_role_family,
+)
 from job_agent.matching.schema import Decision
 from job_agent.matching.scoring import ScoredMatch, combine_match
 from job_agent.matching.semantic import SemanticOutcome
@@ -346,6 +352,159 @@ def test_20_role_family_classification_distinguishes_engineer_titles():
 
 
 # --------------------------------------------------------------------------
+# 20b: Matching Engine V3 calibration fix E — intern/working-student
+# titles resolve to their SUBSTANTIVE role family, not OTHER_UNKNOWN.
+# --------------------------------------------------------------------------
+
+
+def test_20b_product_management_intern_variants_classify_correctly():
+    assert (
+        classify_role_family("Product Management Intern").family == RoleFamily.PRODUCT_MANAGEMENT
+    )
+    assert classify_role_family("PM Intern").family == RoleFamily.PRODUCT_MANAGEMENT
+    assert classify_role_family("Product Intern").family == RoleFamily.PRODUCT_MANAGEMENT
+    assert classify_role_family("APM Intern").family == RoleFamily.PRODUCT_MANAGEMENT
+    assert classify_role_family("Working Student Product").family == RoleFamily.PRODUCT_MANAGEMENT
+
+
+def test_20b_business_analysis_intern_variants_classify_correctly():
+    assert classify_role_family("Business Analyst Intern").family == RoleFamily.BUSINESS_ANALYSIS
+    assert classify_role_family("Business Analysis Intern").family == RoleFamily.BUSINESS_ANALYSIS
+    assert (
+        classify_role_family("Working Student Business Analysis").family
+        == RoleFamily.BUSINESS_ANALYSIS
+    )
+
+
+def test_20b_product_operations_intern_variants_classify_correctly():
+    assert (
+        classify_role_family("Product Operations Intern").family == RoleFamily.PRODUCT_OPERATIONS
+    )
+    assert (
+        classify_role_family("Working Student Product Operations").family
+        == RoleFamily.PRODUCT_OPERATIONS
+    )
+
+
+def test_20b_product_operations_intern_not_shadowed_by_shorter_product_pattern():
+    """Regression guard for the one real ordering trap in fix E: "Working
+    Student Product Operations" contains "Working Student Product" as a
+    literal prefix — the more specific Product Operations patterns must
+    be checked first, or this would incorrectly resolve to
+    PRODUCT_MANAGEMENT instead of PRODUCT_OPERATIONS."""
+    assert (
+        classify_role_family("Working Student Product Operations").family
+        != RoleFamily.PRODUCT_MANAGEMENT
+    )
+
+
+def test_20b_operations_analyst_intern_already_covered_by_existing_pattern():
+    """No new pattern needed — "Operations Analyst" already exists in
+    TIER 0 and is a substring of "Operations Analyst Intern"."""
+    assert (
+        classify_role_family("Operations Analyst Intern").family == RoleFamily.BUSINESS_OPERATIONS
+    )
+
+
+def test_20b_intern_outside_candidate_target_families_gets_its_own_family():
+    """The audit's explicit instruction: "do not classify every internship
+    as Product" — a Finance/Software-Engineering internship must resolve
+    to ITS OWN substantive family, never defaulted to this candidate's
+    own target roles."""
+    assert classify_role_family("Finance Intern").family == RoleFamily.FINANCE_ACCOUNTING
+    assert (
+        classify_role_family("Software Engineering Intern").family
+        == RoleFamily.SOFTWARE_ENGINEERING
+    )
+
+
+def test_20b_intern_titles_with_no_recognized_family_stay_other_unknown():
+    """Fix E only adds patterns for role families TIER 0 already
+    recognizes with a substantive-role pattern — an intern title for a
+    family with no such pattern must still honestly classify as
+    OTHER_UNKNOWN rather than being guessed into one."""
+    assert classify_role_family("Marketing Intern").family == RoleFamily.OTHER_UNKNOWN
+    assert classify_role_family("HR Intern").family == RoleFamily.OTHER_UNKNOWN
+
+
+def test_20b_non_intern_titles_are_unaffected_by_fix_e():
+    """Fix E's new TIER 1 patterns are checked strictly AFTER the existing
+    TIER 0 list — every pre-existing, non-intern classification must be
+    completely unchanged."""
+    assert classify_role_family("Associate Product Manager").family == RoleFamily.PRODUCT_MANAGEMENT
+    assert classify_role_family("Software Engineer").family == RoleFamily.SOFTWARE_ENGINEERING
+    assert (
+        classify_role_family("GNC Engineer").family
+        == RoleFamily.AEROSPACE_CONTROLS_ROBOTICS_ENGINEERING
+    )
+
+
+# --------------------------------------------------------------------------
+# 20c: Matching Engine V3 calibration Phase 9 — career-strategy/job-
+# matching taxonomy consistency. `career_paths.py`'s `_TAXONOMY` and
+# `role_family.py`'s `_CAREER_PATH_LABEL_TO_FAMILY` are two independently
+# maintained lists; this locks in that every label the taxonomy can
+# produce has a mapping, and that the mappings this candidate's real
+# top-ranked paths actually use are unaffected by this task's fixes.
+# --------------------------------------------------------------------------
+
+
+def test_20c_every_career_path_taxonomy_label_has_a_family_mapping():
+    """The audit found two labels ("Program / Project Management", "UX /
+    Product Design") with no entry at all — a HIGH-priority discovered
+    path in either would have been silently dropped from ever promoting a
+    role family via `candidate_role_families()`. Both now map onto the
+    family this codebase's OWN existing comments already document as
+    their home (role_family.py's BUSINESS_OPERATIONS TIER0 comment;
+    vocabulary.py's "Product Management (incl. UX...)" comment) — this
+    test enumerates the taxonomy directly so a future label added to
+    EITHER list without updating the other fails here, not silently."""
+    from job_agent.candidate.career_paths import _TAXONOMY
+
+    taxonomy_labels = {path.label for path in _TAXONOMY}
+    unmapped = taxonomy_labels - set(_CAREER_PATH_LABEL_TO_FAMILY)
+    assert not unmapped, f"career path label(s) with no role-family mapping: {unmapped}"
+
+
+def test_20c_program_project_management_maps_to_business_operations():
+    assert (
+        _CAREER_PATH_LABEL_TO_FAMILY["Program / Project Management"]
+        == RoleFamily.BUSINESS_OPERATIONS
+    )
+
+
+def test_20c_ux_product_design_maps_to_product_management():
+    assert _CAREER_PATH_LABEL_TO_FAMILY["UX / Product Design"] == RoleFamily.PRODUCT_MANAGEMENT
+
+
+def test_20c_real_profile_top_career_paths_still_map_correctly(real_profile):
+    """The candidate's actual top discovered paths (Business Analysis,
+    Marketing Operations, Product Management, ...) must keep mapping to
+    the same families after this task's fixes — Phase 9 explicitly
+    forbids changing career-path SCORES; this only confirms the
+    unification layer reading them is unaffected."""
+    paths = discover_career_paths(real_profile)
+    top_labels = {p.label for p in paths if p.recommended_priority == "HIGH"}
+    assert "Business Analysis" in top_labels
+    assert "Product Management" in top_labels
+    for label in top_labels:
+        assert label in _CAREER_PATH_LABEL_TO_FAMILY, f"HIGH-priority path {label!r} has no mapping"
+
+
+def test_20c_candidate_role_families_still_matches_target_roles_yaml(real_profile, real_config):
+    """Re-run of the exact family map the forensic audit captured —
+    Business Analysis and Product Management primary, Business
+    Operations/Product Operations/Marketing Operations secondary — must
+    be byte-for-byte unchanged by these calibration fixes."""
+    families = candidate_role_families(real_profile, real_config.profile)
+    assert families[RoleFamily.BUSINESS_ANALYSIS] == "primary"
+    assert families[RoleFamily.PRODUCT_MANAGEMENT] == "primary"
+    assert families[RoleFamily.BUSINESS_OPERATIONS] == "secondary"
+    assert families[RoleFamily.PRODUCT_OPERATIONS] == "secondary"
+    assert families[RoleFamily.MARKETING_OPERATIONS] == "secondary"
+
+
+# --------------------------------------------------------------------------
 # 21-22: dashboard ranking + metric semantics (API-level)
 # --------------------------------------------------------------------------
 # See tests/unit/test_web_api.py::test_dashboard_top_opportunities_never_shows_skip
@@ -406,6 +565,93 @@ def test_24_llm_enabled_path_remains_a_sufficient_independent_route_to_apply():
     an optional additional confirmation."""
     scored = _scored(role_match=50, specific_matched_count=0, semantic_available=True)
     assert decide(scored, THRESHOLDS) == Decision.APPLY
+
+
+# --------------------------------------------------------------------------
+# Matching Engine V3 calibration fix B: unknown eligibility must reach
+# REVIEW but never automatic APPLY, deterministic-only. Four cases mirror
+# the calibration spec exactly (compatible/offered, unknown+no
+# contradiction, denied+candidate-unknown, denied+candidate-incompatible).
+# --------------------------------------------------------------------------
+
+
+def test_25_case1_eligibility_confirmed_compatible_can_still_reach_apply():
+    """CASE 1 — no eligibility risk at all: the deterministic path to APPLY
+    must still work exactly as before this fix (this is test_23's own
+    scenario, re-asserted here under the fix-B numbering for a complete
+    case-by-case record)."""
+    scored = _scored(role_match=90, specific_matched_count=3, risk_flags=[])
+    assert decide(scored, THRESHOLDS) == Decision.APPLY
+
+
+def test_25_case2_eligibility_uncertain_alone_reaches_review_never_apply():
+    """CASE 2 — eligibility genuinely unknown, job raises no contradictory
+    language: otherwise-APPLY-worthy deterministic evidence (role_match=90,
+    3 specific matches, overall_score above auto_apply_threshold) must be
+    held to REVIEW, never SKIP/SAVE/HUMAN_REQUIRED and never APPLY. This is
+    the exact case the audit found the matcher had no dedicated test for —
+    `eligibility_uncertain` is an APPLY blocker, not a general
+    recommendation blocker."""
+    scored = _scored(role_match=90, specific_matched_count=3, risk_flags=["eligibility_uncertain"])
+    assert decide(scored, THRESHOLDS) == Decision.REVIEW
+
+
+def test_25_case2_eligibility_uncertain_does_not_block_review_band_either():
+    """Same CASE 2, at a score already inside the REVIEW band (not just at
+    the auto-apply threshold) — confirms `eligibility_uncertain` was never
+    blocking REVIEW to begin with; there is no regression to prevent here,
+    only a guarantee to keep locked in."""
+    scored = _scored(
+        overall_score=70, raw_fit_score=70, role_match=72, specific_matched_count=1,
+        risk_flags=["eligibility_uncertain"],
+    )
+    assert decide(scored, THRESHOLDS) == Decision.REVIEW
+
+
+def test_25_case3_eligibility_denied_candidate_unknown_stays_human_required():
+    """CASE 3 — explicit denial + the candidate's own status still unknown:
+    must preserve the existing hard-stop -> HUMAN_REQUIRED behavior
+    unchanged. `unknown_work_authorization` is a HARD STOP
+    (`job_agent.matching.deterministic._eligibility`), never merely a risk
+    flag, so this is enforced upstream of the APPLY-confidence gate this
+    fix touches."""
+    scored = _scored(
+        role_match=90, specific_matched_count=3,
+        hard_stop_reasons=["unknown_work_authorization"], risk_flags=[],
+    )
+    assert decide(scored, THRESHOLDS) == Decision.HUMAN_REQUIRED
+
+
+def test_25_case4_eligibility_explicitly_incompatible_preserves_existing_behavior():
+    """CASE 4 — this fix does not touch how an explicit, KNOWN eligibility
+    conflict is handled at all; `job_agent.matching.deterministic.
+    _eligibility` already routes that to the same hard-stop path as CASE 3
+    when the candidate's own status contradicts the posting. Re-asserted
+    here as a boundary marker: fix B only ever changes CASE 2's outcome."""
+    scored = _scored(
+        role_match=90, specific_matched_count=3,
+        hard_stop_reasons=["unknown_work_authorization"], risk_flags=[],
+    )
+    assert decide(scored, THRESHOLDS) != Decision.APPLY
+    assert decide(scored, THRESHOLDS) != Decision.REVIEW
+
+
+def test_25_role_family_mismatch_risk_flag_cannot_reach_the_apply_gate_anyway():
+    """Documents WHY `_deterministic_confidence_is_high` only needs to name
+    `eligibility_uncertain` explicitly: `role_family_mismatch` already
+    caps `overall_score` at 45 in `job_agent.matching.scoring.
+    _apply_score_caps`, strictly below `auto_apply_threshold` — so a job
+    carrying that flag can never reach the `overall_score >=
+    auto_apply_threshold` branch in `decide()` regardless of this fix."""
+    from job_agent.matching.deterministic import DeterministicMatch
+    from job_agent.matching.scoring import _apply_score_caps
+
+    det = DeterministicMatch(
+        skills_match=90, experience_match=90, role_match=90, project_match=90,
+        education_match=90, location_match=90, seniority_match=90, eligibility_match=90,
+        risk_flags=["role_family_mismatch"],
+    )
+    assert _apply_score_caps(95, det) < THRESHOLDS.auto_apply_threshold
 
 
 # --------------------------------------------------------------------------
